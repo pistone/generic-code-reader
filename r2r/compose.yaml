@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: r2r
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  r2r:
+    image: sciphiai/r2r:latest
+    ports:
+      - "7272:8000"
+    environment:
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-unused}
+      - R2R_CONFIG_PATH=/config/r2r.toml
+      - R2R_POSTGRES_HOST=postgres
+      - R2R_POSTGRES_PORT=5432
+      - R2R_POSTGRES_USER=postgres
+      - R2R_POSTGRES_PASSWORD=postgres
+      - R2R_POSTGRES_DBNAME=r2r
+      - LITELLM_DROP_PARAMS=True
+    volumes:
+      - ./r2r.toml:/config/r2r.toml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata:

@@ -1,0 +1,29 @@
+[embedding]
+provider = "litellm"
+base_model = "voyage/voyage-code-2"
+base_dimension = 1536
+batch_size = 128
+concurrent_request_limit = 32
+
+[completion_embedding]
+provider = "litellm"
+base_model = "voyage/voyage-code-2"
+base_dimension = 1536
+batch_size = 128
+concurrent_request_limit = 32
+
+[completion]
+provider = "litellm"
+base_model = "openai/gpt-4o-mini"
+
+[database]
+provider = "postgres"
+
+[app]
+quality_llm = "openai/gpt-4o-mini"
+fast_llm = "openai/gpt-4o-mini"
+vlm = "openai/gpt-4o-mini"
+
+[ingestion]
+skip_document_summary = true
+automatic_extraction = false

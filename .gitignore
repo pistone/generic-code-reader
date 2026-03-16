@@ -1,0 +1,21 @@
+# API keys / secrets
+.env
+*.env
+
+# R2R Postgres data (Docker volume on disk if ever mapped)
+r2r/pgdata/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Runtime state (not source)
+mcp_server/staging_queue.json
+mcp_server/query_log.jsonl
+reviewer/rejected_queue.json
+
+# Module map output (generated artifact)
+indexer/module_map.json
