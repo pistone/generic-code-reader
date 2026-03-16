@@ -1,5 +1,5 @@
 r2r>=3.6.0
-anthropic>=0.40.0
+litellm>=1.0.0
 mcp>=1.0.0
 llama-index-core>=0.10.0
 tree-sitter-language-pack>=0.0.1
