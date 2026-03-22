@@ -728,6 +728,9 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                             })
                             total_chunks += 1
                             new_this_run += 1
+                            # Incremental write after retry (crash safety)
+                            if summaries_path:
+                                summaries_path.write_text(json.dumps(summaries, indent=2))
                         except Exception as retry_err:
                             print(f"      [error] retry failed: {retry_err}, skipping")
                             skipped += 1
@@ -791,6 +794,9 @@ def main():
     if not codebase.is_dir():
         print(f"Error: --codebase '{codebase}' is not a directory")
         sys.exit(1)
+
+    if args.passes < 1:
+        args.passes = 1
 
     output_dir = Path(args.output_dir).resolve() if args.output_dir else Path(__file__).parent
     output_dir.mkdir(parents=True, exist_ok=True)
