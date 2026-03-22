@@ -135,6 +135,7 @@ def suggest_index_item(
     source_files: list[str],
     reasoning: str,
     raw_code: str = "",
+    module: str = "",
 ) -> str:
     """
     Suggest a new entry for the domain knowledge base.
@@ -152,6 +153,8 @@ def suggest_index_item(
         raw_code:     The key source code snippet that answers the question.
                       This gets stored alongside the summary so future searches
                       return ground truth, not just the summary.
+        module:       Module this entry belongs to (e.g. "checkers", "dataflow").
+                      Used for module-scoped search filtering.
     """
     queue = _load_staging()
     entry = {
@@ -159,6 +162,7 @@ def suggest_index_item(
         "summary":      summary,
         "source_files": source_files,
         "raw_code":     raw_code,
+        "module":       module,
         "reasoning":    reasoning,
         "status":       "pending",
         "timestamp":    datetime.now(timezone.utc).isoformat(),
