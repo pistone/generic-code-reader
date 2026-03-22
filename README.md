@@ -59,7 +59,7 @@ python indexer/study_agent.py --codebase /path/to/your/src --max-chunks 20
 
 ```bash
 # If you ran with --passes 1 (default), index manually:
-python indexer/indexer.py --index --file indexer/summaries.json
+python indexer/indexer.py --index indexer/summaries.json
 
 # If you ran with --passes > 1, summaries are already indexed.
 
