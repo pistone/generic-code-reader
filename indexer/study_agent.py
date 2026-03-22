@@ -339,28 +339,60 @@ def index_summaries_to_r2r(summaries: list[dict]) -> None:
     Index all summaries into R2R.  If an entry already has a 'doc_id' (from a
     previous pass), the old document is deleted first so there are no duplicates.
     The new doc_id is stored back into the entry dict.
+
+    Also indexes raw code as a separate chunk (chunk_type: "raw_code") so that
+    searches for exact identifiers can match the source code directly.
     """
     client = _r2r_client()
-    print(f"\n[Index] Indexing {len(summaries)} summaries into R2R...")
+    print(f"\n[Index] Indexing {len(summaries)} summaries + raw code into R2R...")
     for i, entry in enumerate(summaries):
+        # Delete old summary doc if re-indexing
         if entry.get("doc_id"):
             try:
                 client.documents.delete(entry["doc_id"])
             except Exception:
                 pass
+        # Delete old raw_code doc if re-indexing
+        if entry.get("code_doc_id"):
+            try:
+                client.documents.delete(entry["code_doc_id"])
+            except Exception:
+                pass
+
+        src_file = entry.get("source_file", "")
+        module   = entry.get("module", "")
+
+        # Index the summary (embedded for semantic search)
         try:
             resp = client.documents.create(
                 raw_text=entry["summary"],
                 metadata={
-                    "source_file": entry.get("source_file", ""),
-                    "module":      entry.get("module", ""),
+                    "source_file": src_file,
+                    "module":      module,
                     "chunk_type":  entry.get("chunk_type", "function_summary"),
                     "raw_code":    entry.get("raw_code", ""),
                 },
             )
-            entry["doc_id"] = resp.results.document_id
+            entry["doc_id"] = str(resp.results.document_id)
         except Exception as e:
-            print(f"  [warn] {entry.get('source_file', '?')}: {e}")
+            print(f"  [warn] {src_file}: summary index failed: {e}")
+
+        # Index the raw code as a separate chunk (for identifier/keyword search)
+        raw_code = entry.get("raw_code", "").strip()
+        if raw_code and len(raw_code) > 30:
+            try:
+                resp = client.documents.create(
+                    raw_text=raw_code,
+                    metadata={
+                        "source_file": src_file,
+                        "module":      module,
+                        "chunk_type":  "raw_code",
+                    },
+                )
+                entry["code_doc_id"] = str(resp.results.document_id)
+            except Exception as e:
+                print(f"  [warn] {src_file}: code index failed: {e}")
+
         if i > 0 and i % 20 == 0:
             time.sleep(0.5)
     print("[Index] Done")

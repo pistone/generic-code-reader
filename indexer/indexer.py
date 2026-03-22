@@ -39,27 +39,47 @@ def get_client() -> R2RClient:
 
 def index_entry(client: R2RClient, entry: dict) -> str:
     """
-    Index one summary entry into R2R.
+    Index one summary entry into R2R. Also indexes raw code as a
+    separate chunk so identifier searches match source code directly.
 
     entry keys:
       summary (str)      — text to embed
-      raw_code (str)     — original source, stored in metadata
+      raw_code (str)     — original source, also indexed separately
       source_file (str)  — e.g. "src/checkers/null_deref.cpp"
       module (str)       — e.g. "checkers"
       chunk_type (str)   — "function_summary" | "file_summary" | "doc_summary"
     """
-    metadata = {
-        "source_file": entry.get("source_file", ""),
-        "module":      entry.get("module", ""),
-        "chunk_type":  entry.get("chunk_type", "function_summary"),
-        "raw_code":    entry.get("raw_code", ""),
-    }
+    src_file = entry.get("source_file", "")
+    module   = entry.get("module", "")
 
+    # Index the summary
     response = client.documents.create(
         raw_text=entry["summary"],
-        metadata=metadata,
+        metadata={
+            "source_file": src_file,
+            "module":      module,
+            "chunk_type":  entry.get("chunk_type", "function_summary"),
+            "raw_code":    entry.get("raw_code", ""),
+        },
     )
-    return response.results.document_id
+    doc_id = str(response.results.document_id)
+
+    # Index raw code as a separate searchable chunk
+    raw_code = entry.get("raw_code", "").strip()
+    if raw_code and len(raw_code) > 30:
+        try:
+            client.documents.create(
+                raw_text=raw_code,
+                metadata={
+                    "source_file": src_file,
+                    "module":      module,
+                    "chunk_type":  "raw_code",
+                },
+            )
+        except Exception:
+            pass  # non-fatal — the summary is already indexed
+
+    return doc_id
 
 
 def index_file(path: str) -> None:
@@ -100,7 +120,7 @@ def search(query: str, limit: int = 5) -> None:
         print(f"  File:   {meta.get('source_file', 'unknown')}")
         print(f"  Module: {meta.get('module', 'unknown')}")
         print(f"  Type:   {meta.get('chunk_type', 'unknown')}")
-        print(f"  Summary snippet: {hit.text[:200]}...")
+        print(f"  Summary snippet: {(hit.text or '')[:200]}...")
         if meta.get("raw_code"):
             print(f"  Raw code snippet: {meta['raw_code'][:200]}...")
         print()
@@ -116,7 +136,8 @@ def list_documents() -> None:
         return
     print(f"{len(docs)} document(s) in the knowledge base:\n")
     for doc in docs:
-        print(f"  {doc.id}  {doc.metadata.get('source_file', '(no file)')}  [{doc.metadata.get('chunk_type', '')}]")
+        meta = doc.metadata or {}
+        print(f"  {doc.id}  {meta.get('source_file', '(no file)')}  [{meta.get('chunk_type', '')}]")
 
 
 if __name__ == "__main__":
