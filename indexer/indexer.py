@@ -10,8 +10,8 @@ Each entry has:
   - chunk_type:  "function_summary" | "file_summary" | "doc_summary"
 
 Usage:
-  # Index a single entry
-  python indexer.py --index --file path/to/summaries.json
+  # Index summaries from a JSON file
+  python indexer.py --index path/to/summaries.json
 
   # Search (smoke test)
   python indexer.py --search "null pointer handling across function calls"

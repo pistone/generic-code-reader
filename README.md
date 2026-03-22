@@ -53,7 +53,12 @@ python indexer/study_agent.py --codebase /path/to/your/src \
 
 # Quick test with 20 chunks
 python indexer/study_agent.py --codebase /path/to/your/src --max-chunks 20
+
+# Re-run only on changed files (uses sha256 hash manifest)
+python indexer/study_agent.py --codebase /path/to/your/src --incremental
 ```
+
+Token usage is printed at the end of each run and logged to `indexer/cost_log.jsonl`.
 
 ### 5. Index summaries into R2R
 
@@ -91,6 +96,7 @@ All scripts respect these environment variables:
 | `LLM_MODEL` | `openai/gpt-4o` | study_agent, reviewer_agent |
 | `OPENAI_API_KEY` | — | LLM calls (if using OpenAI) |
 | `VOYAGE_API_KEY` | — | R2R embeddings |
+| `KB_SEARCH_LIMIT` | `5` | MCP server (max results per search) |
 
 For fully local operation (no API keys): use Ollama + swap R2R embeddings to a local model.
 
