@@ -59,7 +59,6 @@ def index_entry(client: R2RClient, entry: dict) -> str:
             "source_file": src_file,
             "module":      module,
             "chunk_type":  entry.get("chunk_type", "function_summary"),
-            "raw_code":    entry.get("raw_code", ""),
         },
     )
     doc_id = str(response.results.document_id)

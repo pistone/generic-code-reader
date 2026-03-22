@@ -54,22 +54,20 @@ def _format_results(hits: list) -> str:
 
     parts = []
     for i, hit in enumerate(hits):
-        meta     = hit.metadata or {}
-        summary  = hit.text or ""
-        raw_code = meta.get("raw_code", "")
-        source   = meta.get("source_file", "unknown")
-        module   = meta.get("module", "unknown")
-        score    = getattr(hit, "score", 0)
+        meta       = hit.metadata or {}
+        text       = hit.text or ""
+        source     = meta.get("source_file", "unknown")
+        module     = meta.get("module", "unknown")
+        chunk_type = meta.get("chunk_type", "")
+        score      = getattr(hit, "score", 0)
 
-        section = [
-            f"## Result {i+1}  (score: {score:.3f})",
-            f"**File**: `{source}`  |  **Module**: `{module}`",
-            f"",
-            f"**Summary**:",
-            summary,
-        ]
-        if raw_code:
-            section += ["", "**Source code**:", f"```\n{raw_code}\n```"]
+        header = f"## Result {i+1}  (score: {score:.3f})"
+        file_line = f"**File**: `{source}`  |  **Module**: `{module}`"
+
+        if chunk_type == "raw_code":
+            section = [header, file_line, "", "**Source code**:", f"```\n{text}\n```"]
+        else:
+            section = [header, file_line, "", "**Summary**:", text]
 
         parts.append("\n".join(section))
 
