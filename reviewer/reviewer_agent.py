@@ -111,20 +111,44 @@ def search_kb(query: str, limit: int = KB_SEARCH_LIMIT) -> list[dict]:
         return [{"error": str(e)}]
 
 
-def index_entry(entry: dict) -> str:
-    """Promote an approved entry into R2R. Returns the new document_id."""
+def index_entry(entry: dict) -> tuple[str, str]:
+    """Promote an approved entry into R2R. Returns (summary_doc_id, code_doc_id).
+    Also indexes raw code as a separate searchable chunk."""
     client = R2RClient(R2R_URL)
+    src_file = entry.get("source_file", "")
+    module   = entry.get("module", "")
+
+    # Index the summary
     response = client.documents.create(
         raw_text=entry["summary"],
         metadata={
-            "source_file": entry.get("source_file", ""),
-            "module":      entry.get("module", ""),
+            "source_file": src_file,
+            "module":      module,
             "chunk_type":  entry.get("chunk_type", "function_summary"),
-            "raw_code":    entry.get("raw_code", ""),
             "origin":      "suggestion",
         },
     )
-    return response.results.document_id
+    doc_id = str(response.results.document_id)
+
+    # Index raw code as a separate searchable chunk
+    code_doc_id = ""
+    raw_code = entry.get("raw_code", "").strip()
+    if raw_code and len(raw_code) > 30:
+        try:
+            resp = client.documents.create(
+                raw_text=raw_code,
+                metadata={
+                    "source_file": src_file,
+                    "module":      module,
+                    "chunk_type":  "raw_code",
+                    "origin":      "suggestion",
+                },
+            )
+            code_doc_id = str(resp.results.document_id)
+        except Exception:
+            pass  # non-fatal
+
+    return doc_id, code_doc_id
 
 # ── Reviewer prompt ───────────────────────────────────────────────────────────
 
@@ -197,8 +221,11 @@ def review_one(entry: dict, model: str, codebase: Optional[Path]) -> ReviewDecis
     file_contents: dict[str, str] = {}
     for rel_path in entry.get("source_files", [])[:3]:  # cap at 3 files
         if codebase:
-            candidates = list(codebase.rglob(Path(rel_path).name))
-            fpath = candidates[0] if candidates else codebase / rel_path
+            # Try direct relative path first, then rglob on basename
+            fpath = codebase / rel_path
+            if not fpath.exists():
+                candidates = list(codebase.rglob(Path(rel_path).name))
+                fpath = candidates[0] if candidates else codebase / rel_path
         else:
             fpath = Path(rel_path)
 
@@ -273,9 +300,11 @@ def process_queue(model: str, codebase: Optional[Path],
                 "chunk_type":  "function_summary",
             }
             try:
-                doc_id = index_entry(to_index)
+                doc_id, code_doc_id = index_entry(to_index)
                 entry["status"]    = decision.decision  # "approve" or "edit"
                 entry["doc_id"]    = doc_id
+                if code_doc_id:
+                    entry["code_doc_id"] = code_doc_id
                 entry["reasoning"] = decision.reasoning
                 entry["reviewed_at"] = now
                 print(f"       ✓ Indexed → doc_id {doc_id}")
@@ -294,8 +323,9 @@ def process_queue(model: str, codebase: Optional[Path],
 
         processed += 1
 
-    # Persist updated queues
-    save_queue(staging_path, queue)
+    # Prune completed/rejected entries — keep only pending and errored
+    pruned_queue = [e for e in queue if e.get("status") in ("pending", "index_error")]
+    save_queue(staging_path, pruned_queue)
     save_queue(REJECTED_FILE, rejected)
 
     approved = sum(1 for e in queue if e.get("status") in ("approve", "edit"))
