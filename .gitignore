@@ -21,3 +21,5 @@ reviewer/rejected_queue.json
 indexer/module_map.json
 indexer/summaries.json
 indexer/file_hashes.json
+indexer/cost_log.jsonl
+reviewer/cost_log.jsonl

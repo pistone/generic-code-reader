@@ -50,6 +50,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from datetime import datetime, timezone
 from pydantic import BaseModel
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -73,6 +74,88 @@ SKIP_DIRS    = {"__pycache__", ".git", ".hg", ".svn", "node_modules",
                 ".venv", "venv", "env", ".env", "build", "dist",
                 ".mypy_cache", ".pytest_cache", ".tox"}
 
+# ── Token tracking ───────────────────────────────────────────────────────────
+
+class TokenTracker:
+    """Accumulates prompt/completion token counts per phase."""
+
+    def __init__(self):
+        self.phases: dict[str, dict[str, int]] = {}
+
+    def _ensure_phase(self, phase: str) -> dict[str, int]:
+        if phase not in self.phases:
+            self.phases[phase] = {"prompt": 0, "completion": 0, "calls": 0}
+        return self.phases[phase]
+
+    def record(self, phase: str, response) -> None:
+        """Extract usage from a litellm response object."""
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        p = self._ensure_phase(phase)
+        p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+        p["completion"] += getattr(usage, "completion_tokens", 0) or 0
+        p["calls"] += 1
+
+    def record_streaming(self, phase: str, chunks: list) -> None:
+        """Extract usage from the last chunk of a streaming response."""
+        if not chunks:
+            return
+        # litellm puts usage in the final chunk
+        last = chunks[-1]
+        usage = getattr(last, "usage", None)
+        if not usage:
+            # Some providers put it in choices[0]
+            choices = getattr(last, "choices", [])
+            if choices:
+                usage = getattr(choices[0], "usage", None)
+        if usage:
+            p = self._ensure_phase(phase)
+            p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+            p["completion"] += getattr(usage, "completion_tokens", 0) or 0
+            p["calls"] += 1
+        else:
+            # Fallback: count the call but no token data available
+            p = self._ensure_phase(phase)
+            p["calls"] += 1
+
+    def record_estimate(self, phase: str, prompt_chars: int, completion_chars: int) -> None:
+        """Fallback: estimate tokens from character count (÷4)."""
+        p = self._ensure_phase(phase)
+        p["prompt"] += prompt_chars // 4
+        p["completion"] += completion_chars // 4
+        p["calls"] += 1
+
+    def summary(self) -> str:
+        """Return a formatted summary string."""
+        lines = []
+        total_p, total_c = 0, 0
+        for phase, counts in self.phases.items():
+            p, c, n = counts["prompt"], counts["completion"], counts["calls"]
+            total_p += p
+            total_c += c
+            lines.append(
+                f"[Tokens] {phase + ':':<12} {p:>8,} prompt + {c:>7,} completion"
+                f"   ({n} call{'s' if n != 1 else ''})"
+            )
+        lines.append(
+            f"[Tokens] {'Total:':<12} {total_p:>8,} prompt + {total_c:>7,} completion"
+            f" = {total_p + total_c:,} tokens"
+        )
+        return "\n".join(lines)
+
+    def to_log_entry(self, model: str, codebase: str) -> dict:
+        """Return a dict suitable for JSONL logging."""
+        total = sum(p["prompt"] + p["completion"] for p in self.phases.values())
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "codebase": codebase,
+            "phases": dict(self.phases),
+            "total_tokens": total,
+        }
+
+
 # ── Pydantic models (used to validate Pass 1 JSON output) ─────────────────────
 
 class ModuleDefinition(BaseModel):
@@ -91,10 +174,13 @@ class ModuleMap(BaseModel):
 def llm_call(model: str, system: str, user: str,
              max_tokens: int = 4096,
              json_mode: bool = False,
-             stream: bool = False):
+             stream: bool = False,
+             tracker: Optional['TokenTracker'] = None,
+             phase: str = ""):
     """
     Unified LLM call via litellm.
     Returns the full response text (or a generator of text chunks if stream=True).
+    If tracker and phase are provided, records token usage automatically.
     """
     from litellm import completion
 
@@ -106,18 +192,26 @@ def llm_call(model: str, system: str, user: str,
     kwargs = dict(model=model, messages=messages, max_tokens=max_tokens, stream=stream)
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
+    if stream:
+        kwargs["stream_options"] = {"include_usage": True}
 
     response = completion(**kwargs)
 
     if stream:
-        # Return a generator that yields text chunks
+        # Return a generator that yields text chunks and tracks usage
         def _gen():
+            collected_chunks = []
             for chunk in response:
+                collected_chunks.append(chunk)
                 delta = chunk.choices[0].delta
                 if delta and delta.content:
                     yield delta.content
+            if tracker and phase:
+                tracker.record_streaming(phase, collected_chunks)
         return _gen()
     else:
+        if tracker and phase:
+            tracker.record(phase, response)
         return response.choices[0].message.content or ""
 
 # ── File utilities ─────────────────────────────────────────────────────────────
@@ -430,7 +524,8 @@ Output ONLY one of these two JSON forms:
   {{"keep": false, "improved": "rewritten summary here"}}"""
 
 
-def run_review(model: str, summaries: list[dict]) -> tuple[list[dict], float]:
+def run_review(model: str, summaries: list[dict],
+               tracker: Optional[TokenTracker] = None) -> tuple[list[dict], float]:
     """
     Review every summary for quality. Queries the KB for domain context so
     the LLM can use proper vocabulary in rewrites.
@@ -446,7 +541,8 @@ def run_review(model: str, summaries: list[dict]) -> tuple[list[dict], float]:
         prompt = _build_review_prompt(entry, kb_context)
 
         try:
-            raw = llm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512, json_mode=True)
+            raw = llm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512, json_mode=True,
+                           tracker=tracker, phase="Review")
             data = json.loads(raw)
             if not data.get("keep") and data.get("improved", "").strip():
                 entry["summary"] = data["improved"].strip()
@@ -517,7 +613,8 @@ Output ONLY this JSON (no markdown, no extra text):
 
 
 def run_pass1(model: str, codebase: Path, files: list[Path],
-              language: str, docs_context: Optional[str] = None) -> ModuleMap:
+              language: str, docs_context: Optional[str] = None,
+              tracker: Optional[TokenTracker] = None) -> ModuleMap:
     """Call the LLM to analyze directory structure and produce module_map."""
 
     print("\n[Pass 1] Building directory tree and reading file samples...")
@@ -538,7 +635,8 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     )
 
     print(f"[Pass 1] Calling {model} for module discovery ({len(prompt)} char prompt)...")
-    raw = llm_call(model, PASS1_SYSTEM, prompt, max_tokens=4096, json_mode=True)
+    raw = llm_call(model, PASS1_SYSTEM, prompt, max_tokens=4096, json_mode=True,
+                   tracker=tracker, phase="Pass 1")
 
     # Parse and validate with Pydantic
     try:
@@ -604,7 +702,8 @@ def _make_chunk_key(source_file: str, chunk_index: int) -> str:
 def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
               language: str, max_chunks: Optional[int] = None,
               rag: bool = False,
-              summaries_path: Optional[Path] = None) -> list[dict]:
+              summaries_path: Optional[Path] = None,
+              tracker: Optional[TokenTracker] = None) -> list[dict]:
     """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
     With rag=True, queries the KB before each chunk to inject relevant context.
     If summaries_path is set, writes incrementally for crash-safety."""
@@ -683,7 +782,8 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                 try:
                     # Stream + collect
                     summary_text = ""
-                    for text in llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512, stream=True):
+                    for text in llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512, stream=True,
+                                         tracker=tracker, phase="Pass 2"):
                         summary_text += text
 
                     summary_text = summary_text.strip()
@@ -715,7 +815,8 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                         time.sleep(30)
                         try:
                             summary_text = ""
-                            for text in llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512, stream=True):
+                            for text in llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512, stream=True,
+                                                 tracker=tracker, phase="Pass 2"):
                                 summary_text += text
                             summaries.append({
                                 "summary":     summary_text.strip(),
@@ -849,6 +950,8 @@ def main():
             sys.exit(1)
         bootstrap_docs(Path(args.docs))
 
+    tracker = TokenTracker()
+
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
     if not args.pass2_only:
         docs_context = None
@@ -865,7 +968,8 @@ def main():
                             break
                 docs_context = "\n\n".join(parts)
 
-        module_map = run_pass1(args.model, codebase, files, args.language, docs_context)
+        module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
+                              tracker=tracker)
         module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
         print(f"\n[Pass 1] Written to {module_map_path}")
     else:
@@ -900,6 +1004,7 @@ def main():
                 max_chunks=args.max_chunks,
                 rag=args.rag,
                 summaries_path=summaries_path,
+                tracker=tracker,
             )
 
         if args.passes > 1:
@@ -907,7 +1012,7 @@ def main():
             index_summaries_to_r2r(summaries)
 
             # Review + improve
-            summaries, edit_rate = run_review(args.model, summaries)
+            summaries, edit_rate = run_review(args.model, summaries, tracker=tracker)
 
             # Update R2R with improved summaries
             index_summaries_to_r2r(summaries)
@@ -932,6 +1037,15 @@ def main():
         print(f"       Next: python indexer.py --index {summaries_path}")
     else:
         print(f"\n[Done] Final summaries in {summaries_path} (already indexed in R2R)")
+
+    # ── Token usage summary ────────────────────────────────────────────────────
+    if tracker.phases:
+        print(f"\n{tracker.summary()}")
+        cost_log_path = output_dir / "cost_log.jsonl"
+        entry = tracker.to_log_entry(model=args.model, codebase=codebase.name)
+        with cost_log_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        print(f"[Tokens] Logged to {cost_log_path}")
 
 
 if __name__ == "__main__":

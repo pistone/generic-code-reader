@@ -44,6 +44,55 @@ BASE_DIR       = Path(__file__).parent
 STAGING_FILE   = BASE_DIR.parent / "mcp_server" / "staging_queue.json"
 REJECTED_FILE  = BASE_DIR / "rejected_queue.json"
 
+# ── Token tracking ───────────────────────────────────────────────────────────
+
+class TokenTracker:
+    """Accumulates prompt/completion token counts per phase."""
+
+    def __init__(self):
+        self.phases: dict[str, dict[str, int]] = {}
+
+    def _ensure_phase(self, phase: str) -> dict[str, int]:
+        if phase not in self.phases:
+            self.phases[phase] = {"prompt": 0, "completion": 0, "calls": 0}
+        return self.phases[phase]
+
+    def record(self, phase: str, response) -> None:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return
+        p = self._ensure_phase(phase)
+        p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+        p["completion"] += getattr(usage, "completion_tokens", 0) or 0
+        p["calls"] += 1
+
+    def summary(self) -> str:
+        lines = []
+        total_p, total_c = 0, 0
+        for phase, counts in self.phases.items():
+            p, c, n = counts["prompt"], counts["completion"], counts["calls"]
+            total_p += p
+            total_c += c
+            lines.append(
+                f"[Tokens] {phase + ':':<12} {p:>8,} prompt + {c:>7,} completion"
+                f"   ({n} call{'s' if n != 1 else ''})"
+            )
+        lines.append(
+            f"[Tokens] {'Total:':<12} {total_p:>8,} prompt + {total_c:>7,} completion"
+            f" = {total_p + total_c:,} tokens"
+        )
+        return "\n".join(lines)
+
+    def to_log_entry(self, model: str) -> dict:
+        total = sum(p["prompt"] + p["completion"] for p in self.phases.values())
+        return {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "model": model,
+            "phases": dict(self.phases),
+            "total_tokens": total,
+        }
+
+
 # ── Pydantic model for LLM decision ───────────────────────────────────────────
 
 class ReviewDecision(BaseModel):
@@ -53,7 +102,8 @@ class ReviewDecision(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def llm_call_json(model: str, system: str, user: str, max_tokens: int = 1024) -> str:
+def llm_call_json(model: str, system: str, user: str, max_tokens: int = 1024,
+                  tracker: Optional[TokenTracker] = None, phase: str = "") -> str:
     """Call litellm in JSON mode, return raw text."""
     from litellm import completion
     response = completion(
@@ -65,6 +115,8 @@ def llm_call_json(model: str, system: str, user: str, max_tokens: int = 1024) ->
         max_tokens=max_tokens,
         response_format={"type": "json_object"},
     )
+    if tracker and phase:
+        tracker.record(phase, response)
     return response.choices[0].message.content or ""
 
 
@@ -214,7 +266,8 @@ Output ONLY this JSON:
 
 # ── Core review logic ─────────────────────────────────────────────────────────
 
-def review_one(entry: dict, model: str, codebase: Optional[Path]) -> ReviewDecision:
+def review_one(entry: dict, model: str, codebase: Optional[Path],
+               tracker: Optional[TokenTracker] = None) -> ReviewDecision:
     """Run the LLM reviewer on a single staging entry. Returns a ReviewDecision."""
 
     # 1. Read cited source files
@@ -239,7 +292,8 @@ def review_one(entry: dict, model: str, codebase: Optional[Path]) -> ReviewDecis
 
     # 3. Call LLM
     prompt = build_review_prompt(entry, file_contents, kb_hits)
-    raw = llm_call_json(model, REVIEWER_SYSTEM, prompt)
+    raw = llm_call_json(model, REVIEWER_SYSTEM, prompt,
+                        tracker=tracker, phase="Review")
 
     # 4. Parse decision
     try:
@@ -260,7 +314,8 @@ def review_one(entry: dict, model: str, codebase: Optional[Path]) -> ReviewDecis
 # ── Queue processor ───────────────────────────────────────────────────────────
 
 def process_queue(model: str, codebase: Optional[Path],
-                  staging_path: Optional[Path] = None) -> int:
+                  staging_path: Optional[Path] = None,
+                  tracker: Optional[TokenTracker] = None) -> int:
     """
     Process all 'pending' entries in staging_queue.json.
     Returns the number of entries processed.
@@ -285,7 +340,7 @@ def process_queue(model: str, codebase: Optional[Path],
         print(f"\n  [{idx+1}] Reviewing: {topic}")
         print(f"       Files: {entry.get('source_files', [])}")
 
-        decision = review_one(entry, model, codebase)
+        decision = review_one(entry, model, codebase, tracker=tracker)
         print(f"       Decision: {decision.decision.upper()} — {decision.reasoning}")
 
         now = datetime.now(timezone.utc).isoformat()
@@ -363,18 +418,28 @@ def main():
     if args.watch:
         print(f"[Reviewer] Watch mode: polling every {WATCH_INTERVAL}s (Ctrl-C to stop)")
 
+    tracker = TokenTracker()
+    cost_log_path = BASE_DIR / "cost_log.jsonl"
+
     if args.watch:
         while True:
             try:
-                process_queue(args.model, codebase, staging_file)
+                process_queue(args.model, codebase, staging_file, tracker=tracker)
                 time.sleep(WATCH_INTERVAL)
             except KeyboardInterrupt:
                 print("\n[Reviewer] Stopped.")
                 break
     else:
-        processed = process_queue(args.model, codebase, staging_file)
+        processed = process_queue(args.model, codebase, staging_file, tracker=tracker)
         if processed == 0:
             print("[Reviewer] No pending items found.")
+
+    if tracker.phases:
+        print(f"\n{tracker.summary()}")
+        entry = tracker.to_log_entry(model=args.model)
+        with cost_log_path.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+        print(f"[Tokens] Logged to {cost_log_path}")
 
 
 if __name__ == "__main__":
