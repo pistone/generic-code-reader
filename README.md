@@ -100,6 +100,36 @@ ollama pull llama3.1
 python indexer/study_agent.py --codebase /path/to/src --model ollama/llama3.1
 ```
 
+## Testing
+
+Run the smoke tests after setup to validate everything works before applying to your codebase:
+
+```bash
+# Uses this project itself as the test codebase
+python tests/smoke_test.py
+
+# Use a specific directory
+python tests/smoke_test.py --codebase /path/to/your/src
+
+# Different LLM provider
+python tests/smoke_test.py --model ollama/llama3.1
+```
+
+The smoke tests check, in order:
+
+1. R2R health (Docker is up)
+2. LLM connectivity (API key works)
+3. Embedding round-trip (Voyage embeddings work)
+4. Code chunking (tree-sitter AST splitting)
+5. Index + search round-trip (R2R stores and retrieves)
+6. Study agent Pass 1 (module discovery)
+7. Study agent Pass 2 (summarization)
+8. Index summaries (end-to-end indexing)
+9. MCP server search (tool callable)
+10. Suggest + review loop (self-improving pipeline)
+
+Tests clean up after themselves. Total LLM cost is under $0.01.
+
 ## Supported Languages
 
 `python`, `javascript`, `typescript`, `cpp`, `java`, `go`, `rust`
