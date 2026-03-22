@@ -829,6 +829,16 @@ def main():
                 pass
 
     # ── Bootstrap docs into R2R (before Pass 1, so Pass 1 benefits too) ─────────
+    # Auto-detect: if --rag is set and no --docs given, look for common doc dirs
+    if args.rag and not args.docs:
+        for candidate in ("docs", "doc", "documentation", "design"):
+            candidate_path = codebase / candidate
+            if candidate_path.is_dir() and any(candidate_path.rglob("*.md")):
+                args.docs = str(candidate_path)
+                args.bootstrap_docs = True
+                print(f"[Auto] Found docs at {candidate_path}, will bootstrap")
+                break
+
     if args.bootstrap_docs:
         if not args.docs:
             print("Error: --bootstrap-docs requires --docs PATH")
