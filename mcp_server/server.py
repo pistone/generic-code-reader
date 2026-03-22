@@ -92,7 +92,7 @@ mcp = FastMCP("domain-kb")
 
 
 @mcp.tool()
-def search_codebase(query: str) -> str:
+def search_codebase(query: str, module: str = "") -> str:
     """
     Search the domain knowledge base semantically.
 
@@ -101,16 +101,22 @@ def search_codebase(query: str) -> str:
     contain the answer with much less token cost.
 
     Args:
-        query: Natural language description of what you're looking for.
-               E.g. "how does the null dereference checker handle pointer arithmetic"
+        query:  Natural language description of what you're looking for.
+                E.g. "how does the null dereference checker handle pointer arithmetic"
+        module: Optional module name to restrict the search scope.
+                E.g. "checkers", "dataflow". Leave empty to search everything.
     """
     client = get_client()
+    search_settings: dict = {
+        "limit": SEARCH_LIMIT,
+        "use_hybrid_search": True,
+    }
+    if module:
+        search_settings["filters"] = {"module": {"$eq": module}}
+
     results = client.retrieval.search(
         query=query,
-        search_settings={
-            "limit": SEARCH_LIMIT,
-            "use_hybrid_search": True,
-        },
+        search_settings=search_settings,
     )
     hits = results.results.chunk_search_results
 
