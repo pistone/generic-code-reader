@@ -1,5 +1,5 @@
 """
-Study Agent — Two-pass codebase analysis for the domain knowledge base.
+Study Agent — Multi-pass codebase analysis for the domain knowledge base.
 
 Uses litellm so it works with ANY provider:
   OpenAI:    --model openai/gpt-4o        (needs OPENAI_API_KEY)
@@ -17,21 +17,28 @@ Pass 2 — Summarization
   - Loads module_map.json
   - Chunks each file with CodeSplitter (tree-sitter AST boundaries)
   - Calls the LLM with the module's questions to generate domain-aware summaries
-  - Output: summaries.json  →  feed to indexer.py
+  - With --rag: queries the vector DB before each chunk for richer context
+  - Output: summaries.json  →  fed to indexer.py (or auto-indexed with --passes)
+
+Pass 3 — Review  (runs automatically when --passes > 1)
+  - LLM reviews each summary for accuracy and domain vocabulary
+  - Rewrites weak summaries; improves the vector DB in-place
+  - Stops early when edit rate drops below 5% (convergence)
 
 Usage:
-  # OpenAI (get a key at platform.openai.com)
-  OPENAI_API_KEY=sk-... python study_agent.py --codebase /tmp/requests_src/src/requests
+  # Standard two-pass run (same as before)
+  OPENAI_API_KEY=sk-... python study_agent.py --codebase /path/to/src
 
-  # Ollama — 100% local, no key needed
-  # First: brew install ollama && ollama pull llama3.1
-  python study_agent.py --codebase /tmp/requests_src/src/requests --model ollama/llama3.1
+  # Bootstrap design docs into the vector DB, then run with RAG augmentation
+  python study_agent.py --codebase /path/to/src \\
+      --docs /path/to/docs --bootstrap-docs --rag
 
-  # Quick demo with 20 chunks
-  python study_agent.py --codebase /tmp/requests_src/src/requests --max-chunks 20
+  # Three iterative passes (summarize → review → improve) until convergence
+  python study_agent.py --codebase /path/to/src \\
+      --docs /path/to/docs --bootstrap-docs --rag --passes 3
 
   # Skip Pass 1 if module_map.json already exists
-  python study_agent.py --codebase /tmp/requests_src/src/requests --pass2-only
+  python study_agent.py --codebase /path/to/src --pass2-only
 """
 
 import argparse
@@ -45,7 +52,9 @@ from pydantic import BaseModel
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL = "openai/gpt-4o"
+DEFAULT_MODEL        = "openai/gpt-4o"
+R2R_URL              = "http://localhost:7272"
+CONVERGENCE_THRESHOLD = 0.05   # stop iterating when < 5% of summaries are edited
 
 # Max lines to sample from each file for Pass 1
 SAMPLE_LINES = 80
@@ -194,6 +203,189 @@ def chunk_file(path: Path, language: str = "python") -> list[str]:
         return result or [""]
 
 
+# ── R2R helpers (bootstrap, RAG search, auto-index) ───────────────────────────
+
+def _r2r_client():
+    from r2r import R2RClient
+    return R2RClient(R2R_URL)
+
+
+def _chunk_doc(content: str, max_chars: int = 1500) -> list[str]:
+    """Split a doc at markdown headings; fall back to fixed-size chunks."""
+    import re
+    sections = re.split(r'\n(?=#{1,3} )', content)
+    chunks = []
+    for section in sections:
+        if len(section) <= max_chars:
+            if section.strip():
+                chunks.append(section.strip())
+        else:
+            for i in range(0, len(section), max_chars):
+                part = section[i : i + max_chars].strip()
+                if part:
+                    chunks.append(part)
+    return chunks or [content[:max_chars]]
+
+
+def bootstrap_docs(docs_path: Path) -> int:
+    """
+    Index .md/.rst/.txt files from docs_path into R2R as doc_summary chunks.
+    Call this before Pass 2 so the RAG search has domain vocabulary to work with.
+    Returns the number of chunks indexed.
+    """
+    doc_files: list[Path] = []
+    if docs_path.is_file():
+        doc_files = [docs_path]
+    else:
+        for ext in (".md", ".rst", ".txt"):
+            doc_files.extend(sorted(docs_path.rglob(f"*{ext}")))
+
+    print(f"\n[Bootstrap] Indexing {len(doc_files)} doc file(s) into R2R...")
+    client = _r2r_client()
+    count = 0
+    for doc_file in doc_files:
+        try:
+            content = doc_file.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            print(f"  [warn] {doc_file.name}: {e}")
+            continue
+        for chunk in _chunk_doc(content):
+            try:
+                client.documents.create(
+                    raw_text=chunk,
+                    metadata={
+                        "source_file": doc_file.name,
+                        "module":      "documentation",
+                        "chunk_type":  "doc_summary",
+                    },
+                )
+                count += 1
+            except Exception as e:
+                print(f"  [warn] {doc_file.name} chunk: {e}")
+    print(f"[Bootstrap] Indexed {count} doc chunk(s)")
+    return count
+
+
+def search_kb(query: str, limit: int = 3) -> str:
+    """
+    Query R2R and return a formatted context string for prompt injection.
+    Returns empty string if R2R is unavailable (degrades gracefully).
+    """
+    try:
+        client = _r2r_client()
+        results = client.retrieval.search(query=query, search_settings={"limit": limit})
+        hits = results.results.chunk_search_results
+        if not hits:
+            return ""
+        parts = []
+        for hit in hits:
+            src = (hit.metadata or {}).get("source_file", "?")
+            parts.append(f"[{src}] {(hit.text or '').strip()[:300]}")
+        return "\n".join(parts)
+    except Exception:
+        return ""
+
+
+def index_summaries_to_r2r(summaries: list[dict]) -> None:
+    """
+    Index all summaries into R2R.  If an entry already has a 'doc_id' (from a
+    previous pass), the old document is deleted first so there are no duplicates.
+    The new doc_id is stored back into the entry dict.
+    """
+    client = _r2r_client()
+    print(f"\n[Index] Indexing {len(summaries)} summaries into R2R...")
+    for i, entry in enumerate(summaries):
+        if entry.get("doc_id"):
+            try:
+                client.documents.delete(entry["doc_id"])
+            except Exception:
+                pass
+        try:
+            resp = client.documents.create(
+                raw_text=entry["summary"],
+                metadata={
+                    "source_file": entry.get("source_file", ""),
+                    "module":      entry.get("module", ""),
+                    "chunk_type":  entry.get("chunk_type", "function_summary"),
+                    "raw_code":    entry.get("raw_code", ""),
+                },
+            )
+            entry["doc_id"] = resp.results.document_id
+        except Exception as e:
+            print(f"  [warn] {entry.get('source_file', '?')}: {e}")
+        if i > 0 and i % 20 == 0:
+            time.sleep(0.5)
+    print("[Index] Done")
+
+
+# ── Pass 3: Review ─────────────────────────────────────────────────────────────
+
+REVIEW_SYSTEM = (
+    "You are reviewing knowledge-base summaries for accuracy and quality. "
+    "Output ONLY valid JSON — no markdown, no text outside the JSON object."
+)
+
+
+def _build_review_prompt(entry: dict, kb_context: str) -> str:
+    return f"""Review this knowledge-base summary.
+
+Source: {entry.get('source_file', '?')}  Module: {entry.get('module', '?')}
+
+Summary:
+{entry['summary']}
+
+Original source code:
+```
+{entry.get('raw_code', '')[:1500]}
+```
+
+Similar entries already in the knowledge base (for vocabulary reference):
+{kb_context or '(none found)'}
+
+Criteria — a good summary must be:
+1. Accurate: matches what the code actually does
+2. Domain-specific: uses the project's own vocabulary, not generic terms
+3. Useful: answers a real question a developer would ask
+
+Output ONLY one of these two JSON forms:
+  {{"keep": true}}
+  {{"keep": false, "improved": "rewritten summary here"}}"""
+
+
+def run_review(model: str, summaries: list[dict]) -> tuple[list[dict], float]:
+    """
+    Review every summary for quality. Queries the KB for domain context so
+    the LLM can use proper vocabulary in rewrites.
+    Summaries must be indexed in R2R before calling this.
+    Returns (summaries_with_improvements, edit_rate).
+    """
+    print(f"\n[Review] Reviewing {len(summaries)} summaries with {model}...")
+    edited = 0
+
+    for i, entry in enumerate(summaries):
+        query = f"{entry.get('module', '')} {entry['summary'][:120]}"
+        kb_context = search_kb(query, limit=3)
+        prompt = _build_review_prompt(entry, kb_context)
+
+        try:
+            raw = llm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512, json_mode=True)
+            data = json.loads(raw)
+            if not data.get("keep") and data.get("improved", "").strip():
+                entry["summary"] = data["improved"].strip()
+                edited += 1
+                print(f"  [{i+1:>4}/{len(summaries)}] edited  {entry.get('source_file', '?')}")
+            else:
+                print(f"  [{i+1:>4}/{len(summaries)}] kept    {entry.get('source_file', '?')}")
+        except Exception as e:
+            print(f"  [{i+1:>4}/{len(summaries)}] [warn] review failed: {e}")
+
+        time.sleep(0.2)
+
+    edit_rate = edited / len(summaries) if summaries else 0.0
+    print(f"[Review] {edited}/{len(summaries)} summaries edited ({edit_rate:.1%})")
+    return summaries, edit_rate
+
+
 # ── Pass 1: Module Discovery ───────────────────────────────────────────────────
 
 PASS1_SYSTEM = (
@@ -296,14 +488,19 @@ PASS2_SYSTEM = (
 
 def build_pass2_prompt(project_desc: str, module_name: str,
                        module_desc: str, questions: list[str],
-                       source_file: str, raw_code: str) -> str:
+                       source_file: str, raw_code: str,
+                       kb_context: str = "") -> str:
     questions_text = "\n".join(f"- {q}" for q in questions)
+    kb_section = (
+        f"\nRelevant context from the knowledge base (use this vocabulary):\n{kb_context}\n"
+        if kb_context else ""
+    )
     return f"""Project: {project_desc}
 Module: {module_name} — {module_desc}
 
 Domain questions this module answers:
 {questions_text}
-
+{kb_section}
 Source file: {source_file}
 Code chunk:
 ```
@@ -322,14 +519,17 @@ Summary:"""
 
 
 def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
-              language: str, max_chunks: Optional[int] = None) -> list[dict]:
-    """Chunk each file and call the LLM to generate a domain-aware summary per chunk."""
+              language: str, max_chunks: Optional[int] = None,
+              rag: bool = False) -> list[dict]:
+    """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
+    With rag=True, queries the KB before each chunk to inject relevant context."""
 
     summaries = []
     total_chunks = 0
     skipped = 0
 
-    print(f"\n[Pass 2] Summarizing {len(module_map.modules)} modules with {model}...")
+    rag_label = " (RAG-augmented)" if rag else ""
+    print(f"\n[Pass 2] Summarizing {len(module_map.modules)} modules with {model}{rag_label}...")
 
     for mod in module_map.modules:
         print(f"\n  Module: {mod.name} ({len(mod.files)} files)")
@@ -356,6 +556,7 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     print(f"\n[Pass 2] Reached --max-chunks={max_chunks}, stopping.")
                     return summaries
 
+                kb_context = search_kb(f"{mod.name} {chunk[:200]}", limit=3) if rag else ""
                 prompt = build_pass2_prompt(
                     project_desc=f"{module_map.project}: {module_map.description}",
                     module_name=mod.name,
@@ -363,6 +564,7 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     questions=mod.questions,
                     source_file=rel_path,
                     raw_code=chunk,
+                    kb_context=kb_context,
                 )
 
                 try:
@@ -419,7 +621,7 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Study agent: two-pass codebase analysis → module_map.json + summaries.json"
+        description="Study agent: multi-pass codebase analysis → module_map.json + summaries.json"
     )
     parser.add_argument("--codebase", required=True,
                         help="Root directory of the codebase to analyze")
@@ -436,7 +638,17 @@ def main():
                         choices=["python", "javascript", "typescript", "cpp", "java", "go", "rust"],
                         help="Primary language of the codebase (default: python)")
     parser.add_argument("--docs", default=None,
-                        help="Path to a docs file/directory to include in Pass 1 context")
+                        help="Path to a docs file/directory. Used in Pass 1 context. "
+                             "Also indexed into R2R when --bootstrap-docs is set.")
+    parser.add_argument("--bootstrap-docs", action="store_true",
+                        help="Index --docs into R2R before Pass 2 so RAG has domain vocabulary")
+    parser.add_argument("--rag", action="store_true",
+                        help="Query the KB before each chunk in Pass 2 for richer context. "
+                             "Most useful after --bootstrap-docs.")
+    parser.add_argument("--passes", type=int, default=1,
+                        help="Number of summarize+review iterations (default: 1 = no review). "
+                             "With --passes 3: runs Pass 2, indexes, reviews, repeats up to 3x "
+                             "or until edit rate drops below 5%%.")
     parser.add_argument("--pass1-only", action="store_true",
                         help="Only run Pass 1 (module discovery)")
     parser.add_argument("--pass2-only", action="store_true",
@@ -462,6 +674,13 @@ def main():
     if not files:
         print("No source files found. Check --codebase and --language.")
         sys.exit(1)
+
+    # ── Bootstrap docs into R2R (before Pass 1, so Pass 1 benefits too) ─────────
+    if args.bootstrap_docs:
+        if not args.docs:
+            print("Error: --bootstrap-docs requires --docs PATH")
+            sys.exit(1)
+        bootstrap_docs(Path(args.docs))
 
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
     if not args.pass2_only:
@@ -493,15 +712,48 @@ def main():
         print("\nPass 1 complete. Run with --pass2-only to generate summaries.")
         return
 
-    # ── Pass 2 ──────────────────────────────────────────────────────────────────
-    summaries = run_pass2(
-        args.model, codebase, module_map,
-        language=args.language, max_chunks=args.max_chunks,
-    )
+    # ── Iterative Pass 2 + Review ────────────────────────────────────────────────
+    summaries: list[dict] = []
+    for pass_num in range(1, args.passes + 1):
+        if args.passes > 1:
+            print(f"\n{'='*60}")
+            print(f"  PASS {pass_num} of {args.passes}")
+            print(f"{'='*60}")
 
-    summaries_path.write_text(json.dumps(summaries, indent=2))
-    print(f"\n[Done] {len(summaries)} summaries written to {summaries_path}")
-    print(f"       Next: python indexer.py --index {summaries_path}")
+        # Pass 2: summarize (with RAG if requested)
+        summaries = run_pass2(
+            args.model, codebase, module_map,
+            language=args.language,
+            max_chunks=args.max_chunks,
+            rag=args.rag,
+        )
+
+        if args.passes > 1:
+            # Index this pass's summaries so the review pass can query them
+            # (also gives the next summarization pass a richer KB)
+            index_summaries_to_r2r(summaries)
+
+            # Pass 3: review + improve
+            summaries, edit_rate = run_review(args.model, summaries)
+
+            # Update R2R with improved summaries
+            index_summaries_to_r2r(summaries)
+
+            summaries_path.write_text(json.dumps(summaries, indent=2))
+            print(f"\n[Pass {pass_num}] {len(summaries)} summaries written to {summaries_path}")
+
+            if edit_rate < CONVERGENCE_THRESHOLD:
+                print(f"\nConverged after pass {pass_num} "
+                      f"(edit rate {edit_rate:.1%} < {CONVERGENCE_THRESHOLD:.0%})")
+                break
+        else:
+            summaries_path.write_text(json.dumps(summaries, indent=2))
+
+    if args.passes == 1:
+        print(f"\n[Done] {len(summaries)} summaries written to {summaries_path}")
+        print(f"       Next: python indexer.py --index {summaries_path}")
+    else:
+        print(f"\n[Done] Final summaries in {summaries_path} (already indexed in R2R)")
 
 
 if __name__ == "__main__":
