@@ -17,5 +17,7 @@ mcp_server/staging_queue.json
 mcp_server/query_log.jsonl
 reviewer/rejected_queue.json
 
-# Module map output (generated artifact)
+# Generated artifacts
 indexer/module_map.json
+indexer/summaries.json
+indexer/file_hashes.json

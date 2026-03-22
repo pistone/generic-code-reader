@@ -42,8 +42,10 @@ Usage:
 """
 
 import argparse
+import hashlib
 import json
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -145,6 +147,51 @@ def collect_source_files(codebase: Path, language: str = "python") -> list[Path]
         if p.suffix in exts:
             results.append(p)
     return results
+
+
+def file_hash(path: Path) -> str:
+    """Fast content hash of a source file (sha256, hex-truncated to 16 chars)."""
+    h = hashlib.sha256()
+    try:
+        h.update(path.read_bytes())
+    except Exception:
+        return ""
+    return h.hexdigest()[:16]
+
+
+def load_hash_manifest(path: Path) -> dict[str, str]:
+    """Load {relative_path: hash} from a previous run."""
+    if path.exists():
+        try:
+            return json.loads(path.read_text())
+        except Exception:
+            return {}
+    return {}
+
+
+def save_hash_manifest(path: Path, manifest: dict[str, str]) -> None:
+    path.write_text(json.dumps(manifest, indent=2))
+
+
+def filter_changed_files(codebase: Path, files: list[Path],
+                         manifest_path: Path) -> tuple[list[Path], dict[str, str]]:
+    """
+    Compare current file hashes against a saved manifest.
+    Returns (changed_files, new_manifest).
+    Only returns files whose content has changed since the last run.
+    """
+    old_manifest = load_hash_manifest(manifest_path)
+    new_manifest: dict[str, str] = {}
+    changed: list[Path] = []
+
+    for f in files:
+        rel = str(f.relative_to(codebase))
+        h = file_hash(f)
+        new_manifest[rel] = h
+        if h != old_manifest.get(rel, ""):
+            changed.append(f)
+
+    return changed, new_manifest
 
 
 def build_directory_tree(codebase: Path, files: list[Path]) -> str:
@@ -704,6 +751,9 @@ def main():
                         help="Only run Pass 2 (requires existing module_map.json)")
     parser.add_argument("--max-chunks", type=int, default=None,
                         help="Cap total chunks in Pass 2 (good for quick demos)")
+    parser.add_argument("--incremental", action="store_true",
+                        help="Only re-summarize files whose content has changed since "
+                             "the last run. Uses a hash manifest (file_hashes.json).")
     args = parser.parse_args()
 
     codebase = Path(args.codebase).resolve()
@@ -723,6 +773,28 @@ def main():
     if not files:
         print("No source files found. Check --codebase and --language.")
         sys.exit(1)
+
+    # ── Incremental: filter to changed files only ──────────────────────────────
+    hash_manifest_path = output_dir / "file_hashes.json"
+    new_manifest: Optional[dict] = None
+    if args.incremental:
+        changed_files, new_manifest = filter_changed_files(codebase, files, hash_manifest_path)
+        if not changed_files:
+            print("[Incremental] No files changed since last run. Nothing to do.")
+            return
+        print(f"[Incremental] {len(changed_files)}/{len(files)} files changed — "
+              f"only these will be re-summarized")
+        # Remove old summaries for changed files so they get regenerated
+        if summaries_path.exists():
+            try:
+                existing = json.loads(summaries_path.read_text())
+                changed_rels = {str(f.relative_to(codebase)) for f in changed_files}
+                kept = [e for e in existing if e.get("source_file") not in changed_rels]
+                summaries_path.write_text(json.dumps(kept, indent=2))
+                print(f"[Incremental] Purged {len(existing) - len(kept)} stale summaries, "
+                      f"kept {len(kept)}")
+            except Exception:
+                pass
 
     # ── Bootstrap docs into R2R (before Pass 1, so Pass 1 benefits too) ─────────
     if args.bootstrap_docs:
@@ -803,6 +875,11 @@ def main():
                 break
         else:
             summaries_path.write_text(json.dumps(summaries, indent=2))
+
+    # Save hash manifest so --incremental can detect changes next time
+    if new_manifest is not None:
+        save_hash_manifest(hash_manifest_path, new_manifest)
+        print(f"[Incremental] Saved file hashes to {hash_manifest_path}")
 
     if args.passes == 1:
         print(f"\n[Done] {len(summaries)} summaries written to {summaries_path}")
