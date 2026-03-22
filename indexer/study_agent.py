@@ -43,6 +43,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -52,8 +53,8 @@ from pydantic import BaseModel
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL        = "openai/gpt-4o"
-R2R_URL              = "http://localhost:7272"
+DEFAULT_MODEL        = os.getenv("LLM_MODEL", "openai/gpt-4o")
+R2R_URL              = os.getenv("R2R_URL", "http://localhost:7272")
 CONVERGENCE_THRESHOLD = 0.05   # stop iterating when < 5% of summaries are edited
 
 # Max lines to sample from each file for Pass 1

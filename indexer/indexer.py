@@ -26,9 +26,11 @@ import sys
 import time
 from pathlib import Path
 
+import os
+
 from r2r import R2RClient
 
-R2R_URL = "http://localhost:7272"
+R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 
 
 def get_client() -> R2RClient:

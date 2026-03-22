@@ -1,0 +1,107 @@
+# Generic Code Reader
+
+A self-improving domain knowledge base for codebases. Indexes LLM-generated summaries into a vector database (R2R) and exposes them as an MCP server for Claude Code.
+
+## Architecture
+
+```
+indexer/study_agent.py   → Analyzes codebase, generates summaries (multi-pass with RAG)
+indexer/indexer.py       → Feeds summaries into R2R vector DB
+mcp_server/server.py     → MCP server: search_codebase + suggest_index_item
+reviewer/reviewer_agent.py → Verifies runtime suggestions before promoting to the KB
+```
+
+The self-improving loop: when Claude can't find an answer in the KB, it researches manually and calls `suggest_index_item()`. The reviewer agent verifies the suggestion and promotes it into R2R, so the next developer gets an instant answer.
+
+## Setup
+
+### 1. Clone and create virtualenv
+
+```bash
+git clone <repo-url> && cd generic-code-reader
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. Configure API keys
+
+```bash
+cp .env.example .env
+# Edit .env — at minimum set:
+#   OPENAI_API_KEY   (for the LLM — or use Ollama for fully local)
+#   VOYAGE_API_KEY   (for R2R embeddings)
+```
+
+### 3. Start R2R (vector database)
+
+```bash
+source .env
+docker compose -f r2r/compose.yaml up -d
+# Verify: curl http://localhost:7272/v3/health
+```
+
+### 4. Study the codebase
+
+```bash
+# Basic: two-pass analysis (module discovery → summarization)
+python indexer/study_agent.py --codebase /path/to/your/src --language python
+
+# With RAG augmentation (recommended if you have design docs):
+python indexer/study_agent.py --codebase /path/to/your/src \
+    --docs /path/to/docs --bootstrap-docs --rag --passes 3
+
+# Quick test with 20 chunks
+python indexer/study_agent.py --codebase /path/to/your/src --max-chunks 20
+```
+
+### 5. Index summaries into R2R
+
+```bash
+# If you ran with --passes 1 (default), index manually:
+python indexer/indexer.py --index --file indexer/summaries.json
+
+# If you ran with --passes > 1, summaries are already indexed.
+
+# Verify:
+python indexer/indexer.py --search "your query here"
+```
+
+### 6. Use with Claude Code
+
+The `.mcp.json` is already configured. Open Claude Code in this directory and the `search_codebase` tool will be available.
+
+### 7. (Optional) Run the reviewer agent
+
+```bash
+# Process pending suggestions once
+python reviewer/reviewer_agent.py --codebase /path/to/your/src
+
+# Or keep it running in watch mode
+python reviewer/reviewer_agent.py --codebase /path/to/your/src --watch
+```
+
+## Configuration
+
+All scripts respect these environment variables:
+
+| Variable | Default | Used by |
+|----------|---------|---------|
+| `R2R_URL` | `http://localhost:7272` | All scripts |
+| `LLM_MODEL` | `openai/gpt-4o` | study_agent, reviewer_agent |
+| `OPENAI_API_KEY` | — | LLM calls (if using OpenAI) |
+| `VOYAGE_API_KEY` | — | R2R embeddings |
+
+For fully local operation (no API keys): use Ollama + swap R2R embeddings to a local model.
+
+```bash
+# Ollama example
+ollama pull llama3.1
+python indexer/study_agent.py --codebase /path/to/src --model ollama/llama3.1
+```
+
+## Supported Languages
+
+`python`, `javascript`, `typescript`, `cpp`, `java`, `go`, `rust`
+
+Pass `--language <lang>` to the study agent. Defaults to `python`.

@@ -22,6 +22,7 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -33,8 +34,8 @@ from r2r import R2RClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-DEFAULT_MODEL   = "openai/gpt-4o"
-R2R_URL         = "http://localhost:7272"
+DEFAULT_MODEL   = os.getenv("LLM_MODEL", "openai/gpt-4o")
+R2R_URL         = os.getenv("R2R_URL", "http://localhost:7272")
 WATCH_INTERVAL  = 30   # seconds between queue polls in --watch mode
 MAX_FILE_CHARS  = 3000  # max chars to read per cited source file
 KB_SEARCH_LIMIT = 5     # how many similar KB entries to fetch for dup check

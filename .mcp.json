@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "domain-kb": {
-      "command": "/Users/songtao/dev/generic-code-reader/.venv/bin/python",
-      "args": ["/Users/songtao/dev/generic-code-reader/mcp_server/server.py"],
+      "command": ".venv/bin/python",
+      "args": ["mcp_server/server.py"],
       "env": {
         "R2R_URL": "http://localhost:7272",
         "KB_SEARCH_LIMIT": "5"
