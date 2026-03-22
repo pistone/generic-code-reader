@@ -18,6 +18,7 @@ base_model = "openai/gpt-4o-mini"
 
 [database]
 provider = "postgres"
+enable_fts = true
 
 [app]
 quality_llm = "openai/gpt-4o-mini"

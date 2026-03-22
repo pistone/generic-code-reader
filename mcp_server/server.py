@@ -107,7 +107,10 @@ def search_codebase(query: str) -> str:
     client = get_client()
     results = client.retrieval.search(
         query=query,
-        search_settings={"limit": SEARCH_LIMIT},
+        search_settings={
+            "limit": SEARCH_LIMIT,
+            "use_hybrid_search": True,
+        },
     )
     hits = results.results.chunk_search_results
 
@@ -125,6 +128,7 @@ def suggest_index_item(
     summary: str,
     source_files: list[str],
     reasoning: str,
+    raw_code: str = "",
 ) -> str:
     """
     Suggest a new entry for the domain knowledge base.
@@ -139,12 +143,16 @@ def suggest_index_item(
                       the question clearly using domain vocabulary.
         source_files: List of source file paths you read to find the answer.
         reasoning:    Why this is worth adding — what question does it answer?
+        raw_code:     The key source code snippet that answers the question.
+                      This gets stored alongside the summary so future searches
+                      return ground truth, not just the summary.
     """
     queue = _load_staging()
     entry = {
         "topic":        topic,
         "summary":      summary,
         "source_files": source_files,
+        "raw_code":     raw_code,
         "reasoning":    reasoning,
         "status":       "pending",
         "timestamp":    datetime.now(timezone.utc).isoformat(),
