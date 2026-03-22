@@ -201,7 +201,7 @@ def chunk_file(path: Path, language: str = "python") -> list[str]:
             chunk = "\n".join(lines[i : i + CHUNK_LINES + CHUNK_LINES_OVERLAP])
             if chunk.strip():
                 result.append(chunk[:MAX_CHARS])
-        return result or [""]
+        return result or []
 
 
 # ── R2R helpers (bootstrap, RAG search, auto-index) ───────────────────────────
@@ -364,7 +364,7 @@ def run_review(model: str, summaries: list[dict]) -> tuple[list[dict], float]:
     edited = 0
 
     for i, entry in enumerate(summaries):
-        query = f"{entry.get('module', '')} {entry['summary'][:120]}"
+        query = f"{entry.get('module', '')} {entry.get('summary', '')[:120]}"
         kb_context = search_kb(query, limit=3)
         prompt = _build_review_prompt(entry, kb_context)
 
@@ -450,7 +450,7 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     for f in files:
         sample = read_file_sample(f)
         if len(sample.strip()) > 20:
-            file_samples[f.name] = sample
+            file_samples[str(f.relative_to(codebase))] = sample
 
     prompt = build_pass1_prompt(
         codebase_name=codebase.name,
@@ -519,15 +519,38 @@ Requirements:
 Summary:"""
 
 
+def _make_chunk_key(source_file: str, chunk_index: int) -> str:
+    """Unique key for a chunk, used to detect already-summarized chunks on resume."""
+    return f"{source_file}::{chunk_index}"
+
+
 def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
               language: str, max_chunks: Optional[int] = None,
-              rag: bool = False) -> list[dict]:
+              rag: bool = False,
+              summaries_path: Optional[Path] = None) -> list[dict]:
     """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
-    With rag=True, queries the KB before each chunk to inject relevant context."""
+    With rag=True, queries the KB before each chunk to inject relevant context.
+    If summaries_path is set, writes incrementally for crash-safety."""
 
-    summaries = []
-    total_chunks = 0
+    # Load existing summaries for resume support
+    summaries: list[dict] = []
+    done_keys: set[str] = set()
+    if summaries_path and summaries_path.exists():
+        try:
+            summaries = json.loads(summaries_path.read_text())
+            for entry in summaries:
+                done_keys.add(_make_chunk_key(
+                    entry.get("source_file", ""),
+                    entry.get("chunk_index", 0),
+                ))
+            if done_keys:
+                print(f"\n[Pass 2] Resuming — {len(done_keys)} chunks already summarized")
+        except Exception:
+            summaries = []
+
+    total_chunks = len(summaries)
     skipped = 0
+    new_this_run = 0
 
     rag_label = " (RAG-augmented)" if rag else ""
     print(f"\n[Pass 2] Summarizing {len(module_map.modules)} modules with {model}{rag_label}...")
@@ -536,12 +559,18 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         print(f"\n  Module: {mod.name} ({len(mod.files)} files)")
 
         for fname in mod.files:
-            candidates = list(codebase.rglob(fname))
-            if not candidates:
-                print(f"    [warn] {fname} not found under {codebase}, skipping")
-                skipped += 1
-                continue
-            fpath = candidates[0]
+            # Try direct relative path first (fast, deterministic)
+            fpath = codebase / fname
+            if not fpath.exists():
+                # Fall back to rglob on the basename (handles LLM returning just filenames)
+                candidates = list(codebase.rglob(Path(fname).name))
+                if not candidates:
+                    print(f"    [warn] {fname} not found under {codebase}, skipping")
+                    skipped += 1
+                    continue
+                fpath = candidates[0]
+                if len(candidates) > 1:
+                    print(f"    [warn] {fname}: {len(candidates)} matches, using {fpath.relative_to(codebase)}")
 
             chunks = chunk_file(fpath, language=language)
             if not chunks:
@@ -556,6 +585,12 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                 if max_chunks is not None and total_chunks >= max_chunks:
                     print(f"\n[Pass 2] Reached --max-chunks={max_chunks}, stopping.")
                     return summaries
+
+                chunk_key = _make_chunk_key(rel_path, i)
+                if chunk_key in done_keys:
+                    total_chunks += 0  # already counted
+                    print(f"      chunk {i+1}/{len(chunks)} → [cached]")
+                    continue
 
                 kb_context = search_kb(f"{mod.name} {chunk[:200]}", limit=3) if rag else ""
                 prompt = build_pass2_prompt(
@@ -584,10 +619,16 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                         "source_file": rel_path,
                         "module":      mod.name,
                         "chunk_type":  "function_summary",
+                        "chunk_index": i,
                     }
                     summaries.append(entry)
                     total_chunks += 1
+                    new_this_run += 1
                     print(f"      chunk {i+1}/{len(chunks)} → {len(summary_text)} chars")
+
+                    # Write incrementally for crash safety
+                    if summaries_path and new_this_run % 5 == 0:
+                        summaries_path.write_text(json.dumps(summaries, indent=2))
 
                     time.sleep(0.3)  # avoid rate-limit bursts
 
@@ -605,8 +646,10 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                                 "source_file": rel_path,
                                 "module":      mod.name,
                                 "chunk_type":  "function_summary",
+                                "chunk_index": i,
                             })
                             total_chunks += 1
+                            new_this_run += 1
                         except Exception as retry_err:
                             print(f"      [error] retry failed: {retry_err}, skipping")
                             skipped += 1
@@ -614,7 +657,12 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                         print(f"      [error] chunk {i+1}: {e}, skipping")
                         skipped += 1
 
-    print(f"\n[Pass 2] Done: {total_chunks} summaries generated, {skipped} skipped")
+    # Final write
+    if summaries_path:
+        summaries_path.write_text(json.dumps(summaries, indent=2))
+
+    print(f"\n[Pass 2] Done: {total_chunks} summaries total "
+          f"({new_this_run} new this run, {skipped} skipped)")
     return summaries
 
 
@@ -714,6 +762,11 @@ def main():
         return
 
     # ── Iterative Pass 2 + Review ────────────────────────────────────────────────
+    #
+    # Pass 1 (pass_num=1): summarize all chunks → index → review → improve
+    # Pass 2+ (pass_num>1): only review+improve (KB is richer from pass 1,
+    #   so the reviewer has better context). Re-running Pass 2 from scratch
+    #   would discard the review edits.
     summaries: list[dict] = []
     for pass_num in range(1, args.passes + 1):
         if args.passes > 1:
@@ -721,20 +774,21 @@ def main():
             print(f"  PASS {pass_num} of {args.passes}")
             print(f"{'='*60}")
 
-        # Pass 2: summarize (with RAG if requested)
-        summaries = run_pass2(
-            args.model, codebase, module_map,
-            language=args.language,
-            max_chunks=args.max_chunks,
-            rag=args.rag,
-        )
+        # Only run full summarization on the first pass
+        if pass_num == 1:
+            summaries = run_pass2(
+                args.model, codebase, module_map,
+                language=args.language,
+                max_chunks=args.max_chunks,
+                rag=args.rag,
+                summaries_path=summaries_path,
+            )
 
         if args.passes > 1:
-            # Index this pass's summaries so the review pass can query them
-            # (also gives the next summarization pass a richer KB)
+            # Index summaries so the review pass can query them
             index_summaries_to_r2r(summaries)
 
-            # Pass 3: review + improve
+            # Review + improve
             summaries, edit_rate = run_review(args.model, summaries)
 
             # Update R2R with improved summaries
