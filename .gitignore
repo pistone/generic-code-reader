@@ -30,3 +30,7 @@ doc_agent/doc_hashes.json
 # Auditor artifacts
 auditor/conflict_report.json
 auditor/cost_log.jsonl
+
+# Ticket agent artifacts
+ticket_agent/ticket_hashes.json
+ticket_agent/cost_log.jsonl

@@ -5,12 +5,13 @@ A self-improving domain knowledge base for codebases. Indexes LLM-generated summ
 ## Architecture
 
 ```
-doc_agent/doc_agent.py     → Ingests design docs, runbooks, wiki pages into R2R
-indexer/study_agent.py     → Analyzes codebase, generates summaries (multi-pass with RAG)
-indexer/indexer.py         → Feeds summaries into R2R vector DB
-auditor/auditor.py         → Detects doc↔code conflicts (staleness, contradictions)
-mcp_server/server.py       → MCP server: search_codebase + suggest_index_item
-reviewer/reviewer_agent.py → Verifies runtime suggestions before promoting to the KB
+doc_agent/doc_agent.py       → Ingests design docs, runbooks, wiki pages into R2R
+indexer/study_agent.py       → Analyzes codebase, generates summaries (multi-pass with RAG)
+indexer/indexer.py           → Feeds summaries into R2R vector DB
+ticket_agent/ticket_agent.py → Extracts knowledge from Jira/PR ticket exports
+auditor/auditor.py           → Detects doc↔code conflicts (staleness, contradictions)
+mcp_server/server.py         → MCP server: search_codebase + suggest_index_item
+reviewer/reviewer_agent.py   → Verifies runtime suggestions before promoting to the KB
 ```
 
 The self-improving loop: when Claude can't find an answer in the KB, it researches manually and calls `suggest_index_item()`. The reviewer agent verifies the suggestion and promotes it into R2R, so the next developer gets an instant answer.
@@ -87,7 +88,23 @@ python indexer/indexer.py --index indexer/summaries.json
 python indexer/indexer.py --search "your query here"
 ```
 
-### 7. (Optional) Audit doc↔code consistency
+### 7. (Optional) Index ticket knowledge
+
+If you have exported Jira tickets, PR discussions, or similar:
+
+```bash
+# Export tickets with your existing tools, then:
+python -m ticket_agent.ticket_agent --tickets /path/to/exported/tickets
+
+# Incremental (skip already-processed tickets)
+python -m ticket_agent.ticket_agent --tickets /path/to/tickets --incremental
+```
+
+The ticket agent filters aggressively (only resolved tickets with comments),
+uses LLM to extract root causes, workarounds, and design decisions, then
+deduplicates against the existing KB before indexing.
+
+### 8. (Optional) Audit doc↔code consistency
 
 After indexing both docs and code, check for contradictions:
 
@@ -104,11 +121,11 @@ The auditor compares doc entries against code entries using timestamps
 first, then LLM comparison on flagged pairs. Review the conflict report
 to identify stale documentation.
 
-### 8. Use with Claude Code
+### 9. Use with Claude Code
 
 The `.mcp.json` is already configured. Open Claude Code in this directory and the `search_codebase` tool will be available.
 
-### 9. (Optional) Run the reviewer agent
+### 10. (Optional) Run the reviewer agent
 
 ```bash
 # Process pending suggestions once

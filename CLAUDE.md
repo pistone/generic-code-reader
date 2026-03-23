@@ -192,6 +192,8 @@ generic-code-reader/
 ├── requirements.txt           ← Python dependencies
 ├── auditor/
 │   └── auditor.py             ← cross-reference auditor (doc↔code conflict detection)
+├── ticket_agent/
+│   └── ticket_agent.py        ← knowledge extraction from Jira/PR ticket exports
 ├── doc_agent/
 │   ├── doc_agent.py           ← document ingestion pipeline
 │   ├── sources.py             ← pluggable source adapters (local, future: SharePoint)
@@ -219,6 +221,8 @@ Runtime artifacts (gitignored):
 - `doc_agent/doc_hashes.json` — doc incremental change manifest
 - `auditor/conflict_report.json` — doc↔code conflict report
 - `auditor/cost_log.jsonl` — auditor token usage log
+- `ticket_agent/ticket_hashes.json` — ticket incremental manifest
+- `ticket_agent/cost_log.jsonl` — ticket agent token usage log
 - `mcp_server/staging_queue.json` — pending suggestions
 - `mcp_server/query_log.jsonl` — search query audit log
 - `reviewer/rejected_queue.json` — rejected suggestions
