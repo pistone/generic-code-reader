@@ -23,3 +23,6 @@ indexer/summaries.json
 indexer/file_hashes.json
 indexer/cost_log.jsonl
 reviewer/cost_log.jsonl
+
+# Doc agent artifacts
+doc_agent/doc_hashes.json

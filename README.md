@@ -5,9 +5,10 @@ A self-improving domain knowledge base for codebases. Indexes LLM-generated summ
 ## Architecture
 
 ```
-indexer/study_agent.py   → Analyzes codebase, generates summaries (multi-pass with RAG)
-indexer/indexer.py       → Feeds summaries into R2R vector DB
-mcp_server/server.py     → MCP server: search_codebase + suggest_index_item
+doc_agent/doc_agent.py     → Ingests design docs, runbooks, wiki pages into R2R
+indexer/study_agent.py     → Analyzes codebase, generates summaries (multi-pass with RAG)
+indexer/indexer.py         → Feeds summaries into R2R vector DB
+mcp_server/server.py       → MCP server: search_codebase + suggest_index_item
 reviewer/reviewer_agent.py → Verifies runtime suggestions before promoting to the KB
 ```
 
@@ -41,15 +42,28 @@ docker compose -f r2r/compose.yaml up -d
 # Verify: curl http://localhost:7272/v3/health
 ```
 
-### 4. Study the codebase
+### 4. (Optional) Index design documents
+
+If your project has design docs, architecture docs, runbooks, or wiki exports:
+
+```bash
+python -m doc_agent.doc_agent --docs /path/to/docs
+
+# Re-run only on changed docs
+python -m doc_agent.doc_agent --docs /path/to/docs --incremental
+```
+
+Run this **before** the study agent so RAG-augmented summarization can
+reference your documentation.
+
+### 5. Study the codebase
 
 ```bash
 # Basic: two-pass analysis (module discovery → summarization)
 python indexer/study_agent.py --codebase /path/to/your/src --language python
 
-# With RAG augmentation (recommended if you have design docs):
-python indexer/study_agent.py --codebase /path/to/your/src \
-    --docs /path/to/docs --bootstrap-docs --rag --passes 3
+# With RAG augmentation (recommended after indexing docs):
+python indexer/study_agent.py --codebase /path/to/your/src --rag --passes 3
 
 # Quick test with 20 chunks
 python indexer/study_agent.py --codebase /path/to/your/src --max-chunks 20
@@ -60,7 +74,7 @@ python indexer/study_agent.py --codebase /path/to/your/src --incremental
 
 Token usage is printed at the end of each run and logged to `indexer/cost_log.jsonl`.
 
-### 5. Index summaries into R2R
+### 6. Index summaries into R2R
 
 ```bash
 # If you ran with --passes 1 (default), index manually:
@@ -72,11 +86,11 @@ python indexer/indexer.py --index indexer/summaries.json
 python indexer/indexer.py --search "your query here"
 ```
 
-### 6. Use with Claude Code
+### 7. Use with Claude Code
 
 The `.mcp.json` is already configured. Open Claude Code in this directory and the `search_codebase` tool will be available.
 
-### 7. (Optional) Run the reviewer agent
+### 8. (Optional) Run the reviewer agent
 
 ```bash
 # Process pending suggestions once

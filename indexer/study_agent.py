@@ -370,6 +370,13 @@ def _chunk_doc(content: str, max_chars: int = 1500) -> list[str]:
 
 def bootstrap_docs(docs_path: Path) -> int:
     """
+    DEPRECATED: Use doc_agent for proper document ingestion instead.
+    Run: python -m doc_agent.doc_agent --docs /path/to/docs
+
+    doc_agent provides section-aware chunking, heading extraction, HTML parsing,
+    incremental mode, and proper metadata (doc_title, source_type, last_modified).
+    This function remains for backward compatibility.
+
     Index .md/.rst/.txt files from docs_path into R2R as doc_summary chunks.
     Call this before Pass 2 so the RAG search has domain vocabulary to work with.
     Returns the number of chunks indexed.

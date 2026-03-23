@@ -94,14 +94,24 @@ so searches for exact identifiers match the source directly.
 - **Pass 3+**: Review — LLM reviews each summary against KB context,
   rewrites weak ones. Converges when edit rate < 5%
 
-### 3. Design docs bootstrapped into KB
+### 3. Doc agent for document ingestion
 
-With `--bootstrap-docs`, design docs are chunked and indexed into R2R
-before summarization begins. The study agent queries them on demand
-via `search_kb()` — not preloaded into context.
+The doc agent (`doc_agent/`) ingests design docs, runbooks, wiki pages,
+and other prose documents into R2R.  It runs **before** the study agent
+so code summarization can pull doc knowledge via RAG.
 
-Auto-detection: if `--rag` is set and no `--docs` provided, the agent
-looks for `docs/`, `doc/`, `documentation/`, or `design/` directories.
+```
+python -m doc_agent.doc_agent --docs /path/to/docs
+```
+
+Architecture: pluggable sources (LocalFileSource, future: SharePoint,
+Confluence) → file-type parsers (Markdown, HTML, plain text) →
+section-aware chunking → direct R2R indexing of raw text.  No LLM
+calls needed — docs are already human-readable prose.
+
+The study agent's `--bootstrap-docs` flag is deprecated in favor of
+doc_agent, which provides section-aware chunking, heading extraction,
+HTML parsing, incremental mode, and proper metadata.
 
 ### 4. R2R as the backend
 
@@ -168,6 +178,10 @@ generic-code-reader/
 ├── .env.example               ← environment variable template
 ├── .gitignore
 ├── requirements.txt           ← Python dependencies
+├── doc_agent/
+│   ├── doc_agent.py           ← document ingestion pipeline
+│   ├── sources.py             ← pluggable source adapters (local, future: SharePoint)
+│   └── parsers.py             ← file-type parsers (Markdown, HTML, plain text)
 ├── indexer/
 │   ├── study_agent.py         ← multi-pass codebase analysis
 │   ├── indexer.py             ← feeds summaries to R2R
@@ -188,6 +202,7 @@ Runtime artifacts (gitignored):
 - `indexer/summaries.json` — Pass 2 output
 - `indexer/file_hashes.json` — incremental change manifest
 - `indexer/cost_log.jsonl` — token usage log
+- `doc_agent/doc_hashes.json` — doc incremental change manifest
 - `mcp_server/staging_queue.json` — pending suggestions
 - `mcp_server/query_log.jsonl` — search query audit log
 - `reviewer/rejected_queue.json` — rejected suggestions
