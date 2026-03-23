@@ -90,7 +90,8 @@ mcp = FastMCP("domain-kb")
 
 
 @mcp.tool()
-def search_codebase(query: str, module: str = "") -> str:
+def search_codebase(query: str, module: str = "",
+                    source_type: str = "") -> str:
     """
     Search the domain knowledge base semantically.
 
@@ -103,14 +104,22 @@ def search_codebase(query: str, module: str = "") -> str:
                 E.g. "how does the null dereference checker handle pointer arithmetic"
         module: Optional module name to restrict the search scope.
                 E.g. "checkers", "dataflow". Leave empty to search everything.
+        source_type: Optional filter by knowledge source type.
+                     "code" = code summaries, "doc" = design docs/wiki,
+                     "ticket" = Jira/PR knowledge. Leave empty for all.
     """
     client = get_client()
     search_settings: dict = {
         "limit": SEARCH_LIMIT,
         "use_hybrid_search": True,
     }
+    filters: dict = {}
     if module:
-        search_settings["filters"] = {"module": {"$eq": module}}
+        filters["module"] = {"$eq": module}
+    if source_type:
+        filters["source_type"] = {"$eq": source_type}
+    if filters:
+        search_settings["filters"] = filters
 
     results = client.retrieval.search(
         query=query,

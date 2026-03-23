@@ -183,6 +183,49 @@ class HTMLParser:
 
 
 # ---------------------------------------------------------------------------
+# PDF
+# ---------------------------------------------------------------------------
+
+class PDFParser:
+    """Parse .pdf files using pymupdf (fitz).  Falls back to PlainTextParser
+    if pymupdf is not installed."""
+
+    def parse(self, path: str, content: bytes,
+              last_modified: datetime) -> ParsedDocument:
+        try:
+            import pymupdf  # noqa: F811
+        except ImportError:
+            print(f"  [warn] pymupdf not installed, treating {path} as plain text. "
+                  "Install with: pip install pymupdf")
+            return PlainTextParser().parse(path, content, last_modified)
+
+        doc = pymupdf.Document(stream=content, filetype="pdf")
+        sections: list[Section] = []
+        full_text_parts: list[str] = []
+
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            text = page.get_text().strip()
+            if not text:
+                continue
+            heading = f"Page {page_num + 1}"
+            sections.append(Section(heading=heading, content=text,
+                                    level=1))
+            full_text_parts.append(text)
+
+        full_text = "\n\n".join(full_text_parts)
+        title = (doc.metadata.get("title") or "").strip()
+        if not title:
+            title = Path(path).stem.replace("_", " ").replace("-", " ").title()
+
+        doc.close()
+        return ParsedDocument(
+            title=title, text=full_text, sections=sections,
+            source_file=path, last_modified=last_modified,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Plain text / RST
 # ---------------------------------------------------------------------------
 
@@ -206,12 +249,14 @@ class PlainTextParser:
 
 _MARKDOWN = MarkdownParser()
 _HTML = HTMLParser()
+_PDF = PDFParser()
 _PLAIN = PlainTextParser()
 
 PARSER_MAP = {
     ".md":   _MARKDOWN,
     ".html": _HTML,
     ".htm":  _HTML,
+    ".pdf":  _PDF,
     ".txt":  _PLAIN,
     ".rst":  _PLAIN,
 }

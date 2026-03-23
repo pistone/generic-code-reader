@@ -24,7 +24,7 @@ class DocumentSource(Protocol):
     def list_documents(self) -> Iterator[RawDocument]: ...
 
 
-DOC_EXTENSIONS = {".md", ".rst", ".txt", ".html", ".htm"}
+DOC_EXTENSIONS = {".md", ".rst", ".txt", ".html", ".htm", ".pdf"}
 
 SKIP_DIRS = {
     "__pycache__", ".git", ".hg", ".svn", "node_modules",
