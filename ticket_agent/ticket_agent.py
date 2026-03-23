@@ -20,8 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import litellm
 from r2r import R2RClient
+
+# Shared utilities
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from shared.utils import TokenTracker, llm_call, load_manifest, save_manifest  # noqa: E402
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")
@@ -30,85 +33,6 @@ DEDUP_THRESHOLD = 0.85
 RESOLVED_STATUSES = {"done", "closed", "resolved", "fixed", "complete"}
 REJECT_RESOLUTIONS = {"won't fix", "wontfix", "duplicate", "cannot reproduce",
                       "incomplete", "not a bug"}
-
-
-# ---------------------------------------------------------------------------
-# TokenTracker (same pattern as study_agent / auditor)
-# ---------------------------------------------------------------------------
-
-class TokenTracker:
-    def __init__(self):
-        self.phases: dict[str, dict[str, int]] = {}
-
-    def _ensure_phase(self, phase: str) -> dict[str, int]:
-        if phase not in self.phases:
-            self.phases[phase] = {"prompt": 0, "completion": 0, "calls": 0}
-        return self.phases[phase]
-
-    def record(self, phase: str, response) -> None:
-        p = self._ensure_phase(phase)
-        usage = getattr(response, "usage", None)
-        if usage:
-            p["prompt"] += getattr(usage, "prompt_tokens", 0)
-            p["completion"] += getattr(usage, "completion_tokens", 0)
-        p["calls"] += 1
-
-    def summary(self) -> str:
-        lines = []
-        total_p = total_c = 0
-        for phase, counts in self.phases.items():
-            lines.append(
-                f"[Tokens] {phase}: {counts['prompt']:,} prompt "
-                f"+ {counts['completion']:,} completion  "
-                f"({counts['calls']} call(s))"
-            )
-            total_p += counts["prompt"]
-            total_c += counts["completion"]
-        lines.append(
-            f"[Tokens] Total: {total_p:,} prompt + {total_c:,} completion "
-            f"= {total_p + total_c:,} tokens"
-        )
-        return "\n".join(lines)
-
-    def to_log_entry(self, model: str) -> dict:
-        total = sum(p["prompt"] + p["completion"]
-                    for p in self.phases.values())
-        return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "model": model,
-            "agent": "ticket_agent",
-            "phases": dict(self.phases),
-            "total_tokens": total,
-        }
-
-
-# ---------------------------------------------------------------------------
-# LLM call
-# ---------------------------------------------------------------------------
-
-def llm_call(model: str, system: str, user: str,
-             max_tokens: int = 1024,
-             json_mode: bool = False,
-             tracker: Optional[TokenTracker] = None,
-             phase: str = "") -> str:
-    kwargs: dict = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": max_tokens,
-    }
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    response = litellm.completion(**kwargs)
-    text = response.choices[0].message.content
-
-    if tracker and phase:
-        tracker.record(phase, response)
-
-    return text
 
 
 # ---------------------------------------------------------------------------
@@ -267,10 +191,14 @@ def dedup_against_kb(client: R2RClient, summary: str,
 # Step 6: Index to R2R
 # ---------------------------------------------------------------------------
 
-def index_ticket_summaries(entries: list[dict]) -> list[str]:
-    """Index extracted ticket knowledge into R2R."""
+def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
+    """Index extracted ticket knowledge into R2R.
+
+    Returns a dict mapping ticket key → doc_id for successfully indexed entries.
+    Failed entries are omitted from the result (no misaligned zips).
+    """
     client = R2RClient(R2R_URL)
-    doc_ids: list[str] = []
+    indexed: dict[str, str] = {}
 
     for i, entry in enumerate(entries):
         try:
@@ -285,14 +213,14 @@ def index_ticket_summaries(entries: list[dict]) -> list[str]:
                     "last_modified": entry.get("resolved", ""),
                 },
             )
-            doc_ids.append(str(resp.results.document_id))
+            indexed[entry["key"]] = str(resp.results.document_id)
         except Exception as e:
             print(f"  [warn] {entry['key']}: index failed: {e}")
 
         if i > 0 and i % 20 == 0:
             time.sleep(0.5)
 
-    return doc_ids
+    return indexed
 
 
 # ---------------------------------------------------------------------------
@@ -311,17 +239,7 @@ def ticket_hash(ticket: dict) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
-def load_manifest(path: Path) -> dict:
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def save_manifest(path: Path, manifest: dict) -> None:
-    path.write_text(json.dumps(manifest, indent=2))
+# load_manifest / save_manifest imported from shared.utils
 
 
 # ---------------------------------------------------------------------------
@@ -416,11 +334,14 @@ def main():
     # Step 6: index
     if useful_entries:
         print(f"\nIndexing {len(useful_entries)} ticket summaries into R2R...")
-        doc_ids = index_ticket_summaries(useful_entries)
+        indexed = index_ticket_summaries(useful_entries)
 
         # Update manifest with indexed tickets
-        for entry, doc_id in zip(useful_entries, doc_ids):
+        for entry in useful_entries:
             key = entry["key"]
+            doc_id = indexed.get(key)
+            if doc_id is None:
+                continue  # indexing failed for this entry
             # Find the original ticket to compute hash
             orig = next((t for t in candidates if t.get("key") == key), {})
             manifest[key] = {
@@ -442,7 +363,7 @@ def main():
     # Token tracking
     if tracker.phases:
         print(f"\n{tracker.summary()}")
-        entry = tracker.to_log_entry(model=args.model)
+        entry = tracker.to_log_entry(model=args.model, agent="ticket_agent")
         with cost_log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
 

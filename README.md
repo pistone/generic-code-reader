@@ -12,6 +12,7 @@ ticket_agent/ticket_agent.py → Extracts knowledge from Jira/PR ticket exports
 auditor/auditor.py           → Detects doc↔code conflicts (staleness, contradictions)
 mcp_server/server.py         → MCP server: search_codebase + suggest_index_item
 reviewer/reviewer_agent.py   → Verifies runtime suggestions before promoting to the KB
+shared/utils.py              → Shared utilities (TokenTracker, llm_call, manifest helpers)
 ```
 
 The self-improving loop: when Claude can't find an answer in the KB, it researches manually and calls `suggest_index_item()`. The reviewer agent verifies the suggestion and promotes it into R2R, so the next developer gets an instant answer.
@@ -46,7 +47,7 @@ docker compose -f r2r/compose.yaml up -d
 
 ### 4. (Optional) Index design documents
 
-If your project has design docs, architecture docs, runbooks, or wiki exports:
+If your project has design docs, architecture docs, runbooks, or wiki exports (supports `.md`, `.html`, `.txt`, `.rst`, `.pdf`):
 
 ```bash
 python -m doc_agent.doc_agent --docs /path/to/docs
@@ -123,7 +124,7 @@ to identify stale documentation.
 
 ### 9. Use with Claude Code
 
-The `.mcp.json` is already configured. Open Claude Code in this directory and the `search_codebase` tool will be available.
+The `.mcp.json` is already configured. Open Claude Code in this directory and the `search_codebase` tool will be available. Use the `source_type` parameter to filter results: `"code"` for code summaries, `"doc"` for design docs, `"ticket"` for ticket knowledge, or leave empty for all.
 
 ### 10. (Optional) Run the reviewer agent
 
@@ -142,7 +143,7 @@ All scripts respect these environment variables:
 | Variable | Default | Used by |
 |----------|---------|---------|
 | `R2R_URL` | `http://localhost:7272` | All scripts |
-| `LLM_MODEL` | `openai/gpt-4o` | study_agent, reviewer_agent |
+| `LLM_MODEL` | `openai/gpt-4o` | study_agent, reviewer_agent, auditor, ticket_agent |
 | `OPENAI_API_KEY` | — | LLM calls (if using OpenAI) |
 | `VOYAGE_API_KEY` | — | R2R embeddings |
 | `KB_SEARCH_LIMIT` | `5` | MCP server (max results per search) |

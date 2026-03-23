@@ -24,6 +24,10 @@ from r2r import R2RClient
 from doc_agent.parsers import ParsedDocument, get_parser
 from doc_agent.sources import LocalFileSource, RawDocument
 
+# Shared utilities
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from shared.utils import load_manifest, save_manifest  # noqa: E402
+
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 MAX_SECTION_CHARS = 4000
 
@@ -78,7 +82,11 @@ def _chunk_dict(text: str, heading: str, doc: ParsedDocument) -> dict:
 
 
 def _split_by_paragraphs(text: str, max_chars: int) -> list[str]:
-    """Accumulate paragraphs (split by blank line) up to *max_chars*."""
+    """Accumulate paragraphs (split by blank line) up to *max_chars*.
+
+    Single paragraphs exceeding *max_chars* are hard-split at the limit
+    so no chunk is ever larger than *max_chars*.
+    """
     paragraphs = text.split("\n\n")
     result: list[str] = []
     current = ""
@@ -88,9 +96,12 @@ def _split_by_paragraphs(text: str, max_chars: int) -> list[str]:
             continue
         if current and len(current) + len(para) + 2 > max_chars:
             result.append(current.strip())
-            current = para
-        else:
-            current = f"{current}\n\n{para}" if current else para
+            current = ""
+        # Hard-split a single paragraph that exceeds max_chars
+        while len(para) > max_chars:
+            result.append(para[:max_chars])
+            para = para[max_chars:]
+        current = f"{current}\n\n{para}" if current else para
     if current.strip():
         result.append(current.strip())
     return result
@@ -150,18 +161,7 @@ def file_hash(content_bytes: bytes) -> str:
     return hashlib.sha256(content_bytes).hexdigest()[:16]
 
 
-def load_manifest(path: Path) -> dict:
-    """Load the hash + doc_id manifest from disk."""
-    if path.exists():
-        try:
-            return json.loads(path.read_text())
-        except Exception:
-            pass
-    return {}
-
-
-def save_manifest(path: Path, manifest: dict) -> None:
-    path.write_text(json.dumps(manifest, indent=2))
+# load_manifest / save_manifest imported from shared.utils
 
 
 # ---------------------------------------------------------------------------

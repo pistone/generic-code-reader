@@ -46,9 +46,10 @@ produces a knowledge base tailored to that domain's vocabulary.
 │  RUNTIME (always on, per developer machine)             │
 │                                                         │
 │  MCP Server (FastMCP, ~180 lines Python)                │
-│    search_codebase(query, module="")                    │
+│    search_codebase(query, module="", source_type="")    │
 │      → hybrid search (vector + full-text), returns      │
 │        formatted results with scores                    │
+│      → source_type: "code" | "doc" | "ticket" | ""     │
 │    suggest_index_item(topic, summary, source_files,     │
 │                       reasoning, raw_code, module)      │
 │      → writes to staging_queue.json                     │
@@ -117,7 +118,7 @@ python -m doc_agent.doc_agent --docs /path/to/docs
 ```
 
 Architecture: pluggable sources (LocalFileSource, future: SharePoint,
-Confluence) → file-type parsers (Markdown, HTML, plain text) →
+Confluence) → file-type parsers (Markdown, HTML, PDF, plain text) →
 section-aware chunking → direct R2R indexing of raw text.  No LLM
 calls needed — docs are already human-readable prose.
 
@@ -160,7 +161,8 @@ Registered via `.mcp.json`:
 }
 ```
 
-Two tools: `search_codebase(query, module)` with hybrid search, and
+Two tools: `search_codebase(query, module, source_type)` with hybrid search
+and source-type filtering ("code"/"doc"/"ticket"), and
 `suggest_index_item(topic, summary, source_files, reasoning, raw_code, module)`.
 Logs every query to `mcp_server/query_log.jsonl`.
 
@@ -174,9 +176,9 @@ Logs every query to `mcp_server/query_log.jsonl`.
 
 ### 7. Token tracking
 
-Both study agent and reviewer agent track prompt/completion token
-counts per phase. Printed at the end of each run and appended to
-`cost_log.jsonl` for historical tracking.
+All agents (study, reviewer, auditor, ticket) track prompt/completion
+token counts per phase via shared `TokenTracker`. Printed at the end
+of each run and appended to `cost_log.jsonl` for historical tracking.
 
 ---
 
@@ -197,7 +199,7 @@ generic-code-reader/
 ├── doc_agent/
 │   ├── doc_agent.py           ← document ingestion pipeline
 │   ├── sources.py             ← pluggable source adapters (local, future: SharePoint)
-│   └── parsers.py             ← file-type parsers (Markdown, HTML, plain text)
+│   └── parsers.py             ← file-type parsers (Markdown, HTML, PDF, plain text)
 ├── indexer/
 │   ├── study_agent.py         ← multi-pass codebase analysis
 │   ├── indexer.py             ← feeds summaries to R2R
@@ -206,6 +208,8 @@ generic-code-reader/
 │   └── server.py              ← MCP server (search + suggest tools)
 ├── reviewer/
 │   └── reviewer_agent.py      ← verifies and promotes suggestions
+├── shared/
+│   └── utils.py               ← shared utilities (TokenTracker, llm_call, manifest helpers)
 ├── r2r/
 │   ├── r2r.toml               ← R2R config (embedding, FTS, etc.)
 │   └── compose.yaml           ← Docker compose for R2R + Postgres

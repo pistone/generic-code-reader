@@ -59,6 +59,7 @@ def index_entry(client: R2RClient, entry: dict) -> str:
             "source_file": src_file,
             "module":      module,
             "chunk_type":  entry.get("chunk_type", "function_summary"),
+            "source_type": "code",
         },
     )
     doc_id = str(response.results.document_id)
@@ -73,6 +74,7 @@ def index_entry(client: R2RClient, entry: dict) -> str:
                     "source_file": src_file,
                     "module":      module,
                     "chunk_type":  "raw_code",
+                    "source_type": "code",
                 },
             )
         except Exception:

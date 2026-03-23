@@ -32,6 +32,10 @@ from typing import Optional
 from pydantic import BaseModel
 from r2r import R2RClient
 
+# Shared utilities
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from shared.utils import TokenTracker, llm_call, load_queue, save_queue  # noqa: E402
+
 # ── Config ────────────────────────────────────────────────────────────────────
 
 DEFAULT_MODEL   = os.getenv("LLM_MODEL", "openai/gpt-4o")
@@ -44,54 +48,6 @@ BASE_DIR       = Path(__file__).parent
 STAGING_FILE   = BASE_DIR.parent / "mcp_server" / "staging_queue.json"
 REJECTED_FILE  = BASE_DIR / "rejected_queue.json"
 
-# ── Token tracking ───────────────────────────────────────────────────────────
-
-class TokenTracker:
-    """Accumulates prompt/completion token counts per phase."""
-
-    def __init__(self):
-        self.phases: dict[str, dict[str, int]] = {}
-
-    def _ensure_phase(self, phase: str) -> dict[str, int]:
-        if phase not in self.phases:
-            self.phases[phase] = {"prompt": 0, "completion": 0, "calls": 0}
-        return self.phases[phase]
-
-    def record(self, phase: str, response) -> None:
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return
-        p = self._ensure_phase(phase)
-        p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
-        p["completion"] += getattr(usage, "completion_tokens", 0) or 0
-        p["calls"] += 1
-
-    def summary(self) -> str:
-        lines = []
-        total_p, total_c = 0, 0
-        for phase, counts in self.phases.items():
-            p, c, n = counts["prompt"], counts["completion"], counts["calls"]
-            total_p += p
-            total_c += c
-            lines.append(
-                f"[Tokens] {phase + ':':<12} {p:>8,} prompt + {c:>7,} completion"
-                f"   ({n} call{'s' if n != 1 else ''})"
-            )
-        lines.append(
-            f"[Tokens] {'Total:':<12} {total_p:>8,} prompt + {total_c:>7,} completion"
-            f" = {total_p + total_c:,} tokens"
-        )
-        return "\n".join(lines)
-
-    def to_log_entry(self, model: str) -> dict:
-        total = sum(p["prompt"] + p["completion"] for p in self.phases.values())
-        return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "model": model,
-            "phases": dict(self.phases),
-            "total_tokens": total,
-        }
-
 
 # ── Pydantic model for LLM decision ───────────────────────────────────────────
 
@@ -102,33 +58,14 @@ class ReviewDecision(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+# load_queue / save_queue imported from shared.utils
+
+
 def llm_call_json(model: str, system: str, user: str, max_tokens: int = 1024,
                   tracker: Optional[TokenTracker] = None, phase: str = "") -> str:
-    """Call litellm in JSON mode, return raw text."""
-    from litellm import completion
-    response = completion(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        max_tokens=max_tokens,
-        response_format={"type": "json_object"},
-    )
-    if tracker and phase:
-        tracker.record(phase, response)
-    return response.choices[0].message.content or ""
-
-
-def load_queue(path: Path) -> list[dict]:
-    if path.exists():
-        return json.loads(path.read_text())
-    return []
-
-
-def save_queue(path: Path, queue: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(queue, indent=2))
+    """Call LLM in JSON mode via shared llm_call, return raw text."""
+    return llm_call(model, system, user, max_tokens=max_tokens,
+                    json_mode=True, tracker=tracker, phase=phase)
 
 
 def read_source_file(fpath: Path, max_chars: int = MAX_FILE_CHARS) -> str:
@@ -177,6 +114,7 @@ def index_entry(entry: dict) -> tuple[str, str]:
             "source_file": src_file,
             "module":      module,
             "chunk_type":  entry.get("chunk_type", "function_summary"),
+            "source_type": "code",
             "origin":      "suggestion",
         },
     )
@@ -193,6 +131,7 @@ def index_entry(entry: dict) -> tuple[str, str]:
                     "source_file": src_file,
                     "module":      module,
                     "chunk_type":  "raw_code",
+                    "source_type": "code",
                     "origin":      "suggestion",
                 },
             )
@@ -347,10 +286,11 @@ def process_queue(model: str, codebase: Optional[Path],
 
         if decision.decision in ("approve", "edit"):
             # Build the entry to index
+            source_files = entry.get("source_files", [])
             to_index = {
                 "summary":     decision.final_summary or entry["summary"],
                 "raw_code":    entry.get("raw_code", ""),
-                "source_file": entry.get("source_files", [""])[0],
+                "source_file": ", ".join(source_files) if source_files else "",
                 "module":      entry.get("module", "suggestion"),
                 "chunk_type":  "function_summary",
             }
@@ -436,7 +376,7 @@ def main():
 
     if tracker.phases:
         print(f"\n{tracker.summary()}")
-        entry = tracker.to_log_entry(model=args.model)
+        entry = tracker.to_log_entry(model=args.model, agent="reviewer")
         with cost_log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
         print(f"[Tokens] Logged to {cost_log_path}")

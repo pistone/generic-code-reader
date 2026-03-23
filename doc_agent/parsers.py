@@ -187,17 +187,18 @@ class HTMLParser:
 # ---------------------------------------------------------------------------
 
 class PDFParser:
-    """Parse .pdf files using pymupdf (fitz).  Falls back to PlainTextParser
-    if pymupdf is not installed."""
+    """Parse .pdf files using pymupdf (fitz).  Raises RuntimeError if
+    pymupdf is not installed (binary PDF bytes cannot be treated as text)."""
 
     def parse(self, path: str, content: bytes,
               last_modified: datetime) -> ParsedDocument:
         try:
             import pymupdf  # noqa: F811
         except ImportError:
-            print(f"  [warn] pymupdf not installed, treating {path} as plain text. "
-                  "Install with: pip install pymupdf")
-            return PlainTextParser().parse(path, content, last_modified)
+            raise RuntimeError(
+                f"Cannot parse PDF '{path}': pymupdf not installed. "
+                "Install with: pip install pymupdf"
+            )
 
         doc = pymupdf.Document(stream=content, filetype="pdf")
         sections: list[Section] = []

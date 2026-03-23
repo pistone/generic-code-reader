@@ -21,95 +21,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Union, Generator
 
-import litellm
 from r2r import R2RClient
+
+# Shared utilities
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from shared.utils import TokenTracker, llm_call  # noqa: E402
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")
 DEFAULT_THRESHOLD_DAYS = 90
 MIN_SIMILARITY_SCORE = 0.3
-
-
-# ---------------------------------------------------------------------------
-# TokenTracker (same pattern as study_agent / reviewer_agent)
-# ---------------------------------------------------------------------------
-
-class TokenTracker:
-    """Accumulates prompt/completion token counts per phase."""
-
-    def __init__(self):
-        self.phases: dict[str, dict[str, int]] = {}
-
-    def _ensure_phase(self, phase: str) -> dict[str, int]:
-        if phase not in self.phases:
-            self.phases[phase] = {"prompt": 0, "completion": 0, "calls": 0}
-        return self.phases[phase]
-
-    def record(self, phase: str, response) -> None:
-        p = self._ensure_phase(phase)
-        usage = getattr(response, "usage", None)
-        if usage:
-            p["prompt"] += getattr(usage, "prompt_tokens", 0)
-            p["completion"] += getattr(usage, "completion_tokens", 0)
-        p["calls"] += 1
-
-    def summary(self) -> str:
-        lines = []
-        total_p = total_c = 0
-        for phase, counts in self.phases.items():
-            lines.append(
-                f"[Tokens] {phase}: {counts['prompt']:,} prompt "
-                f"+ {counts['completion']:,} completion  "
-                f"({counts['calls']} call(s))"
-            )
-            total_p += counts["prompt"]
-            total_c += counts["completion"]
-        lines.append(
-            f"[Tokens] Total: {total_p:,} prompt + {total_c:,} completion "
-            f"= {total_p + total_c:,} tokens"
-        )
-        return "\n".join(lines)
-
-    def to_log_entry(self, model: str) -> dict:
-        total = sum(p["prompt"] + p["completion"]
-                    for p in self.phases.values())
-        return {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "model": model,
-            "agent": "auditor",
-            "phases": dict(self.phases),
-            "total_tokens": total,
-        }
-
-
-# ---------------------------------------------------------------------------
-# LLM call (same pattern as study_agent)
-# ---------------------------------------------------------------------------
-
-def llm_call(model: str, system: str, user: str,
-             max_tokens: int = 1024,
-             json_mode: bool = False,
-             tracker: Optional[TokenTracker] = None,
-             phase: str = "") -> str:
-    """Call LLM via litellm.  Returns response text."""
-    kwargs: dict = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-        "max_tokens": max_tokens,
-    }
-    if json_mode:
-        kwargs["response_format"] = {"type": "json_object"}
-
-    response = litellm.completion(**kwargs)
-    text = response.choices[0].message.content
-
-    if tracker and phase:
-        tracker.record(phase, response)
-
-    return text
 
 
 # ---------------------------------------------------------------------------
@@ -425,7 +346,7 @@ def main():
     # Token tracking
     if tracker.phases:
         print(f"\n{tracker.summary()}")
-        entry = tracker.to_log_entry(model=args.model)
+        entry = tracker.to_log_entry(model=args.model, agent="auditor")
         with cost_log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
 
