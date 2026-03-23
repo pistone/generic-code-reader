@@ -69,6 +69,18 @@ produces a knowledge base tailored to that domain's vocabulary.
 │    - On reject: logs to rejected_queue.json             │
 │    - Prunes staging queue after processing              │
 └─────────────────────────────────────────────────────────┘
+                          │
+          after all agents have indexed
+                          ▼
+┌─────────────────────────────────────────────────────────┐
+│  AUDITOR (runs after doc_agent + study_agent)           │
+│                                                         │
+│    - Compares doc entries vs code entries in R2R        │
+│    - Timestamp-first: flags docs older than threshold   │
+│    - LLM comparison on stale suspects only              │
+│    - Outputs conflict_report.json for human review      │
+│    - Does NOT auto-fix — report only                    │
+└─────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -178,6 +190,8 @@ generic-code-reader/
 ├── .env.example               ← environment variable template
 ├── .gitignore
 ├── requirements.txt           ← Python dependencies
+├── auditor/
+│   └── auditor.py             ← cross-reference auditor (doc↔code conflict detection)
 ├── doc_agent/
 │   ├── doc_agent.py           ← document ingestion pipeline
 │   ├── sources.py             ← pluggable source adapters (local, future: SharePoint)
@@ -203,6 +217,8 @@ Runtime artifacts (gitignored):
 - `indexer/file_hashes.json` — incremental change manifest
 - `indexer/cost_log.jsonl` — token usage log
 - `doc_agent/doc_hashes.json` — doc incremental change manifest
+- `auditor/conflict_report.json` — doc↔code conflict report
+- `auditor/cost_log.jsonl` — auditor token usage log
 - `mcp_server/staging_queue.json` — pending suggestions
 - `mcp_server/query_log.jsonl` — search query audit log
 - `reviewer/rejected_queue.json` — rejected suggestions

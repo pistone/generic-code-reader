@@ -26,3 +26,7 @@ reviewer/cost_log.jsonl
 
 # Doc agent artifacts
 doc_agent/doc_hashes.json
+
+# Auditor artifacts
+auditor/conflict_report.json
+auditor/cost_log.jsonl

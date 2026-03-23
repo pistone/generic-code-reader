@@ -8,6 +8,7 @@ A self-improving domain knowledge base for codebases. Indexes LLM-generated summ
 doc_agent/doc_agent.py     → Ingests design docs, runbooks, wiki pages into R2R
 indexer/study_agent.py     → Analyzes codebase, generates summaries (multi-pass with RAG)
 indexer/indexer.py         → Feeds summaries into R2R vector DB
+auditor/auditor.py         → Detects doc↔code conflicts (staleness, contradictions)
 mcp_server/server.py       → MCP server: search_codebase + suggest_index_item
 reviewer/reviewer_agent.py → Verifies runtime suggestions before promoting to the KB
 ```
@@ -86,11 +87,28 @@ python indexer/indexer.py --index indexer/summaries.json
 python indexer/indexer.py --search "your query here"
 ```
 
-### 7. Use with Claude Code
+### 7. (Optional) Audit doc↔code consistency
+
+After indexing both docs and code, check for contradictions:
+
+```bash
+python -m auditor.auditor
+
+# Custom staleness threshold (default: 90 days)
+python -m auditor.auditor --threshold-days 60
+
+# Results in auditor/conflict_report.json
+```
+
+The auditor compares doc entries against code entries using timestamps
+first, then LLM comparison on flagged pairs. Review the conflict report
+to identify stale documentation.
+
+### 8. Use with Claude Code
 
 The `.mcp.json` is already configured. Open Claude Code in this directory and the `search_codebase` tool will be available.
 
-### 8. (Optional) Run the reviewer agent
+### 9. (Optional) Run the reviewer agent
 
 ```bash
 # Process pending suggestions once
