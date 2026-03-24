@@ -1,15 +1,15 @@
-  Successfully indexed the /data00/songtao/prevent/analysis directory (10,640 C++ source files). Here's what was accomplished:
+  Successfully indexed the /data00/user/project-alpha/analysis directory (10,640 C++ source files). Here's what was accomplished:
 
   Indexing Results
 
   Module Discovery (Pass 1)
   - Discovered 6 logical modules:
-    - abstract-interpretation: Implements abstract interpretation handlers, caching mechanisms, and composed runners (4 files, 4 questions)
-    - ast-analysis: Analyzes ASTs and manages patterns, contexts, and events (3 files, 3 questions)
-    - buda-directives: Handles directives for BUDA engine and call graph processing (2 files, 3 questions)
-    - cfg-analysis: CFG analysis and function-level traversal for symbolic execution (2 files, 3 questions)
-    - compliance-checking: Enforces coding standards and compliance rules (2 files, 3 questions)
-    - crypto-analysis: Analyzes and validates cryptographic algorithms (2 files, 3 questions)
+    - value-propagation: Implements value propagation handlers, caching mechanisms, and composed runners (4 files, 4 questions)
+    - syntax-tree-analysis: Analyzes syntax trees and manages patterns, contexts, and events (3 files, 3 questions)
+    - engine-directives: Handles directives for core engine and call graph processing (2 files, 3 questions)
+    - control-flow-analysis: Control flow graph analysis and function-level traversal for symbolic execution (2 files, 3 questions)
+    - standards-enforcement: Enforces coding standards and compliance rules (2 files, 3 questions)
+    - security-validation: Analyzes and validates security-sensitive algorithms (2 files, 3 questions)
 
   Summarization (Pass 2)
   - Created 124 summaries total (59 new, 65 cached from earlier test run)
@@ -17,9 +17,9 @@
 
   Search Verification
   All test queries returned relevant results with good scores (0.6-0.7):
-  - "abstract interpretation" → Found relevant AI framework code
+  - "value propagation" → Found relevant VP framework code
   - "dataflow analysis" → Found CFG and dataflow traversal code
-  - "cryptographic cipher suites" → Found crypto analysis infrastructure
+  - "security cipher suites" → Found security validation infrastructure
 
   Token Usage
 
@@ -37,12 +37,12 @@
   # Just restart Claude Code to pick up the server
   2. Index additional directories:
   # Example: index frontend code
-  python indexer/study_agent.py --codebase /data00/songtao/prevent/frontend \
+  python indexer/study_agent.py --codebase /data00/user/project-alpha/frontend \
       --language cpp --passes 2
   3. Index documentation (if you have design docs):
   python -m doc_agent.doc_agent --docs /path/to/docs
   4. Incremental updates (re-index only changed files):
-  python indexer/study_agent.py --codebase /data00/songtao/prevent/analysis \
+  python indexer/study_agent.py --codebase /data00/user/project-alpha/analysis \
       --language cpp --incremental
 
   The system is working well! The analysis directory provides a solid foundation covering the core static analysis infrastructure.
