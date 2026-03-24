@@ -76,7 +76,15 @@ SKIP_SUFFIXES = {".pyc", ".pyo", ".pyd", ".so", ".dylib", ".dll",
                  ".egg-info", ".dist-info", ".lock"}
 SKIP_DIRS    = {"__pycache__", ".git", ".hg", ".svn", "node_modules",
                 ".venv", "venv", "env", ".env", "build", "dist",
-                ".mypy_cache", ".pytest_cache", ".tox"}
+                ".mypy_cache", ".pytest_cache", ".tox",
+                # Generated / third-party code
+                "third_party", "thirdparty", "3rdparty", "vendor",
+                "external", "deps",
+                # Build artifacts common in C++ projects
+                "cmake-build-debug", "cmake-build-release", "out",
+                ".build", "_build"}
+SKIP_TEST_DIRS = {"test", "tests", "testing", "test_data", "testdata",
+                  "testcases", "test_fixtures", "fixtures"}
 
 # TokenTracker and llm_call imported from codebase_shared.utils
 
@@ -97,7 +105,8 @@ class ModuleMap(BaseModel):
 
 # ── File utilities ─────────────────────────────────────────────────────────────
 
-def collect_source_files(codebase: Path, language: str = "python") -> list[Path]:
+def collect_source_files(codebase: Path, language: str = "python",
+                         include_tests: bool = False) -> list[Path]:
     """Return all source files under codebase, filtering out build artifacts."""
     ext_map = {
         "python": {".py"},
@@ -110,16 +119,30 @@ def collect_source_files(codebase: Path, language: str = "python") -> list[Path]
     }
     exts = ext_map.get(language, {".py"})
 
+    # Filename patterns that indicate test files (even outside test dirs)
+    test_prefixes = ("test_", "test-")
+    test_suffixes = ("_test.", "-test.", "_spec.", ".spec.", "_unittest.", "_mock.")
+
     results = []
     for p in sorted(codebase.rglob("*")):
         if not p.is_file():
             continue
         if any(part in SKIP_DIRS for part in p.parts):
             continue
+        if not include_tests and any(part in SKIP_TEST_DIRS for part in p.parts):
+            continue
         if p.suffix in SKIP_SUFFIXES:
             continue
-        if p.suffix in exts:
-            results.append(p)
+        if p.suffix not in exts:
+            continue
+        # Skip test files by name pattern (unless --include-tests)
+        if not include_tests:
+            name_lower = p.name.lower()
+            if name_lower.startswith(test_prefixes):
+                continue
+            if any(s in name_lower for s in test_suffixes):
+                continue
+        results.append(p)
     return results
 
 
@@ -847,6 +870,8 @@ def main():
     parser.add_argument("--incremental", action="store_true",
                         help="Only re-summarize files whose content has changed since "
                              "the last run. Uses a hash manifest (file_hashes.json).")
+    parser.add_argument("--include-tests", action="store_true",
+                        help="Include test files and test directories (skipped by default)")
     args = parser.parse_args()
 
     codebase = Path(args.codebase).resolve()
@@ -864,8 +889,10 @@ def main():
     summaries_path  = output_dir / "summaries.json"
 
     # ── Collect source files ────────────────────────────────────────────────────
-    files = collect_source_files(codebase, language=args.language)
-    print(f"Found {len(files)} {args.language} source files under {codebase}")
+    files = collect_source_files(codebase, language=args.language,
+                                 include_tests=args.include_tests)
+    skip_note = "" if args.include_tests else " (excluding tests — use --include-tests to change)"
+    print(f"Found {len(files)} {args.language} source files under {codebase}{skip_note}")
     if not files:
         print("No source files found. Check --codebase and --language.")
         sys.exit(1)
