@@ -535,7 +535,8 @@ def build_pass1_prompt(codebase_name: str, language: str,
 {samples_section}
 
 ## Task
-1. Group related files into logical modules/subsystems (2–6 modules total).
+1. Group related files into logical modules/subsystems. Use the directory structure
+   as a guide — each major directory or subsystem should be its own module.
 2. For each module, write 3–6 domain-specific questions a developer would ask.
    - Use the project's own vocabulary (class names, concepts, protocols).
    - Focus on HOW things work internally, not just WHAT they are.
@@ -593,48 +594,186 @@ def _stratified_sample(codebase: Path, files: list[Path],
     return selected[:max_samples]
 
 
+def _group_files_by_toplevel(codebase: Path,
+                              files: list[Path]) -> dict[str, list[Path]]:
+    """Group files by their top-level directory (or root for flat files)."""
+    groups: dict[str, list[Path]] = {}
+    for f in files:
+        rel = f.relative_to(codebase)
+        bucket = rel.parts[0] if len(rel.parts) > 1 else "."
+        groups.setdefault(bucket, []).append(f)
+    return groups
+
+
+# Prompt for describing a single module (used in large-codebase mode)
+_MODULE_DESCRIBE_SYSTEM = (
+    "You are a senior software architect. Describe one module of a codebase and "
+    "write questions that a developer would ask about it. "
+    "Output ONLY valid JSON — no markdown fences, no commentary."
+)
+
+def _module_describe_prompt(project_name: str, module_dir: str,
+                            language: str, file_list: list[str],
+                            file_samples: dict[str, str],
+                            docs_context: Optional[str] = None) -> str:
+    samples_section = ""
+    for fname, sample in file_samples.items():
+        samples_section += f"\n### {fname}\n```{language}\n{sample}\n```\n"
+
+    docs_section = ""
+    if docs_context:
+        docs_section = f"\n## Reference Documentation\n{docs_context}\n"
+
+    # Show full file list (just names, not content)
+    file_listing = "\n".join(f"  {f}" for f in file_list[:200])
+    if len(file_list) > 200:
+        file_listing += f"\n  ... and {len(file_list) - 200} more files"
+
+    return f"""This is the "{module_dir}" directory of the {project_name} {language} project.
+It contains {len(file_list)} source files:
+
+{file_listing}
+{docs_section}
+## File Samples
+{samples_section}
+
+## Task
+1. Write a one-sentence description of what this module/directory does.
+2. Write 3–6 domain-specific questions a developer would ask about it.
+   - Use the project's own vocabulary (class names, concepts, protocols).
+   - Focus on HOW things work internally, not just WHAT they are.
+
+Output ONLY this JSON:
+{{
+  "description": "what this module does",
+  "questions": ["question 1", "question 2", "..."]
+}}"""
+
+
 def run_pass1(model: str, codebase: Path, files: list[Path],
               language: str, docs_context: Optional[str] = None,
               tracker: Optional[TokenTracker] = None) -> ModuleMap:
-    """Call the LLM to analyze directory structure and produce module_map."""
+    """Call the LLM to analyze directory structure and produce module_map.
 
-    print(f"\n[Pass 1] {len(files)} source files found. Building directory tree...")
-    tree = build_directory_tree(codebase, files)
+    Small codebases (≤10 top-level dirs): single LLM call discovers modules.
+    Large codebases (>10 top-level dirs): directory-guided mode — each top-level
+    dir becomes a module, with a per-module LLM call for description + questions.
+    All files are assigned, so nothing is orphaned in Pass 2.
+    """
+    groups = _group_files_by_toplevel(codebase, files)
+    n_dirs = len(groups)
 
-    # Stratified sampling: pick representative files, not all of them
-    sample_files = _stratified_sample(codebase, files, max_samples=24)
-    print(f"[Pass 1] Sampling {len(sample_files)}/{len(files)} files for analysis...")
+    print(f"\n[Pass 1] {len(files)} source files in {n_dirs} top-level directories.")
 
-    file_samples: dict[str, str] = {}
-    for f in sample_files:
-        sample = read_file_sample(f)
-        if len(sample.strip()) > 20:
-            file_samples[str(f.relative_to(codebase))] = sample
+    # ── Small codebase: original single-call approach ──────────────────────
+    if n_dirs <= 10:
+        tree = build_directory_tree(codebase, files)
+        sample_files = _stratified_sample(codebase, files, max_samples=24)
+        print(f"[Pass 1] Small codebase mode — sampling {len(sample_files)} files...")
 
-    prompt = build_pass1_prompt(
-        codebase_name=codebase.name,
-        language=language,
-        tree=tree,
-        file_samples=file_samples,
-        docs_context=docs_context,
+        file_samples: dict[str, str] = {}
+        for f in sample_files:
+            sample = read_file_sample(f)
+            if len(sample.strip()) > 20:
+                file_samples[str(f.relative_to(codebase))] = sample
+
+        prompt = build_pass1_prompt(
+            codebase_name=codebase.name,
+            language=language,
+            tree=tree,
+            file_samples=file_samples,
+            docs_context=docs_context,
+        )
+
+        print(f"[Pass 1] Calling {model} for module discovery ({len(prompt)} char prompt)...")
+        raw = llm_call(model, PASS1_SYSTEM, prompt, max_tokens=4096, json_mode=True,
+                       tracker=tracker, phase="Pass 1")
+        try:
+            data = json.loads(raw)
+            module_map = ModuleMap(**data)
+        except Exception as e:
+            print(f"[Pass 1] ERROR: could not parse LLM output as ModuleMap: {e}")
+            print("Raw output:", raw[:500])
+            sys.exit(1)
+
+        print(f"[Pass 1] Discovered {len(module_map.modules)} modules:")
+        for m in module_map.modules:
+            print(f"  - {m.name}: {m.description} ({len(m.files)} files, {len(m.questions)} questions)")
+        return module_map
+
+    # ── Large codebase: directory-guided module discovery ──────────────────
+    print(f"[Pass 1] Large codebase mode — one module per top-level directory.")
+    print(f"[Pass 1] Describing {n_dirs} modules with {model}...\n")
+
+    import random
+    rng = random.Random(42)
+
+    modules: list[ModuleDefinition] = []
+    project_desc = ""
+
+    for dir_name, dir_files in sorted(groups.items()):
+        rel_files = [str(f.relative_to(codebase)) for f in dir_files]
+
+        # Sample a few files for LLM context
+        n_sample = min(5, len(dir_files))
+        sampled = rng.sample(dir_files, n_sample)
+        file_samples = {}
+        for f in sampled:
+            sample = read_file_sample(f)
+            if len(sample.strip()) > 20:
+                file_samples[str(f.relative_to(codebase))] = sample
+
+        if not file_samples:
+            # No readable files — create a stub module
+            modules.append(ModuleDefinition(
+                name=dir_name,
+                description=f"Files under {dir_name}/",
+                files=rel_files,
+                questions=[f"What does the {dir_name} module do?"],
+            ))
+            print(f"  {dir_name}: {len(dir_files)} files (no readable samples, stub module)")
+            continue
+
+        prompt = _module_describe_prompt(
+            project_name=codebase.name,
+            module_dir=dir_name,
+            language=language,
+            file_list=rel_files,
+            file_samples=file_samples,
+            docs_context=docs_context,
+        )
+
+        try:
+            raw = llm_call(model, _MODULE_DESCRIBE_SYSTEM, prompt,
+                           max_tokens=512, json_mode=True,
+                           tracker=tracker, phase="Pass 1")
+            result = json.loads(raw)
+            desc = str(result.get("description", f"Files under {dir_name}/"))
+            questions = result.get("questions", [f"What does {dir_name} do?"])
+            if not project_desc and "description" in result:
+                project_desc = desc  # use first module's desc as project hint
+        except Exception as e:
+            print(f"  [warn] {dir_name}: LLM call failed ({e}), using stub")
+            desc = f"Files under {dir_name}/"
+            questions = [f"What does the {dir_name} module do?"]
+
+        modules.append(ModuleDefinition(
+            name=dir_name,
+            description=desc,
+            files=rel_files,
+            questions=questions if isinstance(questions, list) else [str(questions)],
+        ))
+        print(f"  {dir_name}: {len(dir_files)} files, {len(questions)} questions — {desc[:80]}")
+        time.sleep(0.3)  # rate limit
+
+    module_map = ModuleMap(
+        project=codebase.name,
+        description=project_desc or f"A {language} codebase with {len(files)} files",
+        modules=modules,
     )
 
-    print(f"[Pass 1] Calling {model} for module discovery ({len(prompt)} char prompt)...")
-    raw = llm_call(model, PASS1_SYSTEM, prompt, max_tokens=4096, json_mode=True,
-                   tracker=tracker, phase="Pass 1")
-
-    # Parse and validate with Pydantic
-    try:
-        data = json.loads(raw)
-        module_map = ModuleMap(**data)
-    except Exception as e:
-        print(f"[Pass 1] ERROR: could not parse LLM output as ModuleMap: {e}")
-        print("Raw output:", raw[:500])
-        sys.exit(1)
-
-    print(f"[Pass 1] Discovered {len(module_map.modules)} modules:")
-    for m in module_map.modules:
-        print(f"  - {m.name}: {m.description} ({len(m.files)} files, {len(m.questions)} questions)")
+    total_assigned = sum(len(m.files) for m in modules)
+    print(f"\n[Pass 1] {len(modules)} modules, {total_assigned}/{len(files)} files assigned.")
 
     return module_map
 
