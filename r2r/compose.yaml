@@ -18,8 +18,9 @@ services:
     ports:
       - "7272:8000"
     environment:
-      - VOYAGE_API_KEY=${VOYAGE_API_KEY}
-      - OPENAI_API_KEY=${OPENAI_API_KEY:-unused}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_URL=${OPENAI_URL}
+      - OPENAI_API_BASE=${OPENAI_URL}
       - R2R_CONFIG_PATH=/config/r2r.toml
       - R2R_POSTGRES_HOST=postgres
       - R2R_POSTGRES_PORT=5432

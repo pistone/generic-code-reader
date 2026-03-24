@@ -34,7 +34,7 @@ from r2r import R2RClient
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared.utils import TokenTracker, llm_call, load_queue, save_queue  # noqa: E402
+from codebase_shared.utils import TokenTracker, llm_call, load_queue, save_queue  # noqa: E402
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -58,7 +58,7 @@ class ReviewDecision(BaseModel):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-# load_queue / save_queue imported from shared.utils
+# load_queue / save_queue imported from codebase_shared.utils
 
 
 def llm_call_json(model: str, system: str, user: str, max_tokens: int = 1024,

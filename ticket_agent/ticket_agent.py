@@ -24,7 +24,7 @@ from r2r import R2RClient
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared.utils import TokenTracker, llm_call, load_manifest, save_manifest  # noqa: E402
+from codebase_shared.utils import TokenTracker, llm_call, load_manifest, save_manifest  # noqa: E402
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")
@@ -239,7 +239,7 @@ def ticket_hash(ticket: dict) -> str:
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
 
 
-# load_manifest / save_manifest imported from shared.utils
+# load_manifest / save_manifest imported from codebase_shared.utils
 
 
 # ---------------------------------------------------------------------------

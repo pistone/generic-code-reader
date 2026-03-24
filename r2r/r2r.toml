@@ -1,7 +1,9 @@
 [embedding]
 provider = "litellm"
-base_model = "voyage/voyage-code-2"
-base_dimension = 1536
+# Using company's embedding service with OpenAI-compatible API
+# Using 512 dimensions to match R2R's reranking model default
+base_model = "openai/text-embedding-3-small"
+base_dimension = 512
 batch_size = 128
 concurrent_request_limit = 32
 

@@ -55,7 +55,7 @@ from pydantic import BaseModel
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared.utils import TokenTracker, llm_call  # noqa: E402
+from codebase_shared.utils import TokenTracker, llm_call  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -78,7 +78,7 @@ SKIP_DIRS    = {"__pycache__", ".git", ".hg", ".svn", "node_modules",
                 ".venv", "venv", "env", ".env", "build", "dist",
                 ".mypy_cache", ".pytest_cache", ".tox"}
 
-# TokenTracker and llm_call imported from shared.utils
+# TokenTracker and llm_call imported from codebase_shared.utils
 
 # ── Pydantic models (used to validate Pass 1 JSON output) ─────────────────────
 
@@ -93,7 +93,7 @@ class ModuleMap(BaseModel):
     description: str
     modules:     list[ModuleDefinition]
 
-# llm_call imported from shared.utils
+# llm_call imported from codebase_shared.utils
 
 # ── File utilities ─────────────────────────────────────────────────────────────
 

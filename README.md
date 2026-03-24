@@ -37,6 +37,15 @@ cp .env.example .env
 #   VOYAGE_API_KEY   (for R2R embeddings)
 ```
 
+**IMPORTANT: Embedding dimension configuration**
+
+If you change the embedding model in `r2r/r2r.toml`, you must ensure `base_dimension` matches your model's output:
+- `text-embedding-3-small` → 512 dimensions
+- `text-embedding-3-large` → 3072 dimensions (requires all R2R embedding configs to use 3072)
+- `voyage-code-2` → 1536 dimensions
+
+R2R uses multiple embedding configurations internally (for indexing and reranking), and **all must use the same dimension**. If you see an error like `Both embedding configurations must use the same dimensions. Got 3072 and 512`, use `text-embedding-3-small` with `base_dimension = 512` or configure all embedding sections to match.
+
 ### 3. Start R2R (vector database)
 
 ```bash

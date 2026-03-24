@@ -26,7 +26,7 @@ from doc_agent.sources import LocalFileSource, RawDocument
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared.utils import load_manifest, save_manifest  # noqa: E402
+from codebase_shared.utils import load_manifest, save_manifest  # noqa: E402
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 MAX_SECTION_CHARS = 4000
@@ -161,7 +161,7 @@ def file_hash(content_bytes: bytes) -> str:
     return hashlib.sha256(content_bytes).hexdigest()[:16]
 
 
-# load_manifest / save_manifest imported from shared.utils
+# load_manifest / save_manifest imported from codebase_shared.utils
 
 
 # ---------------------------------------------------------------------------

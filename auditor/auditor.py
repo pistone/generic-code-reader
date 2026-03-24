@@ -25,7 +25,7 @@ from r2r import R2RClient
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from shared.utils import TokenTracker, llm_call  # noqa: E402
+from codebase_shared.utils import TokenTracker, llm_call  # noqa: E402
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")

@@ -1,4 +1,4 @@
-r2r>=3.6.0
+r2r[core]>=3.6.0
 litellm>=1.0.0
 mcp>=1.0.0
 pydantic>=2.0.0
