@@ -992,6 +992,131 @@ PASS2_SYSTEM = (
     "Write plain prose — no markdown, no bullet points."
 )
 
+# Phrases that indicate the summary has unresolved references
+_VAGUE_MARKERS = [
+    "calls an external", "delegates to", "uses a helper",
+    "defined elsewhere", "another component", "not shown here",
+    "presumably", "likely", "unclear", "unknown function",
+    "some kind of", "appears to", "seems to",
+]
+
+
+def _needs_reference_resolution(summary: str) -> Optional[str]:
+    """Check if a summary contains vague references that could be resolved.
+
+    Returns the vague phrase found, or None if the summary is specific enough.
+    """
+    lower = summary.lower()
+    for marker in _VAGUE_MARKERS:
+        if marker in lower:
+            return marker
+    return None
+
+
+def _resolve_references(model: str, summary: str, raw_code: str,
+                         codebase: Path, rel_path: str,
+                         tracker: Optional[TokenTracker] = None) -> str:
+    """Try to resolve vague references in a summary by reading referenced files.
+
+    Extracts identifiers from the code chunk that look like cross-file references
+    (includes, imports, class prefixes), reads those files, and re-generates the
+    summary with extra context. Returns the improved summary, or the original
+    if resolution fails or finds nothing useful.
+    """
+    import re
+
+    # Extract cross-file references from the code
+    refs: list[str] = []
+
+    # C/C++ includes
+    for m in re.finditer(r'#include\s*[<"]([^>"]+)[>"]', raw_code):
+        refs.append(m.group(1))
+
+    # Python/JS imports
+    for m in re.finditer(r'(?:from|import)\s+([\w.]+)', raw_code):
+        refs.append(m.group(1).replace(".", "/"))
+
+    # Class::Method or Namespace::Class patterns (C++)
+    for m in re.finditer(r'(\w+)::\w+', raw_code):
+        refs.append(m.group(1))
+
+    if not refs:
+        return summary
+
+    # Try to read referenced files (up to 3)
+    extra_context_parts: list[str] = []
+    seen: set[str] = set()
+    for ref in refs[:6]:
+        if ref in seen:
+            continue
+        seen.add(ref)
+
+        # Try direct path
+        ref_path = codebase / ref
+        if not ref_path.exists():
+            # Try common patterns: same directory, .h/.hpp extension
+            parent = (codebase / rel_path).parent
+            for candidate in [parent / ref, parent / (ref + ".h"),
+                              parent / (ref + ".hpp")]:
+                if candidate.exists():
+                    ref_path = candidate
+                    break
+            else:
+                # Try rglob on the basename
+                basename = Path(ref).name
+                candidates = list(codebase.rglob(basename))
+                if not candidates:
+                    candidates = list(codebase.rglob(basename + ".h"))
+                if not candidates:
+                    candidates = list(codebase.rglob(basename + ".hpp"))
+                if candidates:
+                    ref_path = candidates[0]
+                else:
+                    continue
+
+        if ref_path.exists() and ref_path.is_file():
+            content = read_file_sample(ref_path, max_lines=40)
+            if len(content.strip()) > 20:
+                extra_context_parts.append(
+                    f"[{ref_path.relative_to(codebase)}]\n{content}"
+                )
+                if len(extra_context_parts) >= 3:
+                    break
+
+    if not extra_context_parts:
+        return summary
+
+    # Re-generate with extra context
+    extra_context = "\n\n".join(extra_context_parts)
+    refine_prompt = f"""The following summary of a code chunk has vague references.
+Rewrite it to be more specific using the referenced source files provided below.
+
+Original summary:
+{summary}
+
+Code chunk:
+```
+{raw_code[:2000]}
+```
+
+Referenced files:
+{extra_context}
+
+Write an improved 2-4 sentence summary. Be specific about what the referenced
+code does. Plain prose only."""
+
+    try:
+        improved = llm_call(model, PASS2_SYSTEM, refine_prompt,
+                            max_tokens=256,
+                            tracker=tracker, phase="Pass 2 (refine)")
+        improved = improved.strip()
+        if improved and len(improved) > 20:
+            return improved
+    except Exception:
+        pass
+
+    return summary
+
 def build_pass2_prompt(project_desc: str, module_name: str,
                        module_desc: str, questions: list[str],
                        source_file: str, raw_code: str,
@@ -1119,6 +1244,18 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     if summary_text.lower().startswith("summary:"):
                         summary_text = summary_text[len("summary:"):].strip()
 
+                    # Resolve vague references if detected
+                    vague = _needs_reference_resolution(summary_text)
+                    refined = False
+                    if vague:
+                        improved = _resolve_references(
+                            model, summary_text, chunk, codebase, rel_path,
+                            tracker=tracker,
+                        )
+                        if improved != summary_text:
+                            summary_text = improved
+                            refined = True
+
                     entry = {
                         "summary":     summary_text,
                         "raw_code":    chunk,
@@ -1130,7 +1267,8 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     summaries.append(entry)
                     total_chunks += 1
                     new_this_run += 1
-                    print(f"      chunk {i+1}/{len(chunks)} → {len(summary_text)} chars")
+                    ref_tag = " [refined]" if refined else ""
+                    print(f"      chunk {i+1}/{len(chunks)} → {len(summary_text)} chars{ref_tag}")
 
                     # Write incrementally for crash safety
                     if summaries_path and new_this_run % 5 == 0:
