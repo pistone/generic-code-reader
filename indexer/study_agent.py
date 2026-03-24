@@ -168,12 +168,43 @@ def filter_changed_files(codebase: Path, files: list[Path],
     return changed, new_manifest
 
 
-def build_directory_tree(codebase: Path, files: list[Path]) -> str:
-    """Build a compact directory tree string from the list of files."""
-    lines = [str(codebase.name) + "/"]
-    for rp in sorted(f.relative_to(codebase) for f in files):
-        indent = "  " * (len(rp.parts) - 1)
-        lines.append(f"{indent}  {rp.name}")
+def build_directory_tree(codebase: Path, files: list[Path],
+                         max_depth: int = 4) -> str:
+    """Build a compact directory tree from file list.
+
+    For large codebases (>1000 files), shows only directory structure with
+    file counts per directory — not individual filenames.  This keeps the
+    Pass 1 prompt under control even for 100K+ file repos.
+    """
+    if len(files) <= 500:
+        # Small codebase: show every file (original behaviour)
+        lines = [str(codebase.name) + "/"]
+        for rp in sorted(f.relative_to(codebase) for f in files):
+            indent = "  " * (len(rp.parts) - 1)
+            lines.append(f"{indent}  {rp.name}")
+        return "\n".join(lines)
+
+    # Large codebase: show directory structure + counts
+    from collections import Counter
+    dir_counts: Counter[str] = Counter()
+    for f in files:
+        rel = f.relative_to(codebase)
+        # Count at each directory level up to max_depth
+        parts = rel.parts[:-1]  # directories only
+        if not parts:
+            dir_counts["."] += 1
+        else:
+            trimmed = parts[:max_depth]
+            dir_counts["/".join(trimmed)] += 1
+
+    lines = [f"{codebase.name}/  ({len(files)} files total)"]
+    for dirpath in sorted(dir_counts):
+        if dirpath == ".":
+            lines.append(f"  ({dir_counts[dirpath]} files in root)")
+        else:
+            depth = dirpath.count("/")
+            indent = "  " * (depth + 1)
+            lines.append(f"{indent}{dirpath.split('/')[-1]}/  ({dir_counts[dirpath]} files)")
     return "\n".join(lines)
 
 
@@ -461,7 +492,7 @@ def build_pass1_prompt(codebase_name: str, language: str,
                        tree: str, file_samples: dict[str, str],
                        docs_context: Optional[str] = None) -> str:
     samples_section = ""
-    for fname, sample in list(file_samples.items())[:12]:
+    for fname, sample in file_samples.items():
         samples_section += f"\n### {fname}\n```{language}\n{sample}\n```\n"
 
     docs_section = ""
@@ -502,16 +533,55 @@ Output ONLY this JSON (no markdown, no extra text):
 }}"""
 
 
+def _stratified_sample(codebase: Path, files: list[Path],
+                       max_samples: int = 24) -> list[Path]:
+    """Pick representative files from different directories.
+
+    For small codebases, returns all files (up to max_samples).
+    For large codebases, picks evenly across top-level directories
+    so the LLM sees breadth, not just the first alphabetical dir.
+    """
+    if len(files) <= max_samples:
+        return files
+
+    # Group by top-level directory (or root)
+    buckets: dict[str, list[Path]] = {}
+    for f in files:
+        rel = f.relative_to(codebase)
+        bucket = rel.parts[0] if len(rel.parts) > 1 else "."
+        buckets.setdefault(bucket, []).append(f)
+
+    # Allocate samples proportionally, minimum 1 per bucket
+    selected: list[Path] = []
+    n_buckets = len(buckets)
+    per_bucket = max(1, max_samples // n_buckets)
+
+    import random
+    rng = random.Random(42)  # deterministic
+
+    for _bucket_name, bucket_files in sorted(buckets.items()):
+        pick = min(per_bucket, len(bucket_files))
+        selected.extend(rng.sample(bucket_files, pick))
+        if len(selected) >= max_samples:
+            break
+
+    return selected[:max_samples]
+
+
 def run_pass1(model: str, codebase: Path, files: list[Path],
               language: str, docs_context: Optional[str] = None,
               tracker: Optional[TokenTracker] = None) -> ModuleMap:
     """Call the LLM to analyze directory structure and produce module_map."""
 
-    print("\n[Pass 1] Building directory tree and reading file samples...")
+    print(f"\n[Pass 1] {len(files)} source files found. Building directory tree...")
     tree = build_directory_tree(codebase, files)
 
+    # Stratified sampling: pick representative files, not all of them
+    sample_files = _stratified_sample(codebase, files, max_samples=24)
+    print(f"[Pass 1] Sampling {len(sample_files)}/{len(files)} files for analysis...")
+
     file_samples: dict[str, str] = {}
-    for f in files:
+    for f in sample_files:
         sample = read_file_sample(f)
         if len(sample.strip()) > 20:
             file_samples[str(f.relative_to(codebase))] = sample
