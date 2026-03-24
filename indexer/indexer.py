@@ -37,6 +37,29 @@ def get_client() -> R2RClient:
     return R2RClient(R2R_URL)
 
 
+def _create_or_replace(client: R2RClient, raw_text: str,
+                       metadata: dict) -> str:
+    """Create a document in R2R; if it already exists, delete and retry."""
+    try:
+        resp = client.documents.create(raw_text=raw_text, metadata=metadata)
+        return str(resp.results.document_id)
+    except Exception as e:
+        err = str(e)
+        if "already exists" not in err.lower():
+            raise
+        # Extract doc_id from error message and delete it
+        import re
+        match = re.search(r"document\s+([0-9a-f-]{36})", err, re.IGNORECASE)
+        if match:
+            try:
+                client.documents.delete(match.group(1))
+            except Exception:
+                pass
+            resp = client.documents.create(raw_text=raw_text, metadata=metadata)
+            return str(resp.results.document_id)
+        raise
+
+
 def index_entry(client: R2RClient, entry: dict) -> str:
     """
     Index one summary entry into R2R. Also indexes raw code as a
@@ -53,30 +76,23 @@ def index_entry(client: R2RClient, entry: dict) -> str:
     module   = entry.get("module", "")
 
     # Index the summary
-    response = client.documents.create(
-        raw_text=entry["summary"],
-        metadata={
-            "source_file": src_file,
-            "module":      module,
-            "chunk_type":  entry.get("chunk_type", "function_summary"),
-            "source_type": "code",
-        },
-    )
-    doc_id = str(response.results.document_id)
+    doc_id = _create_or_replace(client, entry["summary"], {
+        "source_file": src_file,
+        "module":      module,
+        "chunk_type":  entry.get("chunk_type", "function_summary"),
+        "source_type": "code",
+    })
 
     # Index raw code as a separate searchable chunk
     raw_code = entry.get("raw_code", "").strip()
     if raw_code and len(raw_code) > 30:
         try:
-            client.documents.create(
-                raw_text=raw_code,
-                metadata={
-                    "source_file": src_file,
-                    "module":      module,
-                    "chunk_type":  "raw_code",
-                    "source_type": "code",
-                },
-            )
+            _create_or_replace(client, raw_code, {
+                "source_file": src_file,
+                "module":      module,
+                "chunk_type":  "raw_code",
+                "source_type": "code",
+            })
         except Exception:
             pass  # non-fatal — the summary is already indexed
 

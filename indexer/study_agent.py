@@ -369,10 +369,31 @@ def search_kb(query: str, limit: int = 3) -> str:
         return ""
 
 
+def _create_or_replace(client, raw_text: str, metadata: dict) -> str:
+    """Create a document in R2R; if it already exists, delete and retry."""
+    import re as _re
+    try:
+        resp = client.documents.create(raw_text=raw_text, metadata=metadata)
+        return str(resp.results.document_id)
+    except Exception as e:
+        err = str(e)
+        if "already exists" not in err.lower():
+            raise
+        match = _re.search(r"document\s+([0-9a-f-]{36})", err, _re.IGNORECASE)
+        if match:
+            try:
+                client.documents.delete(match.group(1))
+            except Exception:
+                pass
+            resp = client.documents.create(raw_text=raw_text, metadata=metadata)
+            return str(resp.results.document_id)
+        raise
+
+
 def index_summaries_to_r2r(summaries: list[dict]) -> None:
     """
-    Index all summaries into R2R.  If an entry already has a 'doc_id' (from a
-    previous pass), the old document is deleted first so there are no duplicates.
+    Index all summaries into R2R with upsert semantics.
+    If a document already exists (same content hash), it is replaced.
     The new doc_id is stored back into the entry dict.
 
     Also indexes raw code as a separate chunk (chunk_type: "raw_code") so that
@@ -381,34 +402,18 @@ def index_summaries_to_r2r(summaries: list[dict]) -> None:
     client = _r2r_client()
     print(f"\n[Index] Indexing {len(summaries)} summaries + raw code into R2R...")
     for i, entry in enumerate(summaries):
-        # Delete old summary doc if re-indexing
-        if entry.get("doc_id"):
-            try:
-                client.documents.delete(entry["doc_id"])
-            except Exception:
-                pass
-        # Delete old raw_code doc if re-indexing
-        if entry.get("code_doc_id"):
-            try:
-                client.documents.delete(entry["code_doc_id"])
-            except Exception:
-                pass
-
         src_file = entry.get("source_file", "")
         module   = entry.get("module", "")
 
         # Index the summary (embedded for semantic search)
         try:
-            resp = client.documents.create(
-                raw_text=entry["summary"],
-                metadata={
-                    "source_file": src_file,
-                    "module":      module,
-                    "chunk_type":  entry.get("chunk_type", "function_summary"),
-                    "source_type": "code",
-                },
-            )
-            entry["doc_id"] = str(resp.results.document_id)
+            doc_id = _create_or_replace(client, entry["summary"], {
+                "source_file": src_file,
+                "module":      module,
+                "chunk_type":  entry.get("chunk_type", "function_summary"),
+                "source_type": "code",
+            })
+            entry["doc_id"] = doc_id
         except Exception as e:
             print(f"  [warn] {src_file}: summary index failed: {e}")
 
@@ -416,16 +421,13 @@ def index_summaries_to_r2r(summaries: list[dict]) -> None:
         raw_code = entry.get("raw_code", "").strip()
         if raw_code and len(raw_code) > 30:
             try:
-                resp = client.documents.create(
-                    raw_text=raw_code,
-                    metadata={
-                        "source_file": src_file,
-                        "module":      module,
-                        "chunk_type":  "raw_code",
-                        "source_type": "code",
-                    },
-                )
-                entry["code_doc_id"] = str(resp.results.document_id)
+                code_doc_id = _create_or_replace(client, raw_code, {
+                    "source_file": src_file,
+                    "module":      module,
+                    "chunk_type":  "raw_code",
+                    "source_type": "code",
+                })
+                entry["code_doc_id"] = code_doc_id
             except Exception as e:
                 print(f"  [warn] {src_file}: code index failed: {e}")
 
