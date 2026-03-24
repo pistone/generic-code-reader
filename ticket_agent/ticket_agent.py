@@ -8,6 +8,7 @@ only the knowledge nuggets worth indexing.
 Usage:
     python -m ticket_agent.ticket_agent --tickets /path/to/exported/tickets
     python -m ticket_agent.ticket_agent --tickets /tmp/tickets --incremental
+    python -m ticket_agent.ticket_agent --index-only          # re-index from saved summaries
 """
 
 import argparse
@@ -250,22 +251,40 @@ def main():
     parser = argparse.ArgumentParser(
         description="Ticket agent: extract knowledge from ticket exports → R2R",
     )
-    parser.add_argument("--tickets", required=True,
+    parser.add_argument("--tickets", default=None,
                         help="Directory of exported ticket JSON files")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help="litellm model string (default: %(default)s)")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process tickets changed since last run")
+    parser.add_argument("--index-only", action="store_true",
+                        help="Skip extraction; re-index from saved ticket_summaries.json")
     args = parser.parse_args()
+
+    output_dir = Path(__file__).resolve().parent
+    manifest_path = output_dir / "ticket_hashes.json"
+    cost_log_path = output_dir / "cost_log.jsonl"
+    summaries_path = output_dir / "ticket_summaries.json"
+
+    # --index-only: replay from saved summaries, no LLM calls
+    if args.index_only:
+        if not summaries_path.exists():
+            print(f"Error: {summaries_path} not found. Run extraction first.")
+            sys.exit(1)
+        entries = json.loads(summaries_path.read_text())
+        print(f"Re-indexing {len(entries)} saved ticket summaries into R2R...")
+        indexed = index_ticket_summaries(entries)
+        print(f"[Done] {len(indexed)}/{len(entries)} entries indexed (no LLM calls)")
+        return
+
+    if not args.tickets:
+        print("Error: --tickets is required unless using --index-only")
+        sys.exit(1)
 
     tickets_dir = Path(args.tickets).resolve()
     if not tickets_dir.is_dir():
         print(f"Error: '{tickets_dir}' is not a directory")
         sys.exit(1)
-
-    output_dir = Path(__file__).resolve().parent
-    manifest_path = output_dir / "ticket_hashes.json"
-    cost_log_path = output_dir / "cost_log.jsonl"
 
     tracker = TokenTracker()
     manifest = load_manifest(manifest_path)
@@ -330,6 +349,28 @@ def main():
     print(f"\nExtraction: {len(useful_entries)} useful, "
           f"{not_useful} not useful, "
           f"{len(candidates) - len(useful_entries) - not_useful} duplicates")
+
+    # Save extracted summaries to disk (so --index-only can replay)
+    if useful_entries:
+        # Merge with any previously saved summaries
+        existing_summaries: list[dict] = []
+        if summaries_path.exists():
+            try:
+                existing_summaries = json.loads(summaries_path.read_text())
+            except Exception:
+                existing_summaries = []
+        existing_keys = {e["key"] for e in existing_summaries}
+        for entry in useful_entries:
+            if entry["key"] not in existing_keys:
+                existing_summaries.append(entry)
+            else:
+                # Update existing entry
+                existing_summaries = [
+                    entry if e["key"] == entry["key"] else e
+                    for e in existing_summaries
+                ]
+        summaries_path.write_text(json.dumps(existing_summaries, indent=2))
+        print(f"Saved {len(existing_summaries)} total summaries to {summaries_path}")
 
     # Step 6: index
     if useful_entries:
