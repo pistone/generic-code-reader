@@ -172,6 +172,83 @@ def llm_call(model: str, system: str, user: str,
         return response.choices[0].message.content or ""
 
 
+def llm_tool_loop(
+    model: str,
+    system: str,
+    initial_messages: list[dict],
+    tools: list[dict],
+    dispatch: "Callable[[str, dict], str]",
+    terminal_tools: Optional[set[str]] = None,
+    max_rounds: int = 10,
+    max_tokens: int = 4096,
+    tracker: Optional["TokenTracker"] = None,
+    phase: str = "",
+    on_round: Optional["Callable[[int, str, dict], None]"] = None,
+) -> tuple[list[dict], Optional[dict]]:
+    """
+    Generic tool-use agent loop via litellm.
+
+    The LLM can call any tool in `tools`. The `dispatch` callback handles
+    each tool call: dispatch(tool_name, args_dict) -> result_string.
+
+    When the LLM calls a tool listed in `terminal_tools`, the loop ends
+    immediately and returns (conversation, tool_args).  The dispatch
+    function is NOT called for terminal tools.
+
+    If the LLM responds without tool calls (text-only) or max_rounds is
+    exhausted, returns (conversation, None).
+
+    on_round(round_num, tool_name, args) is an optional callback for logging.
+    """
+    from litellm import completion
+
+    terminal_tools = terminal_tools or set()
+    messages = [{"role": "system", "content": system}] + list(initial_messages)
+
+    for round_num in range(1, max_rounds + 1):
+        kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
+                      tools=tools, tool_choice="auto")
+        response = completion(**kwargs)
+
+        if tracker and phase:
+            tracker.record(f"{phase} (round {round_num})", response)
+
+        msg = response.choices[0].message
+
+        # Append assistant message (preserving tool_calls metadata)
+        messages.append(msg.model_dump())
+
+        # No tool calls → LLM is done talking (shouldn't happen often with tools)
+        if not msg.tool_calls:
+            return messages, None
+
+        # Process each tool call
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            try:
+                args = json.loads(tc.function.arguments)
+            except (json.JSONDecodeError, TypeError):
+                args = {}
+
+            if on_round:
+                on_round(round_num, name, args)
+
+            # Terminal tool → return immediately
+            if name in terminal_tools:
+                return messages, args
+
+            # Dispatch and feed result back
+            result = dispatch(name, args)
+            messages.append({
+                "role": "tool",
+                "tool_call_id": tc.id,
+                "content": str(result),
+            })
+
+    # Max rounds exhausted
+    return messages, None
+
+
 # ---------------------------------------------------------------------------
 # Manifest (JSON file persistence for incremental mode)
 # ---------------------------------------------------------------------------

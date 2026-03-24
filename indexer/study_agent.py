@@ -55,7 +55,7 @@ from pydantic import BaseModel
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from codebase_shared.utils import TokenTracker, llm_call, llm_call_multi  # noqa: E402
+from codebase_shared.utils import TokenTracker, llm_call, llm_tool_loop  # noqa: E402
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -582,19 +582,22 @@ def run_review(model: str, summaries: list[dict],
     return summaries, edit_rate
 
 
-# ── Pass 1: Interactive Module Discovery ───────────────────────────────────────
+# ── Pass 1: Agent-based Module Discovery ───────────────────────────────────────
 
 PASS1_SYSTEM = (
     "You are a senior software architect exploring a codebase to build a "
-    "semantic knowledge base. You can request to expand directories or read "
-    "files to understand the codebase better before defining modules.\n\n"
-    "EVERY response must be ONLY valid JSON — no markdown fences, no text "
-    "outside the JSON object."
+    "semantic knowledge base. Use the provided tools to explore the directory "
+    "structure and read key files. When you understand the architecture, call "
+    "define_modules to define the module map.\n\n"
+    "Guidelines:\n"
+    "- Each module should map to a directory or group of related directories\n"
+    "- Every source file should belong to exactly one module\n"
+    "- Write 3-6 domain-specific questions per module (use the project's vocabulary)\n"
+    "- Focus questions on HOW things work internally, not just WHAT they are"
 )
 
-MAX_EXPLORE_ROUNDS = 5   # cap on interactive exploration rounds
-MAX_FILES_PER_READ = 8   # max files the LLM can request per round
-AUTO_EXPAND_THRESHOLD = 200  # auto-expand dirs with more files than this
+MAX_EXPLORE_ROUNDS = 8   # cap on interactive exploration rounds
+MAX_FILES_PER_READ = 8   # max files per read_files call
 
 
 def _group_files_by_dir(codebase: Path, files: list[Path],
@@ -611,220 +614,292 @@ def _group_files_by_dir(codebase: Path, files: list[Path],
     return result
 
 
-def _list_files_in_dir(codebase: Path, files: list[Path],
-                        dir_path: str, max_files: int = 60) -> str:
-    """List filenames in a directory (for the LLM to pick files to read)."""
-    matches = _group_files_by_dir(codebase, files, dir_path)
-    lines = [str(f.relative_to(codebase)) for f in matches[:max_files]]
-    if len(matches) > max_files:
-        lines.append(f"... and {len(matches) - max_files} more files")
-    return "\n".join(lines)
+# ── Tool definitions ──────────────────────────────────────────────────────
+
+PASS1_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "expand_dirs",
+            "description": (
+                "Expand directories to see their subdirectory structure deeper. "
+                "Use this when you see a truncated directory with a large file/subdir count "
+                "and want to understand its internal organization."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dirs": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Directory paths to expand (e.g. ['core/analysis', 'lib'])",
+                    },
+                },
+                "required": ["dirs"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_files",
+            "description": (
+                "List the source files in a specific directory. "
+                "Use this to see what files exist before deciding to read some."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "dir_path": {
+                        "type": "string",
+                        "description": "Directory to list files in (e.g. 'core/handlers')",
+                    },
+                },
+                "required": ["dir_path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_files",
+            "description": (
+                "Read the first 80 lines of specific source files. "
+                "Use this to understand what a module does by examining key files. "
+                f"Up to {MAX_FILES_PER_READ} files per call."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "File paths relative to codebase root",
+                    },
+                },
+                "required": ["paths"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_kb",
+            "description": (
+                "Search the existing knowledge base (design docs, previously indexed content). "
+                "Use this to find documentation about a module or concept."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query (e.g. 'dataflow analysis architecture')",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max results to return (default 3)",
+                        "default": 3,
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "define_modules",
+            "description": (
+                "Define the final module map. Call this when you have explored enough "
+                "to understand the codebase architecture. Every source file should "
+                "belong to exactly one module via dir_paths."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string", "description": "Project name"},
+                    "description": {"type": "string", "description": "One sentence about the project"},
+                    "modules": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": {"type": "string", "description": "Short module name"},
+                                "description": {"type": "string", "description": "What this module does"},
+                                "dir_paths": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Directory paths belonging to this module",
+                                },
+                                "questions": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "3-6 domain-specific questions about this module",
+                                },
+                            },
+                            "required": ["name", "description", "dir_paths", "questions"],
+                        },
+                    },
+                },
+                "required": ["project", "description", "modules"],
+            },
+        },
+    },
+]
 
 
-def _build_initial_prompt(codebase_name: str, language: str,
-                           tree: str,
-                           docs_context: Optional[str] = None) -> str:
-    docs_section = ""
-    if docs_context:
-        docs_section = f"\n## Reference Documentation\n{docs_context}\n"
+def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str):
+    """Create a closure that dispatches Pass 1 tool calls."""
 
-    return f"""You are exploring the "{codebase_name}" {language} codebase to discover its modules.
+    def dispatch(name: str, args: dict) -> str:
+        if name == "expand_dirs":
+            dirs = args.get("dirs", [])
+            expanded_set = set(str(d) for d in dirs)
+            tree = build_directory_tree(codebase, files, max_depth=3,
+                                         expand_dirs=expanded_set)
+            return tree
 
-## Directory Tree (depth-limited, counts on truncated nodes)
-```
-{tree}
-```
-{docs_section}
-## What you can do
+        elif name == "list_files":
+            dir_path = args.get("dir_path", ".")
+            matches = _group_files_by_dir(codebase, files, dir_path)
+            lines = [str(f.relative_to(codebase)) for f in matches[:80]]
+            if len(matches) > 80:
+                lines.append(f"... and {len(matches) - 80} more files")
+            return "\n".join(lines) if lines else f"(no source files found in {dir_path})"
 
-In each response, output ONE of these JSON actions:
+        elif name == "read_files":
+            paths = args.get("paths", [])
+            parts = []
+            for rf in paths[:MAX_FILES_PER_READ]:
+                rf_path = codebase / str(rf)
+                if rf_path.exists() and rf_path.is_file():
+                    content = read_file_sample(rf_path, max_lines=SAMPLE_LINES)
+                    parts.append(f"=== {rf} ===\n{content}")
+                else:
+                    # Try rglob fallback
+                    candidates = list(codebase.rglob(Path(rf).name))
+                    if candidates:
+                        content = read_file_sample(candidates[0], max_lines=SAMPLE_LINES)
+                        actual = str(candidates[0].relative_to(codebase))
+                        parts.append(f"=== {actual} (matched from {rf}) ===\n{content}")
+                    else:
+                        parts.append(f"=== {rf} ===\n(file not found)")
+            return "\n\n".join(parts) if parts else "(no files specified)"
 
-### Action 1: Explore — request more information
-{{
-  "action": "explore",
-  "expand_dirs": ["dir/to/expand"],
-  "read_files": ["path/to/specific/file.cpp"],
-  "list_files_in": ["dir/to/list/contents"]
-}}
-- expand_dirs: directories whose subdirectory structure you want to see deeper
-- read_files: specific files you want to read (first 80 lines); up to {MAX_FILES_PER_READ} per round
-- list_files_in: directories where you want to see the file listing
+        elif name == "search_kb":
+            query = args.get("query", "")
+            limit = args.get("limit", 3)
+            result = search_kb(query, limit=limit)
+            return result if result else "(no results found in knowledge base)"
 
-### Action 2: Done — define the modules
-{{
-  "action": "done",
-  "project": "{codebase_name}",
-  "description": "one sentence describing this codebase",
-  "modules": [
-    {{
-      "name": "short_module_name",
-      "description": "what this module does",
-      "dir_paths": ["path/to/dir", "other/dir"],
-      "questions": ["domain-specific question 1", "question 2"]
-    }}
-  ]
-}}
-- Every source file should belong to exactly one module (use dir_paths to assign)
-- Write 3–6 domain-specific questions per module that focus on HOW things work
-- Use the project's own vocabulary (class names, protocols, concepts)
-
-Start by examining the tree. Request expansions or file reads for any directories
-you want to understand better before defining modules. You have up to {MAX_EXPLORE_ROUNDS} exploration rounds."""
-
-
-def _fulfill_requests(codebase: Path, files: list[Path], language: str,
-                       data: dict) -> str:
-    """Fulfill explore requests and return a formatted response."""
-    parts: list[str] = []
-
-    # Expand directories
-    expand_dirs = data.get("expand_dirs") or []
-    if expand_dirs:
-        expanded_set = set(str(d) for d in expand_dirs)
-        # Also auto-expand large dirs
-        from collections import defaultdict
-        dir_counts: dict[str, int] = defaultdict(int)
-        for f in files:
-            rel = f.relative_to(codebase)
-            dir_parts = rel.parts[:-1]
-            for depth in range(1, len(dir_parts) + 1):
-                dir_counts["/".join(dir_parts[:depth])] += 1
-        for dp, count in dir_counts.items():
-            if count > AUTO_EXPAND_THRESHOLD and dp.count("/") <= 3:
-                for ed in expand_dirs:
-                    if dp.startswith(str(ed)):
-                        expanded_set.add(dp)
-
-        tree = build_directory_tree(codebase, files, max_depth=3,
-                                     expand_dirs=expanded_set)
-        parts.append(f"## Expanded Directory Tree\n```\n{tree}\n```")
-
-    # List files in directories
-    list_dirs = data.get("list_files_in") or []
-    for d in list_dirs[:5]:
-        listing = _list_files_in_dir(codebase, files, str(d))
-        parts.append(f"## Files in {d}/\n```\n{listing}\n```")
-
-    # Read specific files
-    read_files = data.get("read_files") or []
-    for rf in read_files[:MAX_FILES_PER_READ]:
-        rf_path = codebase / str(rf)
-        if rf_path.exists() and rf_path.is_file():
-            content = read_file_sample(rf_path, max_lines=SAMPLE_LINES)
-            parts.append(f"## File: {rf}\n```{language}\n{content}\n```")
         else:
-            # Try rglob fallback
-            candidates = list(codebase.rglob(Path(rf).name))
-            if candidates:
-                content = read_file_sample(candidates[0], max_lines=SAMPLE_LINES)
-                actual = str(candidates[0].relative_to(codebase))
-                parts.append(f"## File: {actual} (matched from {rf})\n```{language}\n{content}\n```")
-            else:
-                parts.append(f"## File: {rf}\n(not found)")
+            return f"Unknown tool: {name}"
 
-    if not parts:
-        parts.append("No valid requests to fulfill. Please specify expand_dirs, "
-                      "read_files, or list_files_in, or respond with action: done.")
-
-    return "\n\n".join(parts) + "\n\nContinue exploring or output action: done with your module map."
+    return dispatch
 
 
 def run_pass1(model: str, codebase: Path, files: list[Path],
               language: str, docs_context: Optional[str] = None,
               tracker: Optional[TokenTracker] = None) -> ModuleMap:
-    """Interactive module discovery: LLM explores the codebase iteratively.
+    """Agent-based module discovery using tool calling.
 
-    The LLM sees a depth-limited directory tree and can:
-    - Request directory expansions to see deeper structure
-    - Request file listings to see what's in a directory
-    - Request to read specific files (first 80 lines)
-    - When satisfied, output the final module map
+    The LLM explores the codebase interactively using tools:
+    - expand_dirs: see deeper directory structure
+    - list_files: see files in a directory
+    - read_files: read first 80 lines of specific files
+    - search_kb: search existing knowledge base / design docs
+    - define_modules: terminal tool — outputs the final module map
 
     Bounded to MAX_EXPLORE_ROUNDS to cap cost.
     """
     print(f"\n[Pass 1] {len(files)} source files found.")
 
-    # ── Build initial tree ────────────────────────────────────────────────
+    # Build initial tree
     tree = build_directory_tree(codebase, files, max_depth=3)
     tree_lines = len(tree.split("\n"))
     print(f"[Pass 1] Directory tree: {tree_lines} lines, {len(tree)} chars")
 
-    # ── Start interactive exploration ─────────────────────────────────────
-    initial_prompt = _build_initial_prompt(
-        codebase_name=codebase.name,
-        language=language,
-        tree=tree,
-        docs_context=docs_context,
+    # Build initial prompt
+    docs_section = ""
+    if docs_context:
+        docs_section = f"\n\nDesign documentation (excerpts):\n{docs_context}"
+
+    initial_prompt = (
+        f"Explore this {language} codebase and define its modules.\n\n"
+        f"Directory tree (depth-limited, counts on truncated nodes):\n"
+        f"```\n{tree}\n```"
+        f"{docs_section}\n\n"
+        f"Use the tools to explore directories and read key files. "
+        f"When you understand the architecture, call define_modules. "
+        f"You have up to {MAX_EXPLORE_ROUNDS} exploration rounds."
     )
 
-    # Multi-turn conversation
-    conversation: list[dict] = [
-        {"role": "user", "content": initial_prompt},
-    ]
+    # Create dispatcher
+    dispatch = _make_pass1_dispatch(codebase, files, language)
 
-    print(f"[Pass 1] Starting interactive exploration with {model} "
-          f"(up to {MAX_EXPLORE_ROUNDS} rounds)...")
+    # Logging callback
+    def on_round(round_num: int, tool_name: str, args: dict):
+        if tool_name == "expand_dirs":
+            print(f"  Round {round_num}: expand_dirs({args.get('dirs', [])})")
+        elif tool_name == "list_files":
+            print(f"  Round {round_num}: list_files({args.get('dir_path', '?')})")
+        elif tool_name == "read_files":
+            paths = args.get("paths", [])
+            print(f"  Round {round_num}: read_files({len(paths)} files)")
+        elif tool_name == "search_kb":
+            print(f"  Round {round_num}: search_kb({args.get('query', '?')[:60]})")
+        elif tool_name == "define_modules":
+            n = len(args.get("modules", []))
+            print(f"  Round {round_num}: define_modules({n} modules)")
 
-    final_data: Optional[dict] = None
+    print(f"[Pass 1] Starting agent exploration with {model}...")
 
-    for round_num in range(1, MAX_EXPLORE_ROUNDS + 1):
-        raw = llm_call_multi(model, PASS1_SYSTEM, conversation,
-                              max_tokens=4096, json_mode=True,
-                              tracker=tracker, phase=f"Pass 1 (round {round_num})")
+    conversation, terminal_args = llm_tool_loop(
+        model=model,
+        system=PASS1_SYSTEM,
+        initial_messages=[{"role": "user", "content": initial_prompt}],
+        tools=PASS1_TOOLS,
+        dispatch=dispatch,
+        terminal_tools={"define_modules"},
+        max_rounds=MAX_EXPLORE_ROUNDS,
+        max_tokens=4096,
+        tracker=tracker,
+        phase="Pass 1",
+        on_round=on_round,
+    )
 
-        conversation.append({"role": "assistant", "content": raw})
-
-        try:
-            data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError) as e:
-            print(f"  Round {round_num}: JSON parse error: {e}")
-            conversation.append({
-                "role": "user",
-                "content": "Your response was not valid JSON. Please respond with only JSON.",
-            })
-            continue
-
-        action = data.get("action", "explore")
-
-        if action == "done":
-            print(f"  Round {round_num}: LLM is done — defined {len(data.get('modules', []))} modules")
-            final_data = data
-            break
-
-        # Explore action
-        n_expand = len(data.get("expand_dirs") or [])
-        n_read = len(data.get("read_files") or [])
-        n_list = len(data.get("list_files_in") or [])
-        print(f"  Round {round_num}: explore — "
-              f"{n_expand} expand, {n_read} read, {n_list} list")
-
-        response_text = _fulfill_requests(codebase, files, language, data)
-        conversation.append({"role": "user", "content": response_text})
-        time.sleep(0.3)
-
-    # If LLM didn't finish, force a final round
-    if final_data is None:
+    # If agent didn't call define_modules, force it
+    if terminal_args is None:
         print(f"  [Pass 1] Max rounds reached — forcing module definition...")
+        from litellm import completion
         conversation.append({
             "role": "user",
             "content": ("You have used all exploration rounds. "
-                        "Please output your final module map now with action: done. "
-                        "Assign ALL directories to modules — any unassigned files "
-                        "will go into an 'other' module."),
+                        "Call define_modules now to define the final module map. "
+                        "Assign ALL directories to modules."),
         })
-        raw = llm_call_multi(model, PASS1_SYSTEM, conversation,
-                              max_tokens=4096, json_mode=True,
-                              tracker=tracker, phase="Pass 1 (final)")
-        try:
-            final_data = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            print("  [ERROR] Could not parse final module map — falling back to directory-based")
-            # Emergency fallback: one module per top-level directory
-            final_data = _fallback_module_map(codebase, files, language)
+        response = completion(
+            model=model, messages=conversation, max_tokens=4096,
+            tools=PASS1_TOOLS,
+            tool_choice={"type": "function", "function": {"name": "define_modules"}},
+        )
+        if tracker:
+            tracker.record("Pass 1 (forced)", response)
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            try:
+                terminal_args = json.loads(msg.tool_calls[0].function.arguments)
+            except (json.JSONDecodeError, TypeError):
+                terminal_args = None
+
+    if terminal_args is None:
+        print("  [ERROR] Agent failed to define modules — falling back to directory-based")
+        terminal_args = _fallback_module_map(codebase, files, language)
 
     # ── Resolve dir_paths → actual file lists ─────────────────────────────
-    project_desc = final_data.get("description", "")
-    raw_modules = final_data.get("modules", [])
+    project_desc = terminal_args.get("description", "")
+    raw_modules = terminal_args.get("modules", [])
     print(f"\n[Pass 1] Resolving {len(raw_modules)} modules to file lists...")
 
     assigned_files: set[str] = set()
