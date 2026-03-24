@@ -100,6 +100,33 @@ class TokenTracker:
 # LLM call
 # ---------------------------------------------------------------------------
 
+def llm_call_multi(model: str, system: str, messages: list[dict],
+                    max_tokens: int = 4096,
+                    json_mode: bool = False,
+                    tracker: Optional[TokenTracker] = None,
+                    phase: str = ""):
+    """
+    Multi-turn LLM call via litellm.
+
+    messages is a list of {"role": "user"|"assistant", "content": "..."} dicts.
+    The system prompt is prepended automatically.
+    Returns the assistant's response text.
+    """
+    from litellm import completion
+
+    full_messages = [{"role": "system", "content": system}] + messages
+
+    kwargs = dict(model=model, messages=full_messages, max_tokens=max_tokens)
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = completion(**kwargs)
+
+    if tracker and phase:
+        tracker.record(phase, response)
+    return response.choices[0].message.content or ""
+
+
 def llm_call(model: str, system: str, user: str,
              max_tokens: int = 4096,
              json_mode: bool = False,
