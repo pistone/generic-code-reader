@@ -192,43 +192,119 @@ def filter_changed_files(codebase: Path, files: list[Path],
 
 
 def build_directory_tree(codebase: Path, files: list[Path],
-                         max_depth: int = 4) -> str:
-    """Build a compact directory tree from file list.
+                         max_depth: int = 3,
+                         expand_dirs: Optional[set[str]] = None) -> str:
+    """Build a depth-limited annotated directory tree from file list.
 
-    For large codebases (>1000 files), shows only directory structure with
-    file counts per directory — not individual filenames.  This keeps the
-    Pass 1 prompt under control even for 100K+ file repos.
+    Shows directories up to max_depth. Unexpanded nodes get annotations like
+    "(45 files, 3 subdirs)". Leaf directories list file counts.
+    Use expand_dirs to selectively expand specific directories deeper.
+
+    For small codebases (≤200 files), shows every file (original behaviour).
     """
-    if len(files) <= 500:
-        # Small codebase: show every file (original behaviour)
+    if len(files) <= 200:
         lines = [str(codebase.name) + "/"]
         for rp in sorted(f.relative_to(codebase) for f in files):
             indent = "  " * (len(rp.parts) - 1)
             lines.append(f"{indent}  {rp.name}")
         return "\n".join(lines)
 
-    # Large codebase: show directory structure + counts
-    from collections import Counter
-    dir_counts: Counter[str] = Counter()
+    expand_dirs = expand_dirs or set()
+
+    # Build a tree structure: {dir_path: {files: int, subdirs: set}}
+    from collections import defaultdict
+    dir_files: dict[str, int] = defaultdict(int)     # files directly in this dir
+    all_dirs: set[str] = set()
+
     for f in files:
         rel = f.relative_to(codebase)
-        # Count at each directory level up to max_depth
-        parts = rel.parts[:-1]  # directories only
-        if not parts:
-            dir_counts["."] += 1
-        else:
-            trimmed = parts[:max_depth]
-            dir_counts["/".join(trimmed)] += 1
+        parts = rel.parts[:-1]  # directory components
+        # Count file in its immediate directory
+        dir_path = "/".join(parts) if parts else "."
+        dir_files[dir_path] += 1
+        # Register all ancestor directories
+        for i in range(1, len(parts) + 1):
+            all_dirs.add("/".join(parts[:i]))
 
-    lines = [f"{codebase.name}/  ({len(files)} files total)"]
-    for dirpath in sorted(dir_counts):
-        if dirpath == ".":
-            lines.append(f"  ({dir_counts[dirpath]} files in root)")
-        else:
-            depth = dirpath.count("/")
-            indent = "  " * (depth + 1)
-            lines.append(f"{indent}{dirpath.split('/')[-1]}/  ({dir_counts[dirpath]} files)")
-    return "\n".join(lines)
+    def _effective_depth(dir_path: str) -> int:
+        """How deep to expand this directory."""
+        depth = max_depth
+        # If this dir or an ancestor is in expand_dirs, allow deeper
+        for ed in expand_dirs:
+            if dir_path.startswith(ed) or ed.startswith(dir_path):
+                depth = max_depth + 2
+                break
+        return depth
+
+    def _count_below(prefix: str) -> tuple[int, int]:
+        """Count total files and immediate subdirs below a directory prefix."""
+        total_files = 0
+        immediate_subdirs = set()
+        for dp, fc in dir_files.items():
+            if dp == prefix or dp.startswith(prefix + "/"):
+                total_files += fc
+            if dp.startswith(prefix + "/"):
+                # Get the immediate child directory name
+                rest = dp[len(prefix) + 1:]
+                immediate_subdirs.add(rest.split("/")[0])
+        # Also count subdirs registered in all_dirs
+        for d in all_dirs:
+            if d.startswith(prefix + "/"):
+                rest = d[len(prefix) + 1:]
+                if "/" not in rest:
+                    immediate_subdirs.add(rest)
+        return total_files, len(immediate_subdirs)
+
+    def _render_dir(dir_path: str, depth: int) -> list[str]:
+        """Recursively render a directory node."""
+        name = dir_path.split("/")[-1] if "/" in dir_path else dir_path
+        indent = "  " * depth
+        eff_depth = _effective_depth(dir_path)
+
+        # Find immediate children (subdirs at this level)
+        child_dirs = sorted(
+            d for d in all_dirs
+            if d.startswith(dir_path + "/") and d.count("/") == dir_path.count("/") + 1
+        )
+
+        # Files directly in this directory
+        direct_files = dir_files.get(dir_path, 0)
+        total_files, n_subdirs = _count_below(dir_path)
+
+        if depth >= eff_depth and (child_dirs or total_files > direct_files):
+            # Truncated: show summary annotation
+            parts = [f"{indent}{name}/"]
+            annotations = []
+            if total_files:
+                annotations.append(f"{total_files} files")
+            if n_subdirs:
+                annotations.append(f"{n_subdirs} subdirs")
+            if annotations:
+                parts[0] += f"  ({', '.join(annotations)})"
+            return parts
+
+        # Expanded: recurse into children
+        lines = [f"{indent}{name}/"]
+        if direct_files:
+            lines.append(f"{indent}  ({direct_files} files here)")
+        for child in child_dirs:
+            lines.extend(_render_dir(child, depth + 1))
+        return lines
+
+    # Build from top-level directories
+    result = [f"{codebase.name}/  ({len(files)} files total)"]
+
+    # Root files
+    root_files = dir_files.get(".", 0)
+    if root_files:
+        result.append(f"  ({root_files} files in root)")
+
+    # Top-level directories
+    top_dirs = sorted(d for d in all_dirs if "/" not in d)
+    for td in top_dirs:
+        result.extend(_render_dir(td, 1))
+
+    return "\n".join(result)
 
 
 def read_file_sample(path: Path, max_lines: int = SAMPLE_LINES) -> str:
@@ -513,139 +589,112 @@ PASS1_SYSTEM = (
     "Output ONLY valid JSON — no markdown fences, no commentary, no text outside the JSON object."
 )
 
-def build_pass1_prompt(codebase_name: str, language: str,
-                       tree: str, file_samples: dict[str, str],
-                       docs_context: Optional[str] = None) -> str:
-    samples_section = ""
-    for fname, sample in file_samples.items():
-        samples_section += f"\n### {fname}\n```{language}\n{sample}\n```\n"
 
+
+def _group_files_by_dir(codebase: Path, files: list[Path],
+                         dir_path: str) -> list[Path]:
+    """Return files that live under a specific directory path."""
+    result = []
+    for f in files:
+        rel = str(f.relative_to(codebase))
+        if dir_path == ".":
+            if "/" not in rel:
+                result.append(f)
+        elif rel.startswith(dir_path + "/"):
+            result.append(f)
+    return result
+
+
+# ── Tree-based module discovery prompts ───────────────────────────────────
+
+_TREE_DISCOVER_SYSTEM = (
+    "You are a senior software architect analyzing a codebase directory tree. "
+    "Output ONLY valid JSON — no markdown fences, no commentary."
+)
+
+SHARD_MAX_CHARS = 12000  # max tree chars per LLM call
+
+def _shard_tree(tree: str, max_chars: int = SHARD_MAX_CHARS) -> list[str]:
+    """Split a large tree into shards that fit in a prompt."""
+    if len(tree) <= max_chars:
+        return [tree]
+    lines = tree.split("\n")
+    shards: list[str] = []
+    current: list[str] = [lines[0]]  # keep root line in every shard
+    current_len = len(lines[0])
+    for line in lines[1:]:
+        if current_len + len(line) + 1 > max_chars and len(current) > 1:
+            shards.append("\n".join(current))
+            current = [lines[0], line]  # restart with root + current line
+            current_len = len(lines[0]) + len(line) + 1
+        else:
+            current.append(line)
+            current_len += len(line) + 1
+    if len(current) > 1:
+        shards.append("\n".join(current))
+    return shards
+
+
+def _build_tree_discover_prompt(codebase_name: str, language: str,
+                                 tree_shard: str, shard_info: str,
+                                 docs_context: Optional[str] = None) -> str:
     docs_section = ""
     if docs_context:
-        docs_section = f"\n## Design / Reference Documentation\n{docs_context}\n"
+        docs_section = f"\n## Reference Documentation\n{docs_context}\n"
 
-    return f"""Analyze this {language} codebase and produce a module map for a domain knowledge base.
-
-## Directory Structure
+    return f"""Analyze this {language} codebase directory tree and identify modules.
+{shard_info}
+## Directory Tree
 ```
-{tree}
+{tree_shard}
 ```
 {docs_section}
-## File Samples
-{samples_section}
-
 ## Task
-1. Group related files into logical modules/subsystems. Use the directory structure
-   as a guide — each major directory or subsystem should be its own module.
-2. For each module, write 3–6 domain-specific questions a developer would ask.
-   - Use the project's own vocabulary (class names, concepts, protocols).
-   - Focus on HOW things work internally, not just WHAT they are.
-   - Example for an HTTP library:
-     "How does Session manage connection pools across requests?"
-     "What retry/redirect logic does HTTPAdapter implement?"
+1. Identify logical modules from the directory structure. Each module is typically
+   a top-level directory, but related small directories can be grouped together,
+   and large directories with distinct subdirectories can be split into sub-modules.
+2. For each module, specify which directory path(s) it contains.
+3. Flag any directories that seem too large or complex and might need deeper
+   exploration (you can see file/subdir counts on truncated nodes).
 
-Output ONLY this JSON (no markdown, no extra text):
+Output ONLY this JSON:
 {{
   "project": "{codebase_name}",
   "description": "one sentence describing what this codebase does",
   "modules": [
     {{
       "name": "short_module_name",
-      "description": "what this module/subsystem does",
-      "files": ["filename.py"],
-      "questions": ["domain question 1", "question 2"]
+      "description": "what this module does (infer from directory/file names)",
+      "dir_paths": ["path/to/dir"],
+      "needs_expansion": false
     }}
-  ]
+  ],
+  "expand_dirs": ["path/to/large/dir/that/needs/deeper/tree"]
 }}"""
 
 
-def _stratified_sample(codebase: Path, files: list[Path],
-                       max_samples: int = 24) -> list[Path]:
-    """Pick representative files from different directories.
-
-    For small codebases, returns all files (up to max_samples).
-    For large codebases, picks evenly across top-level directories
-    so the LLM sees breadth, not just the first alphabetical dir.
-    """
-    if len(files) <= max_samples:
-        return files
-
-    # Group by top-level directory (or root)
-    buckets: dict[str, list[Path]] = {}
-    for f in files:
-        rel = f.relative_to(codebase)
-        bucket = rel.parts[0] if len(rel.parts) > 1 else "."
-        buckets.setdefault(bucket, []).append(f)
-
-    # Allocate samples proportionally, minimum 1 per bucket
-    selected: list[Path] = []
-    n_buckets = len(buckets)
-    per_bucket = max(1, max_samples // n_buckets)
-
-    import random
-    rng = random.Random(42)  # deterministic
-
-    for _bucket_name, bucket_files in sorted(buckets.items()):
-        pick = min(per_bucket, len(bucket_files))
-        selected.extend(rng.sample(bucket_files, pick))
-        if len(selected) >= max_samples:
-            break
-
-    return selected[:max_samples]
-
-
-def _group_files_by_toplevel(codebase: Path,
-                              files: list[Path]) -> dict[str, list[Path]]:
-    """Group files by their top-level directory (or root for flat files)."""
-    groups: dict[str, list[Path]] = {}
-    for f in files:
-        rel = f.relative_to(codebase)
-        bucket = rel.parts[0] if len(rel.parts) > 1 else "."
-        groups.setdefault(bucket, []).append(f)
-    return groups
-
-
-# Prompt for describing a single module (used in large-codebase mode)
-_MODULE_DESCRIBE_SYSTEM = (
-    "You are a senior software architect. Describe one module of a codebase and "
-    "write questions that a developer would ask about it. "
-    "Output ONLY valid JSON — no markdown fences, no commentary."
-)
-
-def _module_describe_prompt(project_name: str, module_dir: str,
-                            language: str, file_list: list[str],
-                            file_samples: dict[str, str],
-                            docs_context: Optional[str] = None) -> str:
+def _build_module_questions_prompt(codebase_name: str, language: str,
+                                    module_name: str, module_desc: str,
+                                    file_samples: dict[str, str]) -> str:
     samples_section = ""
     for fname, sample in file_samples.items():
         samples_section += f"\n### {fname}\n```{language}\n{sample}\n```\n"
 
-    docs_section = ""
-    if docs_context:
-        docs_section = f"\n## Reference Documentation\n{docs_context}\n"
+    return f"""Generate domain-specific questions for the "{module_name}" module
+of the {codebase_name} {language} project.
 
-    # Show full file list (just names, not content)
-    file_listing = "\n".join(f"  {f}" for f in file_list[:200])
-    if len(file_list) > 200:
-        file_listing += f"\n  ... and {len(file_list) - 200} more files"
+Module description: {module_desc}
 
-    return f"""This is the "{module_dir}" directory of the {project_name} {language} project.
-It contains {len(file_list)} source files:
-
-{file_listing}
-{docs_section}
-## File Samples
+## File Samples from this module
 {samples_section}
 
 ## Task
-1. Write a one-sentence description of what this module/directory does.
-2. Write 3–6 domain-specific questions a developer would ask about it.
-   - Use the project's own vocabulary (class names, concepts, protocols).
-   - Focus on HOW things work internally, not just WHAT they are.
+Write 3–6 questions a developer would ask about this module.
+- Use the project's own vocabulary (class names, concepts, protocols).
+- Focus on HOW things work internally, not just WHAT they are.
 
 Output ONLY this JSON:
 {{
-  "description": "what this module does",
   "questions": ["question 1", "question 2", "..."]
 }}"""
 
@@ -653,118 +702,200 @@ Output ONLY this JSON:
 def run_pass1(model: str, codebase: Path, files: list[Path],
               language: str, docs_context: Optional[str] = None,
               tracker: Optional[TokenTracker] = None) -> ModuleMap:
-    """Call the LLM to analyze directory structure and produce module_map.
+    """Call the LLM to discover modules from an annotated directory tree.
 
-    Small codebases (≤10 top-level dirs): single LLM call discovers modules.
-    Large codebases (>10 top-level dirs): directory-guided mode — each top-level
-    dir becomes a module, with a per-module LLM call for description + questions.
-    All files are assigned, so nothing is orphaned in Pass 2.
+    Algorithm:
+    1. Build a depth-limited tree (3 levels) with file/subdir counts at
+       truncated nodes.
+    2. If the tree is too large, shard it across multiple prompts.
+    3. LLM identifies modules from directory structure + flags dirs needing
+       deeper expansion.
+    4. Auto-expand large truncated dirs (>200 files) plus LLM-requested dirs.
+    5. Re-query with expanded tree if needed (1 round max).
+    6. For each module, sample files and generate domain questions.
+    7. Assign ALL files to their modules so nothing is orphaned in Pass 2.
     """
-    groups = _group_files_by_toplevel(codebase, files)
-    n_dirs = len(groups)
-
-    print(f"\n[Pass 1] {len(files)} source files in {n_dirs} top-level directories.")
-
-    # ── Small codebase: original single-call approach ──────────────────────
-    if n_dirs <= 10:
-        tree = build_directory_tree(codebase, files)
-        sample_files = _stratified_sample(codebase, files, max_samples=24)
-        print(f"[Pass 1] Small codebase mode — sampling {len(sample_files)} files...")
-
-        file_samples: dict[str, str] = {}
-        for f in sample_files:
-            sample = read_file_sample(f)
-            if len(sample.strip()) > 20:
-                file_samples[str(f.relative_to(codebase))] = sample
-
-        prompt = build_pass1_prompt(
-            codebase_name=codebase.name,
-            language=language,
-            tree=tree,
-            file_samples=file_samples,
-            docs_context=docs_context,
-        )
-
-        print(f"[Pass 1] Calling {model} for module discovery ({len(prompt)} char prompt)...")
-        raw = llm_call(model, PASS1_SYSTEM, prompt, max_tokens=4096, json_mode=True,
-                       tracker=tracker, phase="Pass 1")
-        try:
-            data = json.loads(raw)
-            module_map = ModuleMap(**data)
-        except Exception as e:
-            print(f"[Pass 1] ERROR: could not parse LLM output as ModuleMap: {e}")
-            print("Raw output:", raw[:500])
-            sys.exit(1)
-
-        print(f"[Pass 1] Discovered {len(module_map.modules)} modules:")
-        for m in module_map.modules:
-            print(f"  - {m.name}: {m.description} ({len(m.files)} files, {len(m.questions)} questions)")
-        return module_map
-
-    # ── Large codebase: directory-guided module discovery ──────────────────
-    print(f"[Pass 1] Large codebase mode — one module per top-level directory.")
-    print(f"[Pass 1] Describing {n_dirs} modules with {model}...\n")
-
     import random
     rng = random.Random(42)
 
-    modules: list[ModuleDefinition] = []
+    print(f"\n[Pass 1] {len(files)} source files found.")
+
+    # ── Step 1: Build depth-limited tree ──────────────────────────────────
+    tree = build_directory_tree(codebase, files, max_depth=3)
+    tree_lines = len(tree.split("\n"))
+    print(f"[Pass 1] Directory tree: {tree_lines} lines, {len(tree)} chars")
+
+    # ── Step 2: Shard if needed, query LLM for module structure ───────────
+    shards = _shard_tree(tree)
+    print(f"[Pass 1] Querying {model} for module structure ({len(shards)} shard(s))...")
+
+    all_modules_raw: list[dict] = []
+    expand_dirs: set[str] = set()
     project_desc = ""
 
-    for dir_name, dir_files in sorted(groups.items()):
-        rel_files = [str(f.relative_to(codebase)) for f in dir_files]
+    for si, shard in enumerate(shards):
+        shard_info = ""
+        if len(shards) > 1:
+            shard_info = f"\nNote: This is shard {si+1}/{len(shards)} of the directory tree.\n"
 
-        # Sample a few files for LLM context
-        n_sample = min(5, len(dir_files))
-        sampled = rng.sample(dir_files, n_sample)
-        file_samples = {}
+        prompt = _build_tree_discover_prompt(
+            codebase_name=codebase.name,
+            language=language,
+            tree_shard=shard,
+            shard_info=shard_info,
+            docs_context=docs_context,
+        )
+
+        raw = llm_call(model, _TREE_DISCOVER_SYSTEM, prompt,
+                       max_tokens=4096, json_mode=True,
+                       tracker=tracker, phase="Pass 1 (tree)")
+        try:
+            data = json.loads(raw)
+            if not project_desc:
+                project_desc = data.get("description", "")
+            all_modules_raw.extend(data.get("modules", []))
+            for ed in data.get("expand_dirs", []):
+                expand_dirs.add(str(ed))
+        except (json.JSONDecodeError, TypeError) as e:
+            print(f"  [warn] shard {si+1}: parse error: {e}")
+        time.sleep(0.3)
+
+    # ── Step 3: Auto-expand large truncated directories ───────────────────
+    # Find directories with >200 files that weren't fully expanded
+    from collections import defaultdict
+    dir_file_counts: dict[str, int] = defaultdict(int)
+    for f in files:
+        rel = f.relative_to(codebase)
+        parts = rel.parts[:-1]
+        for depth in range(1, min(4, len(parts) + 1)):
+            dir_file_counts["/".join(parts[:depth])] += 1
+
+    for dp, count in dir_file_counts.items():
+        if count > 200 and dp.count("/") < 3:  # large + was likely truncated
+            expand_dirs.add(dp)
+
+    if expand_dirs:
+        print(f"[Pass 1] Expanding {len(expand_dirs)} large directories: "
+              f"{', '.join(sorted(expand_dirs)[:10])}"
+              f"{'...' if len(expand_dirs) > 10 else ''}")
+
+        expanded_tree = build_directory_tree(codebase, files, max_depth=3,
+                                             expand_dirs=expand_dirs)
+        exp_shards = _shard_tree(expanded_tree)
+        print(f"[Pass 1] Re-querying with expanded tree ({len(exp_shards)} shard(s))...")
+
+        # Replace module list with expanded results
+        all_modules_raw = []
+        for si, shard in enumerate(exp_shards):
+            shard_info = ""
+            if len(exp_shards) > 1:
+                shard_info = f"\nNote: This is shard {si+1}/{len(exp_shards)} of the directory tree.\n"
+
+            prompt = _build_tree_discover_prompt(
+                codebase_name=codebase.name,
+                language=language,
+                tree_shard=shard,
+                shard_info=shard_info,
+                docs_context=docs_context,
+            )
+
+            raw = llm_call(model, _TREE_DISCOVER_SYSTEM, prompt,
+                           max_tokens=4096, json_mode=True,
+                           tracker=tracker, phase="Pass 1 (expanded)")
+            try:
+                data = json.loads(raw)
+                if not project_desc:
+                    project_desc = data.get("description", "")
+                all_modules_raw.extend(data.get("modules", []))
+            except (json.JSONDecodeError, TypeError) as e:
+                print(f"  [warn] expanded shard {si+1}: parse error: {e}")
+            time.sleep(0.3)
+
+    # ── Step 4: Resolve dir_paths → actual file lists ─────────────────────
+    print(f"\n[Pass 1] LLM identified {len(all_modules_raw)} modules. Resolving files...")
+
+    assigned_files: set[str] = set()
+    modules: list[ModuleDefinition] = []
+
+    for mod_raw in all_modules_raw:
+        name = mod_raw.get("name", "unknown")
+        desc = mod_raw.get("description", "")
+        dir_paths = mod_raw.get("dir_paths", [])
+
+        # Collect files from all listed directory paths
+        mod_files: list[str] = []
+        for dp in dir_paths:
+            for f in _group_files_by_dir(codebase, files, dp):
+                rel = str(f.relative_to(codebase))
+                if rel not in assigned_files:
+                    mod_files.append(rel)
+                    assigned_files.add(rel)
+
+        if not mod_files:
+            continue
+
+        modules.append(ModuleDefinition(
+            name=name,
+            description=desc,
+            files=mod_files,
+            questions=[],  # filled in step 5
+        ))
+
+    # ── Catch orphaned files (not assigned to any module) ─────────────────
+    orphaned = [str(f.relative_to(codebase)) for f in files
+                if str(f.relative_to(codebase)) not in assigned_files]
+    if orphaned:
+        print(f"[Pass 1] {len(orphaned)} files not covered by any module — adding 'other' module")
+        modules.append(ModuleDefinition(
+            name="other",
+            description="Files not assigned to a specific module",
+            files=orphaned,
+            questions=["What do these miscellaneous files do?"],
+        ))
+
+    # ── Step 5: Generate questions per module (with file samples) ─────────
+    print(f"[Pass 1] Generating questions for {len(modules)} modules...\n")
+
+    for mod in modules:
+        if mod.questions:  # already has questions (e.g., orphan module)
+            print(f"  {mod.name}: {len(mod.files)} files (stub questions)")
+            continue
+
+        # Sample files for context
+        mod_paths = [codebase / f for f in mod.files]
+        n_sample = min(5, len(mod_paths))
+        sampled = rng.sample(mod_paths, n_sample)
+        file_samples: dict[str, str] = {}
         for f in sampled:
             sample = read_file_sample(f)
             if len(sample.strip()) > 20:
                 file_samples[str(f.relative_to(codebase))] = sample
 
         if not file_samples:
-            # No readable files — create a stub module
-            modules.append(ModuleDefinition(
-                name=dir_name,
-                description=f"Files under {dir_name}/",
-                files=rel_files,
-                questions=[f"What does the {dir_name} module do?"],
-            ))
-            print(f"  {dir_name}: {len(dir_files)} files (no readable samples, stub module)")
+            mod.questions = [f"What does the {mod.name} module do?"]
+            print(f"  {mod.name}: {len(mod.files)} files (no readable samples)")
             continue
 
-        prompt = _module_describe_prompt(
-            project_name=codebase.name,
-            module_dir=dir_name,
+        prompt = _build_module_questions_prompt(
+            codebase_name=codebase.name,
             language=language,
-            file_list=rel_files,
+            module_name=mod.name,
+            module_desc=mod.description,
             file_samples=file_samples,
-            docs_context=docs_context,
         )
 
         try:
-            raw = llm_call(model, _MODULE_DESCRIBE_SYSTEM, prompt,
+            raw = llm_call(model, _TREE_DISCOVER_SYSTEM, prompt,
                            max_tokens=512, json_mode=True,
-                           tracker=tracker, phase="Pass 1")
+                           tracker=tracker, phase="Pass 1 (questions)")
             result = json.loads(raw)
-            desc = str(result.get("description", f"Files under {dir_name}/"))
-            questions = result.get("questions", [f"What does {dir_name} do?"])
-            if not project_desc and "description" in result:
-                project_desc = desc  # use first module's desc as project hint
+            mod.questions = result.get("questions", [f"What does {mod.name} do?"])
         except Exception as e:
-            print(f"  [warn] {dir_name}: LLM call failed ({e}), using stub")
-            desc = f"Files under {dir_name}/"
-            questions = [f"What does the {dir_name} module do?"]
+            print(f"  [warn] {mod.name}: question gen failed ({e})")
+            mod.questions = [f"What does the {mod.name} module do?"]
 
-        modules.append(ModuleDefinition(
-            name=dir_name,
-            description=desc,
-            files=rel_files,
-            questions=questions if isinstance(questions, list) else [str(questions)],
-        ))
-        print(f"  {dir_name}: {len(dir_files)} files, {len(questions)} questions — {desc[:80]}")
-        time.sleep(0.3)  # rate limit
+        print(f"  {mod.name}: {len(mod.files)} files, {len(mod.questions)} questions — {mod.description[:80]}")
+        time.sleep(0.3)
 
     module_map = ModuleMap(
         project=codebase.name,
