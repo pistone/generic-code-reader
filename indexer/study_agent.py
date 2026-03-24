@@ -55,7 +55,9 @@ from pydantic import BaseModel
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from codebase_shared.utils import TokenTracker, llm_call, llm_tool_loop  # noqa: E402
+from codebase_shared.utils import (  # noqa: E402
+    TokenTracker, llm_call, llm_tool_loop, RateLimitedExecutor,
+)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -1154,14 +1156,69 @@ def _make_chunk_key(source_file: str, chunk_index: int) -> str:
     return f"{source_file}::{chunk_index}"
 
 
+def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
+                          mod_name: str, mod_desc: str, questions: list[str],
+                          rel_path: str, chunk: str, chunk_index: int,
+                          rag: bool = False,
+                          tracker: Optional[TokenTracker] = None) -> dict:
+    """Summarize a single code chunk. Runs in a worker thread.
+
+    Returns a dict with summary, raw_code, source_file, module, chunk_type,
+    chunk_index, and a 'refined' flag.
+    """
+    kb_context = search_kb(f"{mod_name} {chunk[:200]}", limit=3) if rag else ""
+    prompt = build_pass2_prompt(
+        project_desc=project_desc,
+        module_name=mod_name,
+        module_desc=mod_desc,
+        questions=questions,
+        source_file=rel_path,
+        raw_code=chunk,
+        kb_context=kb_context,
+    )
+
+    summary_text = llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512,
+                            tracker=tracker, phase="Pass 2")
+    summary_text = summary_text.strip()
+    if summary_text.lower().startswith("summary:"):
+        summary_text = summary_text[len("summary:"):].strip()
+
+    # Resolve vague references if detected
+    refined = False
+    vague = _needs_reference_resolution(summary_text)
+    if vague:
+        improved = _resolve_references(
+            model, summary_text, chunk, codebase, rel_path,
+            tracker=tracker,
+        )
+        if improved != summary_text:
+            summary_text = improved
+            refined = True
+
+    return {
+        "summary":     summary_text,
+        "raw_code":    chunk,
+        "source_file": rel_path,
+        "module":      mod_name,
+        "chunk_type":  "function_summary",
+        "chunk_index": chunk_index,
+        "refined":     refined,
+    }
+
+
 def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
               language: str, max_chunks: Optional[int] = None,
               rag: bool = False,
               summaries_path: Optional[Path] = None,
-              tracker: Optional[TokenTracker] = None) -> list[dict]:
+              tracker: Optional[TokenTracker] = None,
+              workers: int = 4, rpm: int = 60) -> list[dict]:
     """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
-    With rag=True, queries the KB before each chunk to inject relevant context.
-    If summaries_path is set, writes incrementally for crash-safety."""
+
+    Uses parallel workers with rate limiting. With rag=True, queries the KB
+    before each chunk to inject relevant context.
+    If summaries_path is set, writes incrementally for crash-safety.
+    """
+    import threading
 
     # Load existing summaries for resume support
     summaries: list[dict] = []
@@ -1179,138 +1236,116 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         except Exception:
             summaries = []
 
-    total_chunks = len(summaries)  # includes cached — for display only
+    # ── Collect work items ────────────────────────────────────────────────
+    work_items: list[dict] = []  # each item has all info needed for one chunk
     skipped = 0
-    new_this_run = 0  # only new chunks — used for --max-chunks cap
 
     rag_label = " (RAG-augmented)" if rag else ""
-    print(f"\n[Pass 2] Summarizing {len(module_map.modules)} modules with {model}{rag_label}...")
+    project_desc = f"{module_map.project}: {module_map.description}"
+    print(f"\n[Pass 2] Collecting chunks from {len(module_map.modules)} modules{rag_label}...")
 
     for mod in module_map.modules:
-        print(f"\n  Module: {mod.name} ({len(mod.files)} files)")
-
         for fname in mod.files:
-            # Try direct relative path first (fast, deterministic)
             fpath = codebase / fname
             if not fpath.exists():
-                # Fall back to rglob on the basename (handles LLM returning just filenames)
                 candidates = list(codebase.rglob(Path(fname).name))
                 if not candidates:
-                    print(f"    [warn] {fname} not found under {codebase}, skipping")
                     skipped += 1
                     continue
                 fpath = candidates[0]
-                if len(candidates) > 1:
-                    print(f"    [warn] {fname}: {len(candidates)} matches, using {fpath.relative_to(codebase)}")
 
             chunks = chunk_file(fpath, language=language)
             if not chunks:
-                print(f"    [skip] {fname} — empty")
                 skipped += 1
                 continue
 
             rel_path = str(fpath.relative_to(codebase))
-            print(f"    {fname}: {len(chunks)} chunk(s)")
 
             for i, chunk in enumerate(chunks):
-                if max_chunks is not None and new_this_run >= max_chunks:
-                    print(f"\n[Pass 2] Reached --max-chunks={max_chunks}, stopping.")
-                    return summaries
-
                 chunk_key = _make_chunk_key(rel_path, i)
                 if chunk_key in done_keys:
-                    print(f"      chunk {i+1}/{len(chunks)} → [cached]")
                     continue
+                work_items.append({
+                    "mod_name": mod.name,
+                    "mod_desc": mod.description,
+                    "questions": mod.questions,
+                    "rel_path": rel_path,
+                    "chunk": chunk,
+                    "chunk_index": i,
+                })
 
-                kb_context = search_kb(f"{mod.name} {chunk[:200]}", limit=3) if rag else ""
-                prompt = build_pass2_prompt(
-                    project_desc=f"{module_map.project}: {module_map.description}",
-                    module_name=mod.name,
-                    module_desc=mod.description,
-                    questions=mod.questions,
-                    source_file=rel_path,
-                    raw_code=chunk,
-                    kb_context=kb_context,
-                )
+    if max_chunks is not None:
+        work_items = work_items[:max_chunks]
 
-                try:
-                    # Stream + collect
-                    summary_text = ""
-                    for text in llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512, stream=True,
-                                         tracker=tracker, phase="Pass 2"):
-                        summary_text += text
+    total_cached = len(done_keys)
+    print(f"[Pass 2] {len(work_items)} new chunks to summarize "
+          f"({total_cached} cached, {skipped} files skipped)")
 
-                    summary_text = summary_text.strip()
-                    if summary_text.lower().startswith("summary:"):
-                        summary_text = summary_text[len("summary:"):].strip()
+    if not work_items:
+        print("[Pass 2] Nothing to do.")
+        return summaries
 
-                    # Resolve vague references if detected
-                    vague = _needs_reference_resolution(summary_text)
-                    refined = False
-                    if vague:
-                        improved = _resolve_references(
-                            model, summary_text, chunk, codebase, rel_path,
-                            tracker=tracker,
-                        )
-                        if improved != summary_text:
-                            summary_text = improved
-                            refined = True
+    # ── Process in parallel ───────────────────────────────────────────────
+    effective_workers = min(workers, len(work_items))
+    print(f"[Pass 2] Starting {effective_workers} workers, {rpm} calls/min rate limit...\n")
 
-                    entry = {
-                        "summary":     summary_text,
-                        "raw_code":    chunk,
-                        "source_file": rel_path,
-                        "module":      mod.name,
-                        "chunk_type":  "function_summary",
-                        "chunk_index": i,
-                    }
-                    summaries.append(entry)
-                    total_chunks += 1
-                    new_this_run += 1
-                    ref_tag = " [refined]" if refined else ""
-                    print(f"      chunk {i+1}/{len(chunks)} → {len(summary_text)} chars{ref_tag}")
+    executor = RateLimitedExecutor(workers=effective_workers,
+                                    calls_per_minute=rpm)
 
-                    # Write incrementally for crash safety
-                    if summaries_path and new_this_run % 5 == 0:
-                        summaries_path.write_text(json.dumps(summaries, indent=2))
+    # Thread-safe accumulator
+    write_lock = threading.Lock()
+    completed = [0]  # mutable counter in list for closure access
+    refined_count = [0]
+    error_count = [0]
 
-                    time.sleep(0.3)  # avoid rate-limit bursts
+    # Submit all work items
+    future_to_item = {}
+    for item in work_items:
+        future = executor.submit(
+            _summarize_one_chunk,
+            model, codebase, project_desc,
+            item["mod_name"], item["mod_desc"], item["questions"],
+            item["rel_path"], item["chunk"], item["chunk_index"],
+            rag=rag, tracker=tracker,
+        )
+        future_to_item[future] = item
 
-                except Exception as e:
-                    if "rate" in str(e).lower():
-                        print(f"      [rate limit] chunk {i+1} — waiting 30s...")
-                        time.sleep(30)
-                        try:
-                            summary_text = ""
-                            for text in llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512, stream=True,
-                                                 tracker=tracker, phase="Pass 2"):
-                                summary_text += text
-                            summaries.append({
-                                "summary":     summary_text.strip(),
-                                "raw_code":    chunk,
-                                "source_file": rel_path,
-                                "module":      mod.name,
-                                "chunk_type":  "function_summary",
-                                "chunk_index": i,
-                            })
-                            total_chunks += 1
-                            new_this_run += 1
-                            # Incremental write after retry (crash safety)
-                            if summaries_path:
-                                summaries_path.write_text(json.dumps(summaries, indent=2))
-                        except Exception as retry_err:
-                            print(f"      [error] retry failed: {retry_err}, skipping")
-                            skipped += 1
-                    else:
-                        print(f"      [error] chunk {i+1}: {e}, skipping")
-                        skipped += 1
+    # Collect results as they complete
+    for future in executor.as_completed(future_to_item):
+        item = future_to_item[future]
+        try:
+            entry = future.result()
+            ref_tag = " [refined]" if entry.pop("refined", False) else ""
+            if entry.get("refined"):
+                refined_count[0] += 1
+
+            with write_lock:
+                summaries.append(entry)
+                completed[0] += 1
+                n = completed[0]
+
+                print(f"  [{n:>4}/{len(work_items)}] "
+                      f"{item['rel_path']}:{item['chunk_index']} → "
+                      f"{len(entry['summary'])} chars{ref_tag}")
+
+                # Incremental write every 10 completions
+                if summaries_path and n % 10 == 0:
+                    summaries_path.write_text(json.dumps(summaries, indent=2))
+
+        except Exception as e:
+            with write_lock:
+                error_count[0] += 1
+                print(f"  [error] {item['rel_path']}:{item['chunk_index']}: {e}")
+
+    executor.shutdown()
 
     # Final write
     if summaries_path:
         summaries_path.write_text(json.dumps(summaries, indent=2))
 
-    print(f"\n[Pass 2] Done: {total_chunks} summaries total "
-          f"({new_this_run} new this run, {skipped} skipped)")
+    print(f"\n[Pass 2] Done: {len(summaries)} summaries total "
+          f"({completed[0]} new, {total_cached} cached, "
+          f"{error_count[0]} errors, {refined_count[0]} refined)")
     return summaries
 
 
@@ -1357,6 +1392,10 @@ def main():
                              "the last run. Uses a hash manifest (file_hashes.json).")
     parser.add_argument("--include-tests", action="store_true",
                         help="Include test files and test directories (skipped by default)")
+    parser.add_argument("--workers", type=int, default=4,
+                        help="Parallel workers for Pass 2 summarization (default: 4)")
+    parser.add_argument("--rpm", type=int, default=60,
+                        help="Rate limit: max LLM calls per minute (default: 60)")
     args = parser.parse_args()
 
     codebase = Path(args.codebase).resolve()
@@ -1476,6 +1515,8 @@ def main():
                 rag=args.rag,
                 summaries_path=summaries_path,
                 tracker=tracker,
+                workers=args.workers,
+                rpm=args.rpm,
             )
 
         if args.passes > 1:

@@ -250,6 +250,77 @@ def llm_tool_loop(
 
 
 # ---------------------------------------------------------------------------
+# Rate-limited parallel executor
+# ---------------------------------------------------------------------------
+
+class RateLimitedExecutor:
+    """ThreadPoolExecutor with token-bucket rate limiting and retry on rate errors.
+
+    Usage:
+        executor = RateLimitedExecutor(workers=4, calls_per_minute=60)
+        futures = [executor.submit(fn, arg) for arg in work_items]
+        for future in executor.as_completed(futures):
+            result = future.result()  # or handle exceptions
+        executor.shutdown()
+
+    Rate limit errors (HTTP 429 / "rate" in error message) are retried
+    with exponential backoff up to max_retries times.
+    """
+
+    def __init__(self, workers: int = 4, calls_per_minute: int = 60,
+                 max_retries: int = 3):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        self._pool = ThreadPoolExecutor(max_workers=workers)
+        self._interval = 60.0 / calls_per_minute  # seconds between calls
+        self._lock = threading.Lock()
+        self._last_call = 0.0
+        self._max_retries = max_retries
+
+    def _wait_for_slot(self):
+        """Block until the next rate-limit slot is available."""
+        import time as _time
+        with self._lock:
+            now = _time.monotonic()
+            wait = self._last_call + self._interval - now
+            if wait > 0:
+                _time.sleep(wait)
+            self._last_call = _time.monotonic()
+
+    def submit(self, fn, *args, **kwargs):
+        """Submit a callable with rate limiting and retry."""
+        from concurrent.futures import Future
+
+        def _wrapped():
+            last_err = None
+            for attempt in range(self._max_retries + 1):
+                self._wait_for_slot()
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "rate" in err_str or "429" in err_str or "too many" in err_str:
+                        last_err = e
+                        import time as _time
+                        backoff = min(60, 10 * (2 ** attempt))
+                        _time.sleep(backoff)
+                    else:
+                        raise
+            raise last_err  # type: ignore[misc]
+
+        return self._pool.submit(_wrapped)
+
+    def as_completed(self, futures):
+        """Yield futures as they complete."""
+        from concurrent.futures import as_completed
+        yield from as_completed(futures)
+
+    def shutdown(self, wait: bool = True):
+        self._pool.shutdown(wait=wait)
+
+
+# ---------------------------------------------------------------------------
 # Manifest (JSON file persistence for incremental mode)
 # ---------------------------------------------------------------------------
 
