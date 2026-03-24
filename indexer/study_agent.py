@@ -1369,9 +1369,10 @@ def main():
     parser.add_argument("--language", default="python",
                         choices=["python", "javascript", "typescript", "cpp", "java", "go", "rust"],
                         help="Primary language of the codebase (default: python)")
-    parser.add_argument("--docs", default=None,
-                        help="Path to a docs file/directory. Used in Pass 1 context. "
-                             "Also indexed into R2R when --bootstrap-docs is set.")
+    parser.add_argument("--docs", nargs="+", default=None,
+                        help="Path(s) to docs files/directories. Used in Pass 1 context. "
+                             "Also indexed into R2R when --bootstrap-docs is set. "
+                             "Can specify multiple: --docs /path/a /path/b")
     parser.add_argument("--bootstrap-docs", action="store_true",
                         help="Index --docs into R2R before Pass 2 so RAG has domain vocabulary")
     parser.add_argument("--rag", action="store_true",
@@ -1449,7 +1450,7 @@ def main():
         for candidate in ("docs", "doc", "documentation", "design"):
             candidate_path = codebase / candidate
             if candidate_path.is_dir() and any(candidate_path.rglob("*.md")):
-                args.docs = str(candidate_path)
+                args.docs = [str(candidate_path)]
                 args.bootstrap_docs = True
                 print(f"[Auto] Found docs at {candidate_path}, will bootstrap")
                 break
@@ -1458,7 +1459,8 @@ def main():
         if not args.docs:
             print("Error: --bootstrap-docs requires --docs PATH")
             sys.exit(1)
-        bootstrap_docs(Path(args.docs))
+        for doc_path in args.docs:
+            bootstrap_docs(Path(doc_path))
 
     tracker = TokenTracker()
 
@@ -1466,17 +1468,22 @@ def main():
     if not args.pass2_only:
         docs_context = None
         if args.docs:
-            docs_path = Path(args.docs)
-            if docs_path.is_file():
-                docs_context = docs_path.read_text(encoding="utf-8", errors="replace")[:8000]
-            elif docs_path.is_dir():
-                parts = []
-                for doc_file in sorted(docs_path.rglob("*")):
-                    if doc_file.suffix in {".md", ".rst", ".txt"} and doc_file.is_file():
-                        parts.append(f"### {doc_file.name}\n{doc_file.read_text(errors='replace')[:2000]}")
+            parts = []
+            for doc_arg in args.docs:
+                docs_path = Path(doc_arg)
+                if docs_path.is_file():
+                    parts.append(f"### {docs_path.name}\n"
+                                 f"{docs_path.read_text(encoding='utf-8', errors='replace')[:4000]}")
+                elif docs_path.is_dir():
+                    for doc_file in sorted(docs_path.rglob("*")):
+                        if doc_file.suffix in {".md", ".rst", ".txt"} and doc_file.is_file():
+                            parts.append(f"### {doc_file.name}\n"
+                                         f"{doc_file.read_text(errors='replace')[:2000]}")
                         if sum(len(p) for p in parts) > 8000:
                             break
-                docs_context = "\n\n".join(parts)
+                if sum(len(p) for p in parts) > 8000:
+                    break
+            docs_context = "\n\n".join(parts) if parts else None
 
         module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
                               tracker=tracker)

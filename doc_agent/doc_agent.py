@@ -172,27 +172,31 @@ def main():
     parser = argparse.ArgumentParser(
         description="Doc agent: parse documents → chunk by section → index to R2R",
     )
-    parser.add_argument("--docs", required=True,
-                        help="Root directory of documents to ingest")
+    parser.add_argument("--docs", required=True, nargs="+",
+                        help="Root directory/directories of documents to ingest. "
+                             "Can specify multiple: --docs /path/a /path/b")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process docs changed since last run")
     args = parser.parse_args()
-
-    docs_path = Path(args.docs).resolve()
-    if not docs_path.is_dir():
-        print(f"Error: '{docs_path}' is not a directory")
-        sys.exit(1)
 
     output_dir = Path(__file__).resolve().parent
     manifest_path = output_dir / "doc_hashes.json"
     manifest = load_manifest(manifest_path)
 
-    # 1. Collect raw documents
-    source = LocalFileSource(docs_path)
-    raw_docs = list(source.list_documents())
-    print(f"Found {len(raw_docs)} document file(s) under {docs_path}")
+    # 1. Collect raw documents from all doc paths
+    raw_docs = []
+    for doc_arg in args.docs:
+        docs_path = Path(doc_arg).resolve()
+        if not docs_path.is_dir():
+            print(f"Warning: '{docs_path}' is not a directory, skipping")
+            continue
+        source = LocalFileSource(docs_path)
+        found = list(source.list_documents())
+        print(f"Found {len(found)} document file(s) under {docs_path}")
+        raw_docs.extend(found)
+
     if not raw_docs:
-        print("No document files found.")
+        print("No document files found in any of the provided paths.")
         return
 
     # 2. Filter to changed docs (incremental mode)
