@@ -42,6 +42,7 @@ Usage:
 """
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -56,7 +57,8 @@ from pydantic import BaseModel
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from codebase_shared.utils import (  # noqa: E402
-    TokenTracker, llm_call, llm_tool_loop, RateLimitedExecutor,
+    TokenTracker, llm_call, allm_call, llm_tool_loop,
+    RateLimitedExecutor, AsyncRateLimiter,
 )
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -623,98 +625,92 @@ def _review_score(entry: dict) -> float:
     return min(1.0, score)
 
 
-def _review_one_summary(model: str, entry: dict, index: int,
-                        tracker: Optional[TokenTracker] = None) -> tuple[int, bool, str]:
-    """Review a single summary. Returns (index, was_edited, new_summary_or_empty)."""
+async def _async_review_one_summary(model: str, entry: dict,
+                                     tracker: Optional[TokenTracker] = None) -> tuple[bool, str]:
+    """Async review of a single summary. Returns (was_edited, new_summary)."""
     query = f"{entry.get('module', '')} {entry.get('summary', '')[:120]}"
     kb_context = search_kb(query, limit=3)
     prompt = _build_review_prompt(entry, kb_context)
 
-    try:
-        raw = llm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512, json_mode=True,
-                       tracker=tracker, phase="Review")
-        data = json.loads(raw)
-        if not data.get("keep") and data.get("improved", "").strip():
-            return (index, True, data["improved"].strip())
-        return (index, False, "")
-    except Exception as e:
-        return (index, False, "")
+    raw = await allm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512,
+                          json_mode=True, tracker=tracker, phase="Review")
+    data = json.loads(raw)
+    if not data.get("keep") and data.get("improved", "").strip():
+        return (True, data["improved"].strip())
+    return (False, "")
 
 
-def run_review(model: str, summaries: list[dict],
-               tracker: Optional[TokenTracker] = None,
-               workers: int = 4, rpm: int = 60,
-               quiet: bool = False) -> tuple[list[dict], float]:
+async def run_review(model: str, summaries: list[dict],
+                     tracker: Optional[TokenTracker] = None,
+                     workers: int = 4, rpm: int = 60,
+                     max_concurrent: int = 50,
+                     quiet: bool = False) -> tuple[list[dict], float]:
     """
-    Review summaries for quality using parallel workers.
+    Review summaries for quality using async concurrency.
     Smart targeting: only reviews summaries likely to need improvement.
     Returns (summaries_with_improvements, edit_rate).
     """
-    import threading
-
     # Smart targeting: score and filter
     scored = [(i, _review_score(entry)) for i, entry in enumerate(summaries)]
-    threshold = 0.15  # skip clearly good summaries
+    threshold = 0.15
     review_indices = [i for i, score in scored if score >= threshold]
     skipped = len(summaries) - len(review_indices)
 
     print(f"\n[Review] {len(review_indices)} summaries to review "
-          f"({skipped} skipped as likely good), {workers} workers, {rpm} RPM")
+          f"({skipped} skipped as likely good), async {min(max_concurrent, len(review_indices))} concurrent, {rpm} RPM")
 
     if not review_indices:
         return summaries, 0.0
 
-    executor = RateLimitedExecutor(
-        workers=min(workers, len(review_indices)),
+    limiter = AsyncRateLimiter(
+        max_concurrent=min(max_concurrent, len(review_indices)),
         calls_per_minute=rpm,
     )
 
-    write_lock = threading.Lock()
-    edited = [0]
-    completed = [0]
+    edited_count = 0
+    completed_count = 0
     start_time = time.monotonic()
 
-    future_to_idx = {}
-    for i in review_indices:
-        future = executor.submit(
-            _review_one_summary, model, summaries[i], i, tracker,
-        )
-        future_to_idx[future] = i
+    def on_result(factory_idx, result):
+        nonlocal edited_count, completed_count
+        was_edited, new_summary = result
+        real_idx = review_indices[factory_idx]
+        completed_count += 1
+        n = completed_count
 
-    for future in executor.as_completed(future_to_idx):
-        idx = future_to_idx[future]
-        try:
-            _, was_edited, new_summary = future.result()
-            with write_lock:
-                completed[0] += 1
-                n = completed[0]
-                if was_edited:
-                    summaries[idx]["summary"] = new_summary
-                    edited[0] += 1
-                    tag = "edited"
-                else:
-                    tag = "kept"
+        if was_edited:
+            summaries[real_idx]["summary"] = new_summary
+            edited_count += 1
+            tag = "edited"
+        else:
+            tag = "kept"
 
-                if not quiet:
-                    elapsed = time.monotonic() - start_time
-                    if n > 1 and elapsed > 0:
-                        rate = n / elapsed * 60
-                        remaining = (len(review_indices) - n) / (n / elapsed)
-                        eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
-                    else:
-                        eta = ""
-                    print(f"  [{n:>4}/{len(review_indices)}] {tag:<7} "
-                          f"{summaries[idx].get('source_file', '?')}{eta}")
-        except Exception as e:
-            with write_lock:
-                completed[0] += 1
-                if not quiet:
-                    print(f"  [warn] review failed for index {idx}: {e}")
+        if not quiet:
+            elapsed = time.monotonic() - start_time
+            if n > 1 and elapsed > 0:
+                rate = n / elapsed * 60
+                remaining = (len(review_indices) - n) / (n / elapsed)
+                eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
+            else:
+                eta = ""
+            print(f"  [{n:>4}/{len(review_indices)}] {tag:<7} "
+                  f"{summaries[real_idx].get('source_file', '?')}{eta}")
 
-    executor.shutdown()
+    def on_error(factory_idx, exc):
+        nonlocal completed_count
+        completed_count += 1
+        if not quiet:
+            print(f"  [warn] review failed for index {review_indices[factory_idx]}: {exc}")
 
-    edit_rate = edited[0] / len(summaries) if summaries else 0.0
-    print(f"[Review] {edited[0]}/{len(review_indices)} reviewed summaries edited "
+    factories = [
+        (lambda i=i: _async_review_one_summary(model, summaries[i], tracker))
+        for i in review_indices
+    ]
+
+    await limiter.run_many(factories, on_result=on_result, on_error=on_error)
+
+    edit_rate = edited_count / len(summaries) if summaries else 0.0
+    print(f"[Review] {edited_count}/{len(review_indices)} reviewed summaries edited "
           f"({skipped} skipped) — overall edit rate {edit_rate:.1%}")
     return summaries, edit_rate
 
@@ -1307,10 +1303,10 @@ FILE_SUMMARY_SYSTEM = (
 )
 
 
-def _summarize_one_file(model: str, rel_path: str, sample: str,
-                        mod_name: str, mod_desc: str,
-                        tracker: Optional[TokenTracker] = None) -> tuple[str, str]:
-    """Generate a 1-sentence file summary. Returns (rel_path, summary)."""
+async def _async_summarize_one_file(model: str, rel_path: str, sample: str,
+                                    mod_name: str, mod_desc: str,
+                                    tracker: Optional[TokenTracker] = None) -> tuple[str, str]:
+    """Generate a 1-sentence file summary (async). Returns (rel_path, summary)."""
     prompt = f"""Module: {mod_name} — {mod_desc}
 File: {rel_path}
 
@@ -1319,27 +1315,22 @@ File: {rel_path}
 ```
 
 One sentence describing what this file does:"""
-    try:
-        result = llm_call(model, FILE_SUMMARY_SYSTEM, prompt, max_tokens=100,
-                          tracker=tracker, phase="File summaries")
-        return (rel_path, result.strip())
-    except Exception:
-        return (rel_path, "")
+    result = await allm_call(model, FILE_SUMMARY_SYSTEM, prompt, max_tokens=100,
+                             tracker=tracker, phase="File summaries")
+    return (rel_path, result.strip())
 
 
-def _generate_file_summaries(
+async def _generate_file_summaries(
     model: str, codebase: Path, module_map: "ModuleMap",
-    workers: int = 4, rpm: int = 60,
+    max_concurrent: int = 50, rpm: int = 60,
     tracker: Optional[TokenTracker] = None,
     quiet: bool = False,
 ) -> dict[str, str]:
     """Generate 1-sentence summaries for each file before chunk-level Pass 2.
 
+    Uses async concurrency for high throughput.
     Returns a dict mapping rel_path → file summary.
-    These summaries give each chunk context about its file's overall purpose.
     """
-    import threading
-
     # Collect unique files with their module context
     file_info: dict[str, tuple[str, str, str]] = {}  # rel_path → (fpath, mod_name, mod_desc)
     for mod in module_map.modules:
@@ -1359,43 +1350,46 @@ def _generate_file_summaries(
     if n == 0:
         return {}
 
-    print(f"\n[File summaries] Generating 1-sentence summaries for {n} files...")
+    print(f"\n[File summaries] Generating 1-sentence summaries for {n} files "
+          f"(async, {min(max_concurrent, n)} concurrent, {rpm} RPM)...")
 
-    executor = RateLimitedExecutor(
-        workers=min(workers, n),
+    limiter = AsyncRateLimiter(
+        max_concurrent=min(max_concurrent, n),
         calls_per_minute=rpm,
     )
 
     results: dict[str, str] = {}
-    lock = threading.Lock()
-    done = [0]
+    done_count = 0
     start = time.monotonic()
 
-    futures = {}
+    # Pre-read all file samples (disk I/O — fast, do it synchronously)
+    items: list[tuple[str, str, str, str]] = []  # (rel, sample, mod_name, mod_desc)
     for rel, (fpath_str, mod_name, mod_desc) in file_info.items():
         sample = read_file_sample(Path(fpath_str), max_lines=SAMPLE_LINES)
-        future = executor.submit(
-            _summarize_one_file, model, rel, sample, mod_name, mod_desc, tracker,
-        )
-        futures[future] = rel
+        items.append((rel, sample, mod_name, mod_desc))
 
-    for future in executor.as_completed(futures):
-        rel = futures[future]
-        try:
-            _, summary = future.result()
-            if summary:
-                with lock:
-                    results[rel] = summary
-        except Exception:
-            pass
-        with lock:
-            done[0] += 1
-            if not quiet and done[0] % 50 == 0:
-                elapsed = time.monotonic() - start
-                rate = done[0] / elapsed * 60 if elapsed > 0 else 0
-                print(f"  [{done[0]}/{n}] file summaries generated ({rate:.0f}/min)")
+    def on_result(idx, result):
+        nonlocal done_count
+        rel_path, summary = result
+        if summary:
+            results[rel_path] = summary
+        done_count += 1
+        if not quiet and done_count % 50 == 0:
+            elapsed = time.monotonic() - start
+            rate = done_count / elapsed * 60 if elapsed > 0 else 0
+            print(f"  [{done_count}/{n}] file summaries generated ({rate:.0f}/min)")
 
-    executor.shutdown()
+    def on_error(idx, exc):
+        nonlocal done_count
+        done_count += 1
+
+    factories = [
+        (lambda r=rel, s=sample, mn=mod_name, md=mod_desc:
+            _async_summarize_one_file(model, r, s, mn, md, tracker))
+        for rel, sample, mod_name, mod_desc in items
+    ]
+
+    await limiter.run_many(factories, on_result=on_result, on_error=on_error)
     print(f"[File summaries] Done: {len(results)}/{n} files summarized")
     return results
 
@@ -1406,11 +1400,7 @@ def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
                           rag: bool = False,
                           file_summary: str = "",
                           tracker: Optional[TokenTracker] = None) -> dict:
-    """Summarize a single code chunk. Runs in a worker thread.
-
-    Returns a dict with summary, raw_code, source_file, module, chunk_type,
-    chunk_index, and a 'refined' flag.
-    """
+    """Summarize a single code chunk (sync, legacy). Runs in a worker thread."""
     kb_context = search_kb(f"{mod_name} {chunk[:200]}", limit=3) if rag else ""
     prompt = build_pass2_prompt(
         project_desc=project_desc,
@@ -1429,7 +1419,6 @@ def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
     if summary_text.lower().startswith("summary:"):
         summary_text = summary_text[len("summary:"):].strip()
 
-    # Resolve vague references if detected
     refined = False
     vague = _needs_reference_resolution(summary_text)
     if vague:
@@ -1452,21 +1441,152 @@ def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
     }
 
 
-def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
-              language: str, max_chunks: Optional[int] = None,
-              rag: bool = False,
-              summaries_path: Optional[Path] = None,
-              tracker: Optional[TokenTracker] = None,
-              workers: int = 4, rpm: int = 60,
-              quiet: bool = False, verbose: bool = False) -> list[dict]:
+async def _async_resolve_references(model: str, summary: str, raw_code: str,
+                                     codebase: Path, rel_path: str,
+                                     tracker: Optional[TokenTracker] = None) -> str:
+    """Async version of _resolve_references. File I/O is sync (fast from cache),
+    only the LLM call is awaited."""
+    import re
+
+    refs: list[str] = []
+    for m in re.finditer(r'#include\s*[<"]([^>"]+)[>"]', raw_code):
+        refs.append(m.group(1))
+    for m in re.finditer(r'(?:from|import)\s+([\w.]+)', raw_code):
+        refs.append(m.group(1).replace(".", "/"))
+    for m in re.finditer(r'(\w+)::\w+', raw_code):
+        refs.append(m.group(1))
+
+    if not refs:
+        return summary
+
+    extra_context_parts: list[str] = []
+    seen: set[str] = set()
+    for ref in refs[:6]:
+        if ref in seen:
+            continue
+        seen.add(ref)
+        ref_path = codebase / ref
+        if not ref_path.exists():
+            parent = (codebase / rel_path).parent
+            for candidate in [parent / ref, parent / (ref + ".h"),
+                              parent / (ref + ".hpp")]:
+                if candidate.exists():
+                    ref_path = candidate
+                    break
+            else:
+                basename = Path(ref).name
+                match = _find_file(codebase, basename)
+                if not match:
+                    match = _find_file(codebase, basename + ".h")
+                if not match:
+                    match = _find_file(codebase, basename + ".hpp")
+                if match:
+                    ref_path = match
+                else:
+                    continue
+
+        if ref_path.exists() and ref_path.is_file():
+            content = read_file_sample(ref_path, max_lines=40)
+            if len(content.strip()) > 20:
+                extra_context_parts.append(
+                    f"[{ref_path.relative_to(codebase)}]\n{content}"
+                )
+                if len(extra_context_parts) >= 3:
+                    break
+
+    if not extra_context_parts:
+        return summary
+
+    extra_context = "\n\n".join(extra_context_parts)
+    refine_prompt = f"""The following summary of a code chunk has vague references.
+Rewrite it to be more specific using the referenced source files provided below.
+
+Original summary:
+{summary}
+
+Code chunk:
+```
+{raw_code[:2000]}
+```
+
+Referenced files:
+{extra_context}
+
+Write an improved 2-4 sentence summary. Be specific about what the referenced
+code does. Plain prose only."""
+
+    try:
+        improved = await allm_call(model, PASS2_SYSTEM, refine_prompt,
+                                   max_tokens=256,
+                                   tracker=tracker, phase="Pass 2 (refine)")
+        improved = improved.strip()
+        if improved and len(improved) > 20:
+            return improved
+    except Exception:
+        pass
+    return summary
+
+
+async def _async_summarize_one_chunk(
+        model: str, codebase: Path, project_desc: str,
+        mod_name: str, mod_desc: str, questions: list[str],
+        rel_path: str, chunk: str, chunk_index: int,
+        rag: bool = False, file_summary: str = "",
+        tracker: Optional[TokenTracker] = None) -> dict:
+    """Async version: summarize a single code chunk."""
+    kb_context = search_kb(f"{mod_name} {chunk[:200]}", limit=3) if rag else ""
+    prompt = build_pass2_prompt(
+        project_desc=project_desc,
+        module_name=mod_name,
+        module_desc=mod_desc,
+        questions=questions,
+        source_file=rel_path,
+        raw_code=chunk,
+        kb_context=kb_context,
+        file_summary=file_summary,
+    )
+
+    summary_text = await allm_call(model, PASS2_SYSTEM, prompt, max_tokens=512,
+                                   tracker=tracker, phase="Pass 2")
+    summary_text = summary_text.strip()
+    if summary_text.lower().startswith("summary:"):
+        summary_text = summary_text[len("summary:"):].strip()
+
+    refined = False
+    if _needs_reference_resolution(summary_text):
+        improved = await _async_resolve_references(
+            model, summary_text, chunk, codebase, rel_path,
+            tracker=tracker,
+        )
+        if improved != summary_text:
+            summary_text = improved
+            refined = True
+
+    return {
+        "summary":     summary_text,
+        "raw_code":    chunk,
+        "source_file": rel_path,
+        "module":      mod_name,
+        "chunk_type":  "function_summary",
+        "chunk_index": chunk_index,
+        "refined":     refined,
+    }
+
+
+async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
+                    language: str, max_chunks: Optional[int] = None,
+                    rag: bool = False,
+                    summaries_path: Optional[Path] = None,
+                    tracker: Optional[TokenTracker] = None,
+                    workers: int = 4, rpm: int = 60,
+                    max_concurrent: int = 50,
+                    quiet: bool = False, verbose: bool = False) -> list[dict]:
     """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
 
-    Uses parallel workers with rate limiting. With rag=True, queries the KB
-    before each chunk to inject relevant context.
+    Uses async concurrency with rate limiting for high throughput.
+    With rag=True, queries the KB before each chunk to inject relevant context.
     If summaries_path is set, writes incrementally for crash-safety.
     """
-    import threading
-
     # Load existing summaries for resume support
     summaries: list[dict] = []
     done_keys: set[str] = set()
@@ -1485,13 +1605,13 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
 
     # ── Generate file-level summaries ────────────────────────────────────
     project_desc = f"{module_map.project}: {module_map.description}"
-    file_summaries = _generate_file_summaries(
+    file_summaries = await _generate_file_summaries(
         model, codebase, module_map,
-        workers=workers, rpm=rpm, tracker=tracker, quiet=quiet,
+        max_concurrent=max_concurrent, rpm=rpm, tracker=tracker, quiet=quiet,
     )
 
     # ── Collect work items ────────────────────────────────────────────────
-    work_items: list[dict] = []  # each item has all info needed for one chunk
+    work_items: list[dict] = []
     skipped = 0
 
     rag_label = " (RAG-augmented)" if rag else ""
@@ -1531,21 +1651,17 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
 
     # ── Dedup near-identical chunks (boilerplate, generated code) ────────
     def _chunk_signature(text: str, n: int = 3) -> frozenset:
-        """Cheap token n-gram fingerprint for similarity detection."""
         tokens = text.split()
         if len(tokens) < n:
             return frozenset(tokens)
         return frozenset(tuple(tokens[i:i+n]) for i in range(0, len(tokens) - n + 1, 5))
 
-    seen_sigs: dict[frozenset, str] = {}  # signature → first source_file
+    seen_sigs: dict[frozenset, str] = {}
     deduped: list[dict] = []
     dedup_count = 0
     for item in work_items:
         sig = _chunk_signature(item["chunk"])
         if sig in seen_sigs:
-            # Check jaccard overlap
-            existing = seen_sigs[sig]
-            # Same signature set means very high overlap — skip
             dedup_count += 1
             continue
         seen_sigs[sig] = item["rel_path"]
@@ -1565,77 +1681,73 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         print("[Pass 2] Nothing to do.")
         return summaries
 
-    # ── Process in parallel ───────────────────────────────────────────────
-    effective_workers = min(workers, len(work_items))
-    print(f"[Pass 2] Starting {effective_workers} workers, {rpm} calls/min rate limit...\n")
+    # ── Process with async concurrency ────────────────────────────────────
+    effective_concurrent = min(max_concurrent, len(work_items))
+    print(f"[Pass 2] Async: {effective_concurrent} concurrent, {rpm} RPM\n")
 
-    executor = RateLimitedExecutor(workers=effective_workers,
-                                    calls_per_minute=rpm)
+    limiter = AsyncRateLimiter(
+        max_concurrent=effective_concurrent,
+        calls_per_minute=rpm,
+    )
 
-    # Thread-safe accumulator
-    write_lock = threading.Lock()
     start_time = time.monotonic()
-    completed = [0]  # mutable counter in list for closure access
-    refined_count = [0]
-    error_count = [0]
+    completed_count = 0
+    refined_count = 0
+    error_count = 0
 
-    # Submit all work items
-    future_to_item = {}
-    for item in work_items:
-        future = executor.submit(
-            _summarize_one_chunk,
+    def on_result(idx, entry):
+        nonlocal completed_count, refined_count
+        ref_tag = ""
+        if entry.pop("refined", False):
+            ref_tag = " [refined]"
+            refined_count += 1
+
+        summaries.append(entry)
+        completed_count += 1
+        n = completed_count
+
+        elapsed = time.monotonic() - start_time
+        if n > 1 and elapsed > 0:
+            rate = n / elapsed * 60
+            remaining = (len(work_items) - n) / (n / elapsed)
+            eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
+        else:
+            eta = ""
+        if not quiet:
+            print(f"  [{n:>4}/{len(work_items)}] "
+                  f"{work_items[idx]['rel_path']}:{work_items[idx]['chunk_index']} → "
+                  f"{len(entry['summary'])} chars{ref_tag}{eta}")
+
+        # Incremental write every 10 completions
+        if summaries_path and n % 10 == 0:
+            summaries_path.write_text(json.dumps(summaries, indent=2))
+
+    def on_error(idx, exc):
+        nonlocal error_count
+        error_count += 1
+        item = work_items[idx]
+        print(f"  [error] {item['rel_path']}:{item['chunk_index']}: {exc}")
+
+    factories = [
+        (lambda it=item: _async_summarize_one_chunk(
             model, codebase, project_desc,
-            item["mod_name"], item["mod_desc"], item["questions"],
-            item["rel_path"], item["chunk"], item["chunk_index"],
-            rag=rag, file_summary=item.get("file_summary", ""),
+            it["mod_name"], it["mod_desc"], it["questions"],
+            it["rel_path"], it["chunk"], it["chunk_index"],
+            rag=rag, file_summary=it.get("file_summary", ""),
             tracker=tracker,
-        )
-        future_to_item[future] = item
+        ))
+        for item in work_items
+    ]
 
-    # Collect results as they complete
-    for future in executor.as_completed(future_to_item):
-        item = future_to_item[future]
-        try:
-            entry = future.result()
-            ref_tag = " [refined]" if entry.pop("refined", False) else ""
-            if entry.get("refined"):
-                refined_count[0] += 1
-
-            with write_lock:
-                summaries.append(entry)
-                completed[0] += 1
-                n = completed[0]
-
-                elapsed = time.monotonic() - start_time
-                if n > 1 and elapsed > 0:
-                    rate = n / elapsed * 60  # per minute
-                    remaining = (len(work_items) - n) / (n / elapsed)
-                    eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
-                else:
-                    eta = ""
-                if not quiet:
-                    print(f"  [{n:>4}/{len(work_items)}] "
-                          f"{item['rel_path']}:{item['chunk_index']} → "
-                          f"{len(entry['summary'])} chars{ref_tag}{eta}")
-
-                # Incremental write every 10 completions
-                if summaries_path and n % 10 == 0:
-                    summaries_path.write_text(json.dumps(summaries, indent=2))
-
-        except Exception as e:
-            with write_lock:
-                error_count[0] += 1
-                print(f"  [error] {item['rel_path']}:{item['chunk_index']}: {e}")
-
-    executor.shutdown()
+    await limiter.run_many(factories, on_result=on_result, on_error=on_error)
 
     # Final write
     if summaries_path:
         summaries_path.write_text(json.dumps(summaries, indent=2))
 
     print(f"\n[Pass 2] Done: {len(summaries)} summaries total "
-          f"({completed[0]} new, {total_cached} cached, "
-          f"{error_count[0]} errors, {refined_count[0]} refined)")
+          f"({completed_count} new, {total_cached} cached, "
+          f"{error_count} errors, {refined_count} refined)")
     if _search_kb_failures > 0:
         print(f"  [warn] {_search_kb_failures} RAG queries failed — "
               f"is R2R running? (summaries were generated without KB context)")
@@ -1694,6 +1806,9 @@ def main():
                         help="Parallel workers for Pass 2 summarization (default: 4)")
     parser.add_argument("--rpm", type=int, default=60,
                         help="Rate limit: max LLM calls per minute (default: 60)")
+    parser.add_argument("--max-concurrent", type=int, default=50,
+                        help="Max concurrent async requests (default: 50). "
+                             "Higher values use more memory but better saturate high RPM limits.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Estimate token cost without running any LLM calls")
     parser.add_argument("--verbose", action="store_true",
@@ -1871,7 +1986,7 @@ def main():
 
         # Only run full summarization on the first pass
         if pass_num == 1:
-            summaries = run_pass2(
+            summaries = asyncio.run(run_pass2(
                 args.model_fast or args.model, codebase, module_map,
                 language=args.language,
                 max_chunks=args.max_chunks,
@@ -1880,19 +1995,22 @@ def main():
                 tracker=tracker,
                 workers=args.workers,
                 rpm=args.rpm,
+                max_concurrent=args.max_concurrent,
                 quiet=args.quiet,
                 verbose=args.verbose,
-            )
+            ))
 
         if args.passes > 1:
             # Index summaries so the review pass can query them
             index_summaries_to_r2r(summaries)
 
             # Review + improve
-            summaries, edit_rate = run_review(
+            summaries, edit_rate = asyncio.run(run_review(
                 args.model, summaries, tracker=tracker,
-                workers=args.workers, rpm=args.rpm, quiet=args.quiet,
-            )
+                workers=args.workers, rpm=args.rpm,
+                max_concurrent=args.max_concurrent,
+                quiet=args.quiet,
+            ))
 
             # Update R2R with improved summaries
             index_summaries_to_r2r(summaries)

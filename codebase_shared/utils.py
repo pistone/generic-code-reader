@@ -2,7 +2,9 @@
 
 Provides:
   - TokenTracker: accumulates prompt/completion token counts per phase
-  - llm_call: unified LLM call via litellm (supports streaming, JSON mode)
+  - llm_call / allm_call: unified LLM call via litellm (sync and async)
+  - RateLimitedExecutor: thread-based parallel executor (legacy)
+  - AsyncRateLimiter: asyncio-based rate limiter for high-concurrency workloads
   - load_manifest / save_manifest: JSON file persistence for incremental mode
 """
 
@@ -172,6 +174,35 @@ def llm_call(model: str, system: str, user: str,
         return response.choices[0].message.content or ""
 
 
+async def allm_call(model: str, system: str, user: str,
+                    max_tokens: int = 4096,
+                    json_mode: bool = False,
+                    tracker: Optional[TokenTracker] = None,
+                    phase: str = ""):
+    """
+    Async LLM call via litellm.acompletion.
+
+    Same interface as llm_call but awaitable. Use with AsyncRateLimiter
+    for high-concurrency workloads.
+    """
+    from litellm import acompletion
+
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user",   "content": user},
+    ]
+
+    kwargs = dict(model=model, messages=messages, max_tokens=max_tokens)
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = await acompletion(**kwargs)
+
+    if tracker and phase:
+        tracker.record(phase, response)
+    return response.choices[0].message.content or ""
+
+
 def llm_tool_loop(
     model: str,
     system: str,
@@ -321,6 +352,117 @@ class RateLimitedExecutor:
 
     def shutdown(self, wait: bool = True):
         self._pool.shutdown(wait=wait)
+
+
+# ---------------------------------------------------------------------------
+# Async rate-limited concurrency
+# ---------------------------------------------------------------------------
+
+class AsyncRateLimiter:
+    """Asyncio-based rate limiter with semaphore for concurrency control.
+
+    Usage:
+        limiter = AsyncRateLimiter(max_concurrent=50, calls_per_minute=500)
+        tasks = [limiter.run(coro_fn(arg)) for arg in work_items]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        # or use run_many() for callback-based processing
+
+    Compared to RateLimitedExecutor (thread-based):
+    - Supports 50-200+ concurrent requests (vs 4 threads)
+    - No GIL contention on I/O
+    - Token-bucket sleeps don't block other coroutines
+    - Rate limit retries with exponential backoff
+    """
+
+    def __init__(self, max_concurrent: int = 50,
+                 calls_per_minute: int = 500,
+                 max_retries: int = 3):
+        import asyncio
+        self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._interval = 60.0 / calls_per_minute
+        self._lock = asyncio.Lock()
+        self._last_call = 0.0
+        self._max_retries = max_retries
+
+    async def _wait_for_slot(self):
+        """Reserve a rate-limit slot, sleep if needed."""
+        import asyncio
+        import time as _time
+        async with self._lock:
+            now = _time.monotonic()
+            wait = self._last_call + self._interval - now
+            if wait < 0:
+                wait = 0
+            self._last_call = now + wait
+        if wait > 0:
+            await asyncio.sleep(wait)
+
+    async def run(self, coro, max_retries: Optional[int] = None):
+        """Run a coroutine with rate limiting, concurrency control, and retry."""
+        import asyncio
+        retries = max_retries if max_retries is not None else self._max_retries
+        async with self._semaphore:
+            last_err = None
+            for attempt in range(retries + 1):
+                await self._wait_for_slot()
+                try:
+                    return await coro
+                except Exception as e:
+                    err_str = str(e).lower()
+                    if "rate" in err_str or "429" in err_str or "too many" in err_str:
+                        last_err = e
+                        backoff = min(60, 10 * (2 ** attempt))
+                        await asyncio.sleep(backoff)
+                        # Recreate coroutine — can't await same one twice
+                        # Caller must handle this by passing a factory
+                        raise  # let caller retry with a new coroutine
+                    else:
+                        raise
+            raise last_err  # type: ignore[misc]
+
+    async def run_many(self, coro_factories: list,
+                       on_result=None, on_error=None):
+        """Run many coroutine factories concurrently with rate limiting.
+
+        Each factory is a no-arg callable that returns an awaitable.
+        This allows retry (a coroutine can only be awaited once).
+
+        on_result(index, result) and on_error(index, exception) are called
+        as tasks complete.
+
+        Returns list of results (None for failed tasks).
+        """
+        import asyncio
+
+        results = [None] * len(coro_factories)
+
+        async def _run_one(idx, factory):
+            last_err = None
+            for attempt in range(self._max_retries + 1):
+                async with self._semaphore:
+                    await self._wait_for_slot()
+                    try:
+                        result = await factory()
+                        results[idx] = result
+                        if on_result:
+                            on_result(idx, result)
+                        return
+                    except Exception as e:
+                        err_str = str(e).lower()
+                        if ("rate" in err_str or "429" in err_str
+                                or "too many" in err_str):
+                            last_err = e
+                            backoff = min(60, 10 * (2 ** attempt))
+                            await asyncio.sleep(backoff)
+                        else:
+                            if on_error:
+                                on_error(idx, e)
+                            return
+            if on_error and last_err:
+                on_error(idx, last_err)
+
+        await asyncio.gather(*[_run_one(i, f) for i, f in enumerate(coro_factories)])
+        return results
 
 
 # ---------------------------------------------------------------------------
