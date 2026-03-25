@@ -90,6 +90,22 @@ SKIP_TEST_DIRS = {"test", "tests", "testing", "test_data", "testdata",
 
 _search_kb_failures = 0
 
+# Cache for file lookups to avoid repeated rglob walks
+_file_index_cache: dict[Path, dict[str, list[Path]]] = {}
+
+def _find_file(codebase: Path, filename: str) -> Optional[Path]:
+    """Find a file by name using a cached index. O(1) after first call."""
+    if codebase not in _file_index_cache:
+        # Build index once: map basename -> list of full paths
+        index: dict[str, list[Path]] = {}
+        for p in codebase.rglob("*"):
+            if p.is_file():
+                index.setdefault(p.name, []).append(p)
+        _file_index_cache[codebase] = index
+
+    matches = _file_index_cache.get(codebase, {}).get(filename, [])
+    return matches[0] if matches else None
+
 # TokenTracker and llm_call imported from codebase_shared.utils
 
 # ── Pydantic models (used to validate Pass 1 JSON output) ─────────────────────
@@ -788,8 +804,9 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str):
                     content = read_file_sample(rf_path, max_lines=SAMPLE_LINES)
                     parts.append(f"=== {rf} ===\n{content}")
                 else:
-                    # Try rglob fallback
-                    candidates = list(codebase.rglob(Path(rf).name))
+                    # Try cached file index fallback
+                    match = _find_file(codebase, Path(rf).name)
+                    candidates = [match] if match else []
                     if candidates:
                         content = read_file_sample(candidates[0], max_lines=SAMPLE_LINES)
                         actual = str(candidates[0].relative_to(codebase))
@@ -1073,13 +1090,14 @@ def _resolve_references(model: str, summary: str, raw_code: str,
                     ref_path = candidate
                     break
             else:
-                # Try rglob on the basename
+                # Try cached file index on the basename
                 basename = Path(ref).name
-                candidates = list(codebase.rglob(basename))
-                if not candidates:
-                    candidates = list(codebase.rglob(basename + ".h"))
-                if not candidates:
-                    candidates = list(codebase.rglob(basename + ".hpp"))
+                match = _find_file(codebase, basename)
+                if not match:
+                    match = _find_file(codebase, basename + ".h")
+                if not match:
+                    match = _find_file(codebase, basename + ".hpp")
+                candidates = [match] if match else []
                 if candidates:
                     ref_path = candidates[0]
                 else:
@@ -1258,7 +1276,8 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         for fname in mod.files:
             fpath = codebase / fname
             if not fpath.exists():
-                candidates = list(codebase.rglob(Path(fname).name))
+                match = _find_file(codebase, Path(fname).name)
+                candidates = [match] if match else []
                 if not candidates:
                     skipped += 1
                     continue

@@ -284,9 +284,12 @@ class RateLimitedExecutor:
         with self._lock:
             now = _time.monotonic()
             wait = self._last_call + self._interval - now
-            if wait > 0:
-                _time.sleep(wait)
-            self._last_call = _time.monotonic()
+            if wait < 0:
+                wait = 0
+            # Reserve the slot now, sleep outside the lock
+            self._last_call = now + wait
+        if wait > 0:
+            _time.sleep(wait)
 
     def submit(self, fn, *args, **kwargs):
         """Submit a callable with rate limiting and retry."""
