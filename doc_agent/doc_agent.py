@@ -18,6 +18,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from r2r import R2RClient
 
@@ -111,32 +112,43 @@ def _split_by_paragraphs(text: str, max_chars: int) -> list[str]:
 # R2R indexing
 # ---------------------------------------------------------------------------
 
-def index_chunks(chunks: list[dict], last_modified: str) -> list[str]:
-    """Index all chunks into R2R.  Returns list of document IDs."""
+def _index_one_chunk(client, chunk: dict, last_modified: str) -> Optional[str]:
+    """Index a single chunk into R2R. Returns doc_id or None."""
+    resp = client.documents.create(
+        raw_text=chunk["text"],
+        metadata={
+            "source_file":   chunk["source_file"],
+            "module":        "documentation",
+            "chunk_type":    "doc_summary",
+            "doc_title":     chunk["doc_title"],
+            "source_type":   "doc",
+            "last_modified": last_modified,
+        },
+    )
+    return str(resp.results.document_id)
+
+
+def index_chunks(chunks: list[dict], last_modified: str,
+                 index_workers: int = 8) -> list[str]:
+    """Index all chunks into R2R using parallel workers.  Returns list of document IDs."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     client = R2RClient(R2R_URL)
-    doc_ids: list[str] = []
+    doc_ids: list[Optional[str]] = [None] * len(chunks)
 
-    for i, chunk in enumerate(chunks):
-        try:
-            resp = client.documents.create(
-                raw_text=chunk["text"],
-                metadata={
-                    "source_file":   chunk["source_file"],
-                    "module":        "documentation",
-                    "chunk_type":    "doc_summary",
-                    "doc_title":     chunk["doc_title"],
-                    "source_type":   "doc",
-                    "last_modified": last_modified,
-                },
-            )
-            doc_ids.append(str(resp.results.document_id))
-        except Exception as e:
-            print(f"  [warn] chunk {i}: index failed: {e}")
+    with ThreadPoolExecutor(max_workers=index_workers) as pool:
+        future_to_idx = {
+            pool.submit(_index_one_chunk, client, chunk, last_modified): i
+            for i, chunk in enumerate(chunks)
+        }
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
+            try:
+                doc_ids[idx] = future.result()
+            except Exception as e:
+                print(f"  [warn] chunk {idx}: index failed: {e}")
 
-        if i > 0 and i % 20 == 0:
-            time.sleep(0.5)
-
-    return doc_ids
+    return [d for d in doc_ids if d is not None]
 
 
 def purge_old_docs(source_file: str, manifest: dict) -> None:

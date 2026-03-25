@@ -488,55 +488,80 @@ def _create_or_replace(client, raw_text: str, metadata: dict) -> str:
         raise
 
 
-def index_summaries_to_r2r(summaries: list[dict]) -> None:
+def _index_one_entry(client, entry: dict) -> tuple[str, Optional[str], Optional[str]]:
+    """Index one summary + raw_code into R2R. Returns (src_file, doc_id, code_doc_id)."""
+    src_file = entry.get("source_file", "")
+    module = entry.get("module", "")
+    doc_id = None
+    code_doc_id = None
+
+    try:
+        doc_id = _create_or_replace(client, entry["summary"], {
+            "source_file": src_file,
+            "module": module,
+            "chunk_type": entry.get("chunk_type", "function_summary"),
+            "source_type": "code",
+        })
+    except Exception as e:
+        print(f"  [warn] {src_file}: summary index failed: {e}")
+
+    raw_code = entry.get("raw_code", "").strip()
+    if raw_code and len(raw_code) > 30:
+        try:
+            code_doc_id = _create_or_replace(client, raw_code, {
+                "source_file": src_file,
+                "module": module,
+                "chunk_type": "raw_code",
+                "source_type": "code",
+            })
+        except Exception as e:
+            print(f"  [warn] {src_file}: code index failed: {e}")
+
+    return (src_file, doc_id, code_doc_id)
+
+
+def index_summaries_to_r2r(summaries: list[dict], index_workers: int = 8) -> None:
     """
-    Index all summaries into R2R with upsert semantics.
+    Index all summaries into R2R with upsert semantics, using parallel workers.
     If a document already exists (same content hash), it is replaced.
     The new doc_id is stored back into the entry dict.
 
     Also indexes raw code as a separate chunk (chunk_type: "raw_code") so that
     searches for exact identifiers can match the source code directly.
     """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
     client = _r2r_client()
-    print(f"\n[Index] Indexing {len(summaries)} summaries + raw code into R2R...")
-    for i, entry in enumerate(summaries):
-        src_file = entry.get("source_file", "")
-        module   = entry.get("module", "")
+    n = len(summaries)
+    print(f"\n[Index] Indexing {n} summaries + raw code into R2R ({index_workers} workers)...")
 
-        # Index the summary (embedded for semantic search)
-        try:
-            doc_id = _create_or_replace(client, entry["summary"], {
-                "source_file": src_file,
-                "module":      module,
-                "chunk_type":  entry.get("chunk_type", "function_summary"),
-                "source_type": "code",
-            })
-            entry["doc_id"] = doc_id
-        except Exception as e:
-            print(f"  [warn] {src_file}: summary index failed: {e}")
-
-        # Index the raw code as a separate chunk (for identifier/keyword search)
-        raw_code = entry.get("raw_code", "").strip()
-        if raw_code and len(raw_code) > 30:
+    # Map future → index so we can write back doc_ids
+    with ThreadPoolExecutor(max_workers=index_workers) as pool:
+        future_to_idx = {
+            pool.submit(_index_one_entry, client, entry): i
+            for i, entry in enumerate(summaries)
+        }
+        done = 0
+        for future in as_completed(future_to_idx):
+            idx = future_to_idx[future]
             try:
-                code_doc_id = _create_or_replace(client, raw_code, {
-                    "source_file": src_file,
-                    "module":      module,
-                    "chunk_type":  "raw_code",
-                    "source_type": "code",
-                })
-                entry["code_doc_id"] = code_doc_id
+                src_file, doc_id, code_doc_id = future.result()
+                if doc_id:
+                    summaries[idx]["doc_id"] = doc_id
+                if code_doc_id:
+                    summaries[idx]["code_doc_id"] = code_doc_id
             except Exception as e:
-                print(f"  [warn] {src_file}: code index failed: {e}")
+                print(f"  [warn] index failed for entry {idx}: {e}")
+            done += 1
+            if done % 100 == 0:
+                print(f"  [{done}/{n}] indexed...")
 
-        if i > 0 and i % 20 == 0:
-            time.sleep(0.5)
     succeeded = sum(1 for e in summaries if e.get("doc_id"))
-    failed = len(summaries) - succeeded
+    failed = n - succeeded
     if failed > 0:
-        print(f"[Index] Done: {succeeded}/{len(summaries)} indexed ({failed} failed)")
+        print(f"[Index] Done: {succeeded}/{n} indexed ({failed} failed)")
     else:
-        print(f"[Index] Done: {succeeded}/{len(summaries)} indexed")
+        print(f"[Index] Done: {succeeded}/{n} indexed")
 
 
 # ── Pass 3: Review ─────────────────────────────────────────────────────────────
@@ -573,39 +598,124 @@ Output ONLY one of these two JSON forms:
   {{"keep": false, "improved": "rewritten summary here"}}"""
 
 
+def _review_score(entry: dict) -> float:
+    """Score a summary for review priority. Higher = more likely to need review.
+    Returns 0.0-1.0. Summaries scoring below a threshold can be skipped."""
+    score = 0.0
+    summary = entry.get("summary", "")
+
+    # Short summaries are likely shallow
+    if len(summary) < 100:
+        score += 0.4
+    elif len(summary) < 200:
+        score += 0.2
+
+    # Vague markers suggest the summary needs improvement
+    vague_count = sum(1 for marker in _VAGUE_MARKERS if marker in summary.lower())
+    score += min(0.4, vague_count * 0.15)
+
+    # Generic terms suggest lack of domain specificity
+    generic = {"function", "method", "class", "handles", "processes", "implements",
+               "this code", "this function", "this method"}
+    generic_count = sum(1 for g in generic if g in summary.lower())
+    score += min(0.2, generic_count * 0.05)
+
+    return min(1.0, score)
+
+
+def _review_one_summary(model: str, entry: dict, index: int,
+                        tracker: Optional[TokenTracker] = None) -> tuple[int, bool, str]:
+    """Review a single summary. Returns (index, was_edited, new_summary_or_empty)."""
+    query = f"{entry.get('module', '')} {entry.get('summary', '')[:120]}"
+    kb_context = search_kb(query, limit=3)
+    prompt = _build_review_prompt(entry, kb_context)
+
+    try:
+        raw = llm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512, json_mode=True,
+                       tracker=tracker, phase="Review")
+        data = json.loads(raw)
+        if not data.get("keep") and data.get("improved", "").strip():
+            return (index, True, data["improved"].strip())
+        return (index, False, "")
+    except Exception as e:
+        return (index, False, "")
+
+
 def run_review(model: str, summaries: list[dict],
-               tracker: Optional[TokenTracker] = None) -> tuple[list[dict], float]:
+               tracker: Optional[TokenTracker] = None,
+               workers: int = 4, rpm: int = 60,
+               quiet: bool = False) -> tuple[list[dict], float]:
     """
-    Review every summary for quality. Queries the KB for domain context so
-    the LLM can use proper vocabulary in rewrites.
-    Summaries must be indexed in R2R before calling this.
+    Review summaries for quality using parallel workers.
+    Smart targeting: only reviews summaries likely to need improvement.
     Returns (summaries_with_improvements, edit_rate).
     """
-    print(f"\n[Review] Reviewing {len(summaries)} summaries with {model}...")
-    edited = 0
+    import threading
 
-    for i, entry in enumerate(summaries):
-        query = f"{entry.get('module', '')} {entry.get('summary', '')[:120]}"
-        kb_context = search_kb(query, limit=3)
-        prompt = _build_review_prompt(entry, kb_context)
+    # Smart targeting: score and filter
+    scored = [(i, _review_score(entry)) for i, entry in enumerate(summaries)]
+    threshold = 0.15  # skip clearly good summaries
+    review_indices = [i for i, score in scored if score >= threshold]
+    skipped = len(summaries) - len(review_indices)
 
+    print(f"\n[Review] {len(review_indices)} summaries to review "
+          f"({skipped} skipped as likely good), {workers} workers, {rpm} RPM")
+
+    if not review_indices:
+        return summaries, 0.0
+
+    executor = RateLimitedExecutor(
+        workers=min(workers, len(review_indices)),
+        calls_per_minute=rpm,
+    )
+
+    write_lock = threading.Lock()
+    edited = [0]
+    completed = [0]
+    start_time = time.monotonic()
+
+    future_to_idx = {}
+    for i in review_indices:
+        future = executor.submit(
+            _review_one_summary, model, summaries[i], i, tracker,
+        )
+        future_to_idx[future] = i
+
+    for future in executor.as_completed(future_to_idx):
+        idx = future_to_idx[future]
         try:
-            raw = llm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512, json_mode=True,
-                           tracker=tracker, phase="Review")
-            data = json.loads(raw)
-            if not data.get("keep") and data.get("improved", "").strip():
-                entry["summary"] = data["improved"].strip()
-                edited += 1
-                print(f"  [{i+1:>4}/{len(summaries)}] edited  {entry.get('source_file', '?')}")
-            else:
-                print(f"  [{i+1:>4}/{len(summaries)}] kept    {entry.get('source_file', '?')}")
+            _, was_edited, new_summary = future.result()
+            with write_lock:
+                completed[0] += 1
+                n = completed[0]
+                if was_edited:
+                    summaries[idx]["summary"] = new_summary
+                    edited[0] += 1
+                    tag = "edited"
+                else:
+                    tag = "kept"
+
+                if not quiet:
+                    elapsed = time.monotonic() - start_time
+                    if n > 1 and elapsed > 0:
+                        rate = n / elapsed * 60
+                        remaining = (len(review_indices) - n) / (n / elapsed)
+                        eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
+                    else:
+                        eta = ""
+                    print(f"  [{n:>4}/{len(review_indices)}] {tag:<7} "
+                          f"{summaries[idx].get('source_file', '?')}{eta}")
         except Exception as e:
-            print(f"  [{i+1:>4}/{len(summaries)}] [warn] review failed: {e}")
+            with write_lock:
+                completed[0] += 1
+                if not quiet:
+                    print(f"  [warn] review failed for index {idx}: {e}")
 
-        time.sleep(0.2)
+    executor.shutdown()
 
-    edit_rate = edited / len(summaries) if summaries else 0.0
-    print(f"[Review] {edited}/{len(summaries)} summaries edited ({edit_rate:.1%})")
+    edit_rate = edited[0] / len(summaries) if summaries else 0.0
+    print(f"[Review] {edited[0]}/{len(review_indices)} reviewed summaries edited "
+          f"({skipped} skipped) — overall edit rate {edit_rate:.1%}")
     return summaries, edit_rate
 
 
@@ -1303,6 +1413,31 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     "chunk_index": i,
                 })
 
+    # ── Dedup near-identical chunks (boilerplate, generated code) ────────
+    def _chunk_signature(text: str, n: int = 3) -> frozenset:
+        """Cheap token n-gram fingerprint for similarity detection."""
+        tokens = text.split()
+        if len(tokens) < n:
+            return frozenset(tokens)
+        return frozenset(tuple(tokens[i:i+n]) for i in range(0, len(tokens) - n + 1, 5))
+
+    seen_sigs: dict[frozenset, str] = {}  # signature → first source_file
+    deduped: list[dict] = []
+    dedup_count = 0
+    for item in work_items:
+        sig = _chunk_signature(item["chunk"])
+        if sig in seen_sigs:
+            # Check jaccard overlap
+            existing = seen_sigs[sig]
+            # Same signature set means very high overlap — skip
+            dedup_count += 1
+            continue
+        seen_sigs[sig] = item["rel_path"]
+        deduped.append(item)
+    if dedup_count > 0:
+        print(f"[Pass 2] Deduped {dedup_count} near-identical chunks")
+    work_items = deduped
+
     if max_chunks is not None:
         work_items = work_items[:max_chunks]
 
@@ -1404,6 +1539,10 @@ def main():
                             "Examples: openai/gpt-4o, ollama/llama3.1, "
                             "anthropic/claude-opus-4-6, groq/llama3-70b-8192"
                         ))
+    parser.add_argument("--model-fast", default=None,
+                        help="Cheaper model for bulk Pass 2 summarization. "
+                             "If set, --model is used for Pass 1 and Review only. "
+                             "Example: --model openai/gpt-4o --model-fast openai/gpt-4o-mini")
     parser.add_argument("--output-dir", default=None,
                         help="Where to write module_map.json and summaries.json "
                              "(default: same dir as this script)")
@@ -1465,6 +1604,10 @@ def main():
                                  include_tests=args.include_tests)
     skip_note = "" if args.include_tests else " (excluding tests — use --include-tests to change)"
     print(f"Found {len(files)} {args.language} source files under {codebase}{skip_note}")
+    if args.model_fast:
+        print(f"Models: {args.model} (Pass 1 + Review), {args.model_fast} (Pass 2 bulk)")
+    else:
+        print(f"Model: {args.model}")
     if not files:
         print("No source files found. Check --codebase and --language.")
         sys.exit(1)
@@ -1498,7 +1641,18 @@ def main():
             est_total += review_tokens * (args.passes - 1)
             print(f"  Est. review:       ~{review_tokens:,} tokens/pass × {args.passes - 1} pass(es)")
             print(f"  Est. total w/review: ~{est_total:,} tokens (~${est_total / 1_000_000 * rate_per_mtok:.2f})")
+        # Wall time estimate
+        total_calls = est_chunks  # Pass 2
+        if args.passes > 1:
+            total_calls += int(est_chunks * 0.7)  # ~70% reviewed per pass
+        est_minutes = total_calls / args.rpm
+        if est_minutes > 60:
+            print(f"  Est. wall time:    ~{est_minutes / 60:.1f} hours (at {args.rpm} RPM)")
+        else:
+            print(f"  Est. wall time:    ~{int(est_minutes)} minutes (at {args.rpm} RPM)")
         print(f"{'='*60}")
+        if not args.model_fast:
+            print(f"\n  Tip: Use --model-fast openai/gpt-4o-mini to reduce Pass 2 cost by ~90%")
         print(f"\n  Note: Actual cost depends on model, file sizes, and content.")
         print(f"  Run without --dry-run to proceed.")
         return
@@ -1597,7 +1751,7 @@ def main():
         # Only run full summarization on the first pass
         if pass_num == 1:
             summaries = run_pass2(
-                args.model, codebase, module_map,
+                args.model_fast or args.model, codebase, module_map,
                 language=args.language,
                 max_chunks=args.max_chunks,
                 rag=args.rag,
@@ -1614,7 +1768,10 @@ def main():
             index_summaries_to_r2r(summaries)
 
             # Review + improve
-            summaries, edit_rate = run_review(args.model, summaries, tracker=tracker)
+            summaries, edit_rate = run_review(
+                args.model, summaries, tracker=tracker,
+                workers=args.workers, rpm=args.rpm, quiet=args.quiet,
+            )
 
             # Update R2R with improved summaries
             index_summaries_to_r2r(summaries)
