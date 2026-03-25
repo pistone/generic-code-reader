@@ -1259,18 +1259,23 @@ code does. Plain prose only."""
 def build_pass2_prompt(project_desc: str, module_name: str,
                        module_desc: str, questions: list[str],
                        source_file: str, raw_code: str,
-                       kb_context: str = "") -> str:
+                       kb_context: str = "",
+                       file_summary: str = "") -> str:
     questions_text = "\n".join(f"- {q}" for q in questions)
     kb_section = (
         f"\nRelevant context from the knowledge base (use this vocabulary):\n{kb_context}\n"
         if kb_context else ""
+    )
+    file_section = (
+        f"\nFile purpose: {file_summary}\n"
+        if file_summary else ""
     )
     return f"""Project: {project_desc}
 Module: {module_name} — {module_desc}
 
 Domain questions this module answers:
 {questions_text}
-{kb_section}
+{kb_section}{file_section}
 Source file: {source_file}
 Code chunk:
 ```
@@ -1293,10 +1298,113 @@ def _make_chunk_key(source_file: str, chunk_index: int) -> str:
     return f"{source_file}::{chunk_index}"
 
 
+# ── File-level summaries (pre-Pass 2) ────────────────────────────────────────
+
+FILE_SUMMARY_SYSTEM = (
+    "You are a code analyst. Write a single sentence describing what this "
+    "source file does in the context of its project. Use the project's own "
+    "vocabulary (class names, domain concepts). Be specific, not generic."
+)
+
+
+def _summarize_one_file(model: str, rel_path: str, sample: str,
+                        mod_name: str, mod_desc: str,
+                        tracker: Optional[TokenTracker] = None) -> tuple[str, str]:
+    """Generate a 1-sentence file summary. Returns (rel_path, summary)."""
+    prompt = f"""Module: {mod_name} — {mod_desc}
+File: {rel_path}
+
+```
+{sample[:3000]}
+```
+
+One sentence describing what this file does:"""
+    try:
+        result = llm_call(model, FILE_SUMMARY_SYSTEM, prompt, max_tokens=100,
+                          tracker=tracker, phase="File summaries")
+        return (rel_path, result.strip())
+    except Exception:
+        return (rel_path, "")
+
+
+def _generate_file_summaries(
+    model: str, codebase: Path, module_map: "ModuleMap",
+    workers: int = 4, rpm: int = 60,
+    tracker: Optional[TokenTracker] = None,
+    quiet: bool = False,
+) -> dict[str, str]:
+    """Generate 1-sentence summaries for each file before chunk-level Pass 2.
+
+    Returns a dict mapping rel_path → file summary.
+    These summaries give each chunk context about its file's overall purpose.
+    """
+    import threading
+
+    # Collect unique files with their module context
+    file_info: dict[str, tuple[str, str, str]] = {}  # rel_path → (fpath, mod_name, mod_desc)
+    for mod in module_map.modules:
+        for fname in mod.files:
+            fpath = codebase / fname
+            if not fpath.exists():
+                match = _find_file(codebase, Path(fname).name)
+                if match:
+                    fpath = match
+                else:
+                    continue
+            rel = str(fpath.relative_to(codebase))
+            if rel not in file_info:
+                file_info[rel] = (str(fpath), mod.name, mod.description)
+
+    n = len(file_info)
+    if n == 0:
+        return {}
+
+    print(f"\n[File summaries] Generating 1-sentence summaries for {n} files...")
+
+    executor = RateLimitedExecutor(
+        workers=min(workers, n),
+        calls_per_minute=rpm,
+    )
+
+    results: dict[str, str] = {}
+    lock = threading.Lock()
+    done = [0]
+    start = time.monotonic()
+
+    futures = {}
+    for rel, (fpath_str, mod_name, mod_desc) in file_info.items():
+        sample = read_file_sample(Path(fpath_str), max_lines=SAMPLE_LINES)
+        future = executor.submit(
+            _summarize_one_file, model, rel, sample, mod_name, mod_desc, tracker,
+        )
+        futures[future] = rel
+
+    for future in executor.as_completed(futures):
+        rel = futures[future]
+        try:
+            _, summary = future.result()
+            if summary:
+                with lock:
+                    results[rel] = summary
+        except Exception:
+            pass
+        with lock:
+            done[0] += 1
+            if not quiet and done[0] % 50 == 0:
+                elapsed = time.monotonic() - start
+                rate = done[0] / elapsed * 60 if elapsed > 0 else 0
+                print(f"  [{done[0]}/{n}] file summaries generated ({rate:.0f}/min)")
+
+    executor.shutdown()
+    print(f"[File summaries] Done: {len(results)}/{n} files summarized")
+    return results
+
+
 def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
                           mod_name: str, mod_desc: str, questions: list[str],
                           rel_path: str, chunk: str, chunk_index: int,
                           rag: bool = False,
+                          file_summary: str = "",
                           tracker: Optional[TokenTracker] = None) -> dict:
     """Summarize a single code chunk. Runs in a worker thread.
 
@@ -1312,6 +1420,7 @@ def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
         source_file=rel_path,
         raw_code=chunk,
         kb_context=kb_context,
+        file_summary=file_summary,
     )
 
     summary_text = llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512,
@@ -1374,12 +1483,18 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         except Exception:
             summaries = []
 
+    # ── Generate file-level summaries ────────────────────────────────────
+    project_desc = f"{module_map.project}: {module_map.description}"
+    file_summaries = _generate_file_summaries(
+        model, codebase, module_map,
+        workers=workers, rpm=rpm, tracker=tracker, quiet=quiet,
+    )
+
     # ── Collect work items ────────────────────────────────────────────────
     work_items: list[dict] = []  # each item has all info needed for one chunk
     skipped = 0
 
     rag_label = " (RAG-augmented)" if rag else ""
-    project_desc = f"{module_map.project}: {module_map.description}"
     print(f"\n[Pass 2] Collecting chunks from {len(module_map.modules)} modules{rag_label}...")
 
     for mod in module_map.modules:
@@ -1411,6 +1526,7 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     "rel_path": rel_path,
                     "chunk": chunk,
                     "chunk_index": i,
+                    "file_summary": file_summaries.get(rel_path, ""),
                 })
 
     # ── Dedup near-identical chunks (boilerplate, generated code) ────────
@@ -1471,7 +1587,8 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             model, codebase, project_desc,
             item["mod_name"], item["mod_desc"], item["questions"],
             item["rel_path"], item["chunk"], item["chunk_index"],
-            rag=rag, tracker=tracker,
+            rag=rag, file_summary=item.get("file_summary", ""),
+            tracker=tracker,
         )
         future_to_item[future] = item
 
@@ -1619,6 +1736,9 @@ def main():
         est_prompt_tokens = est_chunks * 2000
         est_completion_tokens = est_chunks * 500
         est_total = est_prompt_tokens + est_completion_tokens
+        # File summaries estimate: ~500 tokens per file (prompt + completion)
+        file_summary_tokens = len(files) * 500
+        est_total += file_summary_tokens
         # Pass 1 estimate
         pass1_tokens = 50000  # rough estimate for agent loop
         est_total += pass1_tokens
@@ -1631,6 +1751,7 @@ def main():
         print(f"  Source files:      {len(files):,}")
         print(f"  Est. chunks:       ~{est_chunks:,} (avg 3/file)")
         print(f"  Est. Pass 1:       ~{pass1_tokens:,} tokens")
+        print(f"  Est. file summaries: ~{file_summary_tokens:,} tokens ({len(files):,} files × ~500 tok)")
         print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
         print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
         print(f"  Est. total tokens: ~{est_total:,}")
