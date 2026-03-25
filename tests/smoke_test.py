@@ -442,6 +442,74 @@ def test_suggest_review_loop(runner: SmokeTestRunner):
         _save_staging(original_queue)
 
 
+def test_doc_agent_parsing(runner: SmokeTestRunner):
+    """doc_agent parsers can parse markdown and produce chunks."""
+    from doc_agent.parsers import get_parser, ParsedDocument
+    from doc_agent.doc_agent import chunk_document
+
+    # Parse a markdown string
+    md_parser = get_parser(".md")
+    content = b"# Test Doc\n\nFirst section content.\n\n## Second\n\nMore content here."
+    parsed = md_parser.parse("test.md", content, None)
+
+    if not parsed.text:
+        raise AssertionError("Parsed document has empty text")
+    if not parsed.title:
+        raise AssertionError("Parsed document has no title")
+
+    chunks = chunk_document(parsed)
+    if not chunks:
+        raise AssertionError("chunk_document produced no chunks")
+    if not chunks[0].get("text"):
+        raise AssertionError("First chunk has no text")
+
+
+def test_ticket_agent_filter(runner: SmokeTestRunner):
+    """ticket_agent structural filter correctly filters tickets."""
+    from ticket_agent.ticket_agent import structural_filter, build_ticket_context
+
+    tickets = [
+        # Should pass: resolved with comments
+        {"key": "TEST-1", "title": "Bug fix", "status": "Done",
+         "resolution": "Fixed", "comments": [{"author": "a", "body": "found it"},
+                                               {"author": "b", "body": "fixed"}]},
+        # Should fail: not resolved
+        {"key": "TEST-2", "title": "Open bug", "status": "Open",
+         "comments": [{"author": "a", "body": "x"}, {"author": "b", "body": "y"}]},
+        # Should fail: too few comments
+        {"key": "TEST-3", "title": "Quick fix", "status": "Done",
+         "comments": [{"author": "a", "body": "done"}]},
+        # Should fail: won't fix
+        {"key": "TEST-4", "title": "Rejected", "status": "Closed",
+         "resolution": "Won't Fix",
+         "comments": [{"author": "a", "body": "x"}, {"author": "b", "body": "y"}]},
+    ]
+
+    passed = structural_filter(tickets)
+    if len(passed) != 1:
+        raise AssertionError(f"Expected 1 ticket to pass filter, got {len(passed)}")
+    if passed[0]["key"] != "TEST-1":
+        raise AssertionError(f"Wrong ticket passed: {passed[0]['key']}")
+
+    # Test context building
+    ctx = build_ticket_context(passed[0])
+    if "TEST-1" not in ctx or "Bug fix" not in ctx:
+        raise AssertionError(f"Context missing key fields: {ctx[:100]}")
+
+
+def test_auditor_import(runner: SmokeTestRunner):
+    """auditor module imports and run_audit function exists."""
+    try:
+        from auditor.auditor import run_audit
+    except ImportError as e:
+        raise AssertionError(f"Cannot import auditor: {e}")
+
+    import inspect
+    sig = inspect.signature(run_audit)
+    if "model" not in sig.parameters:
+        raise AssertionError("run_audit missing 'model' parameter")
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 TESTS = [
@@ -453,6 +521,9 @@ TESTS = [
     ("Study Agent Pass 1", test_study_pass1),
     ("Study Agent Pass 2", test_study_pass2),
     ("Index Summaries", test_index_summaries),
+    ("Doc Agent Parsing", test_doc_agent_parsing),
+    ("Ticket Agent Filter", test_ticket_agent_filter),
+    ("Auditor Import", test_auditor_import),
     ("MCP Server Search", test_mcp_search),
     ("Suggest + Review Loop", test_suggest_review_loop),
 ]

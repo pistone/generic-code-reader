@@ -341,11 +341,15 @@ def main():
                              "Optional but recommended.")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help="litellm model string (default: %(default)s). "
-                             "Same options as study_agent: openai/gpt-4o, ollama/llama3.1, ...")
+                             "Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514, ollama/llama3.1")
     parser.add_argument("--watch", action="store_true",
                         help=f"Keep running and poll staging queue every {WATCH_INTERVAL}s")
     parser.add_argument("--staging-file", default=None,
                         help=f"Path to staging_queue.json (default: {STAGING_FILE})")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print detailed progress")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress per-item progress, show only summaries")
     args = parser.parse_args()
 
     staging_file = Path(args.staging_file) if args.staging_file else STAGING_FILE

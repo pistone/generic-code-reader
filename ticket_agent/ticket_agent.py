@@ -254,11 +254,16 @@ def main():
     parser.add_argument("--tickets", default=None,
                         help="Directory of exported ticket JSON files")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="litellm model string (default: %(default)s)")
+                        help="litellm model string (default: %(default)s). "
+                             "Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514, ollama/llama3.1")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process tickets changed since last run")
     parser.add_argument("--index-only", action="store_true",
                         help="Skip extraction; re-index from saved ticket_summaries.json")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print detailed progress")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress per-item progress, show only summaries")
     args = parser.parse_args()
 
     output_dir = Path(__file__).resolve().parent
@@ -329,11 +334,13 @@ def main():
 
         if not result["useful"]:
             not_useful += 1
-            print(f"  {key}: not useful")
+            if not args.quiet:
+                print(f"  {key}: not useful")
         else:
             # Step 5: dedup
             if dedup_against_kb(client, result["summary"]):
-                print(f"  {key}: duplicate (skipped)")
+                if not args.quiet:
+                    print(f"  {key}: duplicate (skipped)")
             else:
                 useful_entries.append({
                     "key": key,
@@ -342,7 +349,8 @@ def main():
                     "category": result["category"],
                     "resolved": t.get("resolved", ""),
                 })
-                print(f"  {key}: [{result['category']}] {result['summary'][:80]}...")
+                if not args.quiet:
+                    print(f"  {key}: [{result['category']}] {result['summary'][:80]}...")
 
         time.sleep(0.3)  # rate limit
 

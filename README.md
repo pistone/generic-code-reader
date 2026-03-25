@@ -12,7 +12,7 @@ ticket_agent/ticket_agent.py → Extracts knowledge from Jira/PR ticket exports
 auditor/auditor.py           → Detects doc↔code conflicts (staleness, contradictions)
 mcp_server/server.py         → MCP server: search_codebase + suggest_index_item
 reviewer/reviewer_agent.py   → Verifies runtime suggestions before promoting to the KB
-shared/utils.py              → Shared utilities (TokenTracker, llm_call, manifest helpers)
+codebase_shared/utils.py     → Shared utilities (TokenTracker, llm_call, llm_tool_loop, RateLimitedExecutor, manifest helpers)
 ```
 
 The self-improving loop: when Claude can't find an answer in the KB, it researches manually and calls `suggest_index_item()`. The reviewer agent verifies the suggestion and promotes it into R2R, so the next developer gets an instant answer.
@@ -26,6 +26,9 @@ git clone <repo-url> && cd generic-code-reader
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+
+# Verify everything is set up correctly
+python preflight.py
 ```
 
 ### 2. Configure API keys
@@ -76,6 +79,9 @@ python indexer/study_agent.py --codebase /path/to/your/src --language python
 
 # With RAG augmentation (recommended after indexing docs):
 python indexer/study_agent.py --codebase /path/to/your/src --rag --passes 3
+
+# Estimate cost before running (no LLM calls)
+python indexer/study_agent.py --codebase /path/to/your/src --dry-run
 
 # Quick test with 20 chunks
 python indexer/study_agent.py --codebase /path/to/your/src --max-chunks 20
@@ -194,6 +200,67 @@ The smoke tests check, in order:
 10. Suggest + review loop (self-improving pipeline)
 
 Tests clean up after themselves. Total LLM cost is under $0.01.
+
+## Troubleshooting
+
+### R2R won't start / embedding errors
+
+```bash
+# Check R2R is healthy
+curl http://localhost:7272/v3/health
+
+# If unhealthy, restart
+docker compose -f r2r/compose.yaml down
+docker compose -f r2r/compose.yaml up -d
+
+# Check logs for embedding errors
+docker compose -f r2r/compose.yaml logs r2r 2>&1 | tail -30
+```
+
+If you see `Both embedding configurations must use the same dimensions`:
+- Open `r2r/r2r.toml` and check `base_dimension` matches your embedding model
+- `voyage-code-2` → 1536, `text-embedding-3-small` → 512
+
+### LLM calls failing
+
+```bash
+# Test your API key
+python -c "from litellm import completion; print(completion(model='openai/gpt-4o', messages=[{'role':'user','content':'hi'}], max_tokens=5).choices[0].message.content)"
+```
+
+Common issues:
+- **Wrong model string**: Use litellm format: `openai/gpt-4o`, `anthropic/claude-sonnet-4-20250514`, `ollama/llama3.1`
+- **Missing API key**: Set `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY`, etc.) in `.env` and run `source .env`
+- **Rate limits**: Reduce `--rpm` (default 60) or `--workers` (default 4)
+- **Company proxy**: Set `OPENAI_API_BASE` to your proxy URL in `.env`
+
+### Study agent runs out of memory on large codebases
+
+- Use `--dry-run` to estimate cost first
+- Use `--max-chunks 100` for an initial test run
+- Use `--incremental` for subsequent runs (only re-processes changed files)
+- Reduce `--workers` to lower parallel memory usage
+
+### Database recovery after restart
+
+All agents save intermediate results to disk. After an R2R restart:
+
+```bash
+# Re-index code summaries (no LLM cost)
+python indexer/indexer.py --index indexer/summaries.json
+
+# Re-index ticket knowledge (no LLM cost)
+python -m ticket_agent.ticket_agent --index-only
+
+# Re-index documentation (no LLM cost)
+python -m doc_agent.doc_agent --docs /path/to/docs
+```
+
+### Stale `shared/` import errors
+
+The shared utilities module was renamed from `shared/` to `codebase_shared/` to avoid conflicts with R2R's `shared.abstractions` package. If you see `ModuleNotFoundError: No module named 'shared.utils'`, ensure:
+- The directory is `codebase_shared/` (not `shared/`)
+- All imports use `from codebase_shared.utils import ...`
 
 ## Supported Languages
 

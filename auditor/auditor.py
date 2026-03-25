@@ -301,7 +301,8 @@ def main():
         description="Cross-reference auditor: detect doc↔code conflicts in R2R",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="litellm model string (default: %(default)s)")
+                        help="litellm model string (default: %(default)s). "
+                             "Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514, ollama/llama3.1")
     parser.add_argument("--threshold-days", type=int,
                         default=DEFAULT_THRESHOLD_DAYS,
                         help="Flag docs older than this many days "
@@ -309,6 +310,10 @@ def main():
     parser.add_argument("--output", default=None,
                         help="Path for conflict report JSON "
                              "(default: auditor/conflict_report.json)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print detailed progress")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress per-item progress, show only summaries")
     args = parser.parse_args()
 
     output_dir = Path(__file__).resolve().parent

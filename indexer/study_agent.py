@@ -1211,7 +1211,8 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
               rag: bool = False,
               summaries_path: Optional[Path] = None,
               tracker: Optional[TokenTracker] = None,
-              workers: int = 4, rpm: int = 60) -> list[dict]:
+              workers: int = 4, rpm: int = 60,
+              quiet: bool = False, verbose: bool = False) -> list[dict]:
     """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
 
     Uses parallel workers with rate limiting. With rag=True, queries the KB
@@ -1294,6 +1295,7 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
 
     # Thread-safe accumulator
     write_lock = threading.Lock()
+    start_time = time.monotonic()
     completed = [0]  # mutable counter in list for closure access
     refined_count = [0]
     error_count = [0]
@@ -1324,9 +1326,17 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                 completed[0] += 1
                 n = completed[0]
 
-                print(f"  [{n:>4}/{len(work_items)}] "
-                      f"{item['rel_path']}:{item['chunk_index']} → "
-                      f"{len(entry['summary'])} chars{ref_tag}")
+                elapsed = time.monotonic() - start_time
+                if n > 1 and elapsed > 0:
+                    rate = n / elapsed * 60  # per minute
+                    remaining = (len(work_items) - n) / (n / elapsed)
+                    eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
+                else:
+                    eta = ""
+                if not quiet:
+                    print(f"  [{n:>4}/{len(work_items)}] "
+                          f"{item['rel_path']}:{item['chunk_index']} → "
+                          f"{len(entry['summary'])} chars{ref_tag}{eta}")
 
                 # Incremental write every 10 completions
                 if summaries_path and n % 10 == 0:
@@ -1397,6 +1407,12 @@ def main():
                         help="Parallel workers for Pass 2 summarization (default: 4)")
     parser.add_argument("--rpm", type=int, default=60,
                         help="Rate limit: max LLM calls per minute (default: 60)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Estimate token cost without running any LLM calls")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Print detailed progress (tool calls, reference resolution)")
+    parser.add_argument("--quiet", action="store_true",
+                        help="Suppress per-chunk progress, show only phase summaries")
     args = parser.parse_args()
 
     codebase = Path(args.codebase).resolve()
@@ -1421,6 +1437,40 @@ def main():
     if not files:
         print("No source files found. Check --codebase and --language.")
         sys.exit(1)
+
+    # ── Dry-run: estimate cost and exit ─────────────────────────────────────
+    if args.dry_run:
+        # Quick estimate: ~3 chunks per file on average
+        est_chunks = len(files) * 3
+        est_prompt_tokens = est_chunks * 2000
+        est_completion_tokens = est_chunks * 500
+        est_total = est_prompt_tokens + est_completion_tokens
+        # Pass 1 estimate
+        pass1_tokens = 50000  # rough estimate for agent loop
+        est_total += pass1_tokens
+        rate_per_mtok = 5.0  # rough average
+        est_cost = est_total / 1_000_000 * rate_per_mtok
+
+        print(f"\n{'='*60}")
+        print(f"  DRY RUN — Cost Estimate")
+        print(f"{'='*60}")
+        print(f"  Source files:      {len(files):,}")
+        print(f"  Est. chunks:       ~{est_chunks:,} (avg 3/file)")
+        print(f"  Est. Pass 1:       ~{pass1_tokens:,} tokens")
+        print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
+        print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
+        print(f"  Est. total tokens: ~{est_total:,}")
+        print(f"  Est. cost:         ~${est_cost:.2f} (at ${rate_per_mtok}/MTok)")
+        if args.passes > 1:
+            review_tokens = est_chunks * 1500
+            review_cost = review_tokens / 1_000_000 * rate_per_mtok
+            est_total += review_tokens * (args.passes - 1)
+            print(f"  Est. review:       ~{review_tokens:,} tokens/pass × {args.passes - 1} pass(es)")
+            print(f"  Est. total w/review: ~{est_total:,} tokens (~${est_total / 1_000_000 * rate_per_mtok:.2f})")
+        print(f"{'='*60}")
+        print(f"\n  Note: Actual cost depends on model, file sizes, and content.")
+        print(f"  Run without --dry-run to proceed.")
+        return
 
     # ── Incremental: filter to changed files only ──────────────────────────────
     hash_manifest_path = output_dir / "file_hashes.json"
@@ -1524,6 +1574,8 @@ def main():
                 tracker=tracker,
                 workers=args.workers,
                 rpm=args.rpm,
+                quiet=args.quiet,
+                verbose=args.verbose,
             )
 
         if args.passes > 1:

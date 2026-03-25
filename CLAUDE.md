@@ -188,6 +188,7 @@ of each run and appended to `cost_log.jsonl` for historical tracking.
 generic-code-reader/
 ├── CLAUDE.md                  ← this file
 ├── README.md                  ← setup and usage guide
+├── preflight.py               ← prerequisite checker (python preflight.py)
 ├── .mcp.json                  ← MCP server registration
 ├── .env.example               ← environment variable template
 ├── .gitignore
@@ -208,8 +209,8 @@ generic-code-reader/
 │   └── server.py              ← MCP server (search + suggest tools)
 ├── reviewer/
 │   └── reviewer_agent.py      ← verifies and promotes suggestions
-├── shared/
-│   └── utils.py               ← shared utilities (TokenTracker, llm_call, manifest helpers)
+├── codebase_shared/
+│   └── utils.py               ← shared utilities (TokenTracker, llm_call, llm_tool_loop, RateLimitedExecutor, manifest helpers)
 ├── r2r/
 │   ├── r2r.toml               ← R2R config (embedding, FTS, etc.)
 │   └── compose.yaml           ← Docker compose for R2R + Postgres
@@ -222,6 +223,7 @@ Runtime artifacts (gitignored):
 - `indexer/summaries.json` — Pass 2 output
 - `indexer/file_hashes.json` — incremental change manifest
 - `indexer/cost_log.jsonl` — token usage log
+- `ticket_agent/ticket_summaries.json` — ticket agent output
 - `doc_agent/doc_hashes.json` — doc incremental change manifest
 - `auditor/conflict_report.json` — doc↔code conflict report
 - `auditor/cost_log.jsonl` — auditor token usage log
