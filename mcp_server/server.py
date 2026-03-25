@@ -23,7 +23,10 @@ from r2r import R2RClient
 # ── Config ────────────────────────────────────────────────────────────────────
 
 R2R_URL       = os.getenv("R2R_URL", "http://localhost:7272")
-SEARCH_LIMIT  = int(os.getenv("KB_SEARCH_LIMIT", "5"))
+try:
+    SEARCH_LIMIT = int(os.getenv("KB_SEARCH_LIMIT", "5"))
+except (ValueError, TypeError):
+    SEARCH_LIMIT = 5
 
 BASE_DIR      = Path(__file__).parent
 STAGING_FILE  = BASE_DIR / "staging_queue.json"
@@ -37,14 +40,17 @@ def get_client() -> R2RClient:
 
 def _log_query(query: str, num_results: int, approx_tokens: int) -> None:
     """Append one line to the query log for experiment measurement."""
-    entry = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "query": query,
-        "num_results": num_results,
-        "approx_tokens": approx_tokens,
-    }
-    with LOG_FILE.open("a") as f:
-        f.write(json.dumps(entry) + "\n")
+    try:
+        entry = {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "query": query,
+            "num_results": num_results,
+            "approx_tokens": approx_tokens,
+        }
+        with LOG_FILE.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass  # logging is non-essential, don't crash the search
 
 
 def _format_results(hits: list) -> str:
@@ -76,7 +82,12 @@ def _format_results(hits: list) -> str:
 
 def _load_staging() -> list:
     if STAGING_FILE.exists():
-        return json.loads(STAGING_FILE.read_text())
+        try:
+            data = json.loads(STAGING_FILE.read_text())
+            if isinstance(data, list):
+                return data
+        except (json.JSONDecodeError, Exception):
+            pass
     return []
 
 
@@ -121,11 +132,14 @@ def search_codebase(query: str, module: str = "",
     if filters:
         search_settings["filters"] = filters
 
-    results = client.retrieval.search(
-        query=query,
-        search_settings=search_settings,
-    )
-    hits = results.results.chunk_search_results
+    try:
+        results = client.retrieval.search(
+            query=query,
+            search_settings=search_settings,
+        )
+        hits = results.results.chunk_search_results
+    except Exception as e:
+        return f"⚠ Knowledge base search failed: {e}\nIs R2R running? Check: curl {R2R_URL}/v3/health"
 
     # Approximate token count for logging (rough: 1 token ≈ 4 chars)
     formatted = _format_results(hits)

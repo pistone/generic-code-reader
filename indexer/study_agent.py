@@ -88,6 +88,8 @@ SKIP_DIRS    = {"__pycache__", ".git", ".hg", ".svn", "node_modules",
 SKIP_TEST_DIRS = {"test", "tests", "testing", "test_data", "testdata",
                   "testcases", "test_fixtures", "fixtures"}
 
+_search_kb_failures = 0
+
 # TokenTracker and llm_call imported from codebase_shared.utils
 
 # ── Pydantic models (used to validate Pass 1 JSON output) ─────────────────────
@@ -444,6 +446,8 @@ def search_kb(query: str, limit: int = 3) -> str:
             parts.append(f"[{src}] {(hit.text or '').strip()[:300]}")
         return "\n".join(parts)
     except Exception:
+        global _search_kb_failures
+        _search_kb_failures += 1
         return ""
 
 
@@ -511,7 +515,12 @@ def index_summaries_to_r2r(summaries: list[dict]) -> None:
 
         if i > 0 and i % 20 == 0:
             time.sleep(0.5)
-    print("[Index] Done")
+    succeeded = sum(1 for e in summaries if e.get("doc_id"))
+    failed = len(summaries) - succeeded
+    if failed > 0:
+        print(f"[Index] Done: {succeeded}/{len(summaries)} indexed ({failed} failed)")
+    else:
+        print(f"[Index] Done: {succeeded}/{len(summaries)} indexed")
 
 
 # ── Pass 3: Review ─────────────────────────────────────────────────────────────
@@ -1356,6 +1365,9 @@ def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     print(f"\n[Pass 2] Done: {len(summaries)} summaries total "
           f"({completed[0]} new, {total_cached} cached, "
           f"{error_count[0]} errors, {refined_count[0]} refined)")
+    if _search_kb_failures > 0:
+        print(f"  [warn] {_search_kb_failures} RAG queries failed — "
+              f"is R2R running? (summaries were generated without KB context)")
     return summaries
 
 

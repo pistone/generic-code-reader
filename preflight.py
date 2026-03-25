@@ -3,7 +3,7 @@
 
 Usage:
     python preflight.py
-    python preflight.py --fix   # attempt to fix common issues
+    python preflight.py --skip-llm   # skip LLM connectivity test
 """
 
 import argparse
@@ -170,6 +170,25 @@ def check_r2r_config():
               "This file configures R2R embedding model and database")
 
 
+def check_docker():
+    """Docker is installed and running."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["docker", "info"], capture_output=True, timeout=5
+        )
+        if result.returncode == 0:
+            _ok("Docker is running")
+        else:
+            _fail("Docker is installed but not running",
+                  "Start Docker Desktop or run: sudo systemctl start docker")
+    except FileNotFoundError:
+        _fail("Docker not found",
+              "Install Docker: https://docs.docker.com/get-docker/")
+    except Exception as e:
+        _warn(f"Could not check Docker: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Preflight check: validate all prerequisites"
@@ -192,6 +211,7 @@ def main():
     check_dependencies()
 
     print("\nServices:")
+    check_docker()
     check_r2r()
     if not args.skip_llm:
         check_llm_connectivity()

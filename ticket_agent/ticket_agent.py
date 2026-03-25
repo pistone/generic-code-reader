@@ -35,6 +35,8 @@ RESOLVED_STATUSES = {"done", "closed", "resolved", "fixed", "complete"}
 REJECT_RESOLUTIONS = {"won't fix", "wontfix", "duplicate", "cannot reproduce",
                       "incomplete", "not a bug"}
 
+_dedup_warned = False
+
 
 # ---------------------------------------------------------------------------
 # Step 1: Load tickets
@@ -184,7 +186,10 @@ def dedup_against_kb(client: R2RClient, summary: str,
         if hits and getattr(hits[0], "score", 0) > threshold:
             return True
     except Exception:
-        pass
+        global _dedup_warned
+        if not _dedup_warned:
+            print("  [warn] R2R unreachable for dedup — duplicates may be indexed")
+            _dedup_warned = True
     return False
 
 
@@ -276,7 +281,11 @@ def main():
         if not summaries_path.exists():
             print(f"Error: {summaries_path} not found. Run extraction first.")
             sys.exit(1)
-        entries = json.loads(summaries_path.read_text())
+        try:
+            entries = json.loads(summaries_path.read_text())
+        except (json.JSONDecodeError, Exception) as e:
+            print(f"Error: {summaries_path} is corrupted: {e}")
+            sys.exit(1)
         print(f"Re-indexing {len(entries)} saved ticket summaries into R2R...")
         indexed = index_ticket_summaries(entries)
         print(f"[Done] {len(indexed)}/{len(entries)} entries indexed (no LLM calls)")

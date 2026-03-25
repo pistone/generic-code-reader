@@ -2,6 +2,25 @@
 
 A self-improving domain knowledge base for codebases. Indexes LLM-generated summaries into a vector database (R2R) and exposes them as an MCP server for Claude Code.
 
+> **What does this do?** Pre-analyzes your codebase with an LLM, creating a searchable knowledge base. Claude Code can then instantly answer questions about architecture, patterns, and implementation details — no more hours of manual code reading.
+
+### Quick Start
+
+```bash
+git clone <repo-url> && cd generic-code-reader
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env              # edit: set OPENAI_API_KEY (or your LLM provider key)
+source .env
+docker compose -f r2r/compose.yaml up -d
+python preflight.py               # verify everything works
+python indexer/study_agent.py --codebase /path/to/src --language python --dry-run  # estimate cost
+python indexer/study_agent.py --codebase /path/to/src --language python --passes 2
+# Done! Open Claude Code in this directory — search_codebase tool is ready.
+```
+
+For detailed options, see the full [Setup](#setup) section below.
+
 ## Architecture
 
 ```
@@ -17,6 +36,12 @@ codebase_shared/utils.py     → Shared utilities (TokenTracker, llm_call, llm_t
 
 The self-improving loop: when Claude can't find an answer in the KB, it researches manually and calls `suggest_index_item()`. The reviewer agent verifies the suggestion and promotes it into R2R, so the next developer gets an instant answer.
 
+## Prerequisites
+
+- **Python 3.10+**
+- **Docker** (for R2R vector database)
+- **LLM API key** — at least one of: OpenAI, Anthropic, Groq, or a local [Ollama](https://ollama.ai) install
+
 ## Setup
 
 ### 1. Clone and create virtualenv
@@ -26,9 +51,6 @@ git clone <repo-url> && cd generic-code-reader
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-
-# Verify everything is set up correctly
-python preflight.py
 ```
 
 ### 2. Configure API keys
@@ -54,7 +76,9 @@ R2R uses multiple embedding configurations internally (for indexing and rerankin
 ```bash
 source .env
 docker compose -f r2r/compose.yaml up -d
-# Verify: curl http://localhost:7272/v3/health
+
+# Verify everything is ready
+python preflight.py
 ```
 
 ### 4. (Optional) Index design documents
