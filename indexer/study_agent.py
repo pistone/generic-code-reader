@@ -377,9 +377,26 @@ def chunk_file(path: Path, language: str = "python") -> list[str]:
         return result or []
 
 
-# ── Function-level chunk grouping ──────────────────────────────────────────────
+# ── Class and function detection ───────────────────────────────────────────────
 
 import re as _re
+
+# Patterns for class/struct declarations across languages
+_CLASS_PATTERNS = [
+    # C++: class Foo : public Bar {  or  struct Foo {
+    _re.compile(r'^\s*(?:class|struct)\s+(\w+)\s*(?:final\s*)?(?::\s*(?:public|protected|private)\s+[\w:]+\s*(?:,\s*(?:public|protected|private)\s+[\w:]+\s*)*)?\s*\{', _re.MULTILINE),
+    # Python: class Foo(Bar):  or  class Foo:
+    _re.compile(r'^\s*class\s+(\w+)\s*(?:\([^)]*\))?\s*:', _re.MULTILINE),
+    # Java/C#: public class Foo extends Bar implements Baz {
+    _re.compile(r'^\s*(?:public|private|protected)?\s*(?:abstract|final|static)?\s*class\s+(\w+)', _re.MULTILINE),
+    # Rust: struct Foo { or impl Foo {
+    _re.compile(r'^\s*(?:pub\s+)?(?:struct|impl|trait|enum)\s+(\w+)', _re.MULTILINE),
+    # TypeScript/JavaScript: class Foo extends Bar {
+    _re.compile(r'^\s*(?:export\s+)?(?:abstract\s+)?class\s+(\w+)', _re.MULTILINE),
+]
+
+# Pattern for C++ ClassName::method — extracts the class name
+_CPP_CLASS_METHOD = _re.compile(r'(\w+)::(\w+)\s*\(')
 
 # Patterns for function/method signatures across supported languages
 _FUNC_SIG_PATTERNS = [
@@ -541,6 +558,161 @@ One sentence describing what this function does:"""
     await limiter.run_many(factories)
 
     return result
+
+
+# ── Class-level summaries ──────────────────────────────────────────────────────
+
+def _extract_class_name(chunk_text: str) -> Optional[str]:
+    """Extract a class/struct declaration name from a chunk."""
+    first_lines = "\n".join(chunk_text.splitlines()[:10])
+    for pattern in _CLASS_PATTERNS:
+        m = pattern.search(first_lines)
+        if m:
+            name = m.group(1)
+            if name.lower() not in _KEYWORDS:
+                return name
+    return None
+
+
+def _extract_class_from_methods(chunk_text: str) -> Optional[str]:
+    """Extract the owning class from C++ ClassName::method patterns."""
+    matches = _CPP_CLASS_METHOD.findall(chunk_text)
+    if not matches:
+        return None
+    # Count occurrences of each class name, return the most common
+    from collections import Counter
+    class_counts = Counter(cls for cls, _ in matches if cls.lower() not in _KEYWORDS)
+    if class_counts:
+        return class_counts.most_common(1)[0][0]
+    return None
+
+
+def _detect_classes_in_file(chunks: list[str], rel_path: str,
+                            codebase: Path) -> dict[str, str]:
+    """Detect classes referenced in a file's chunks.
+
+    Returns a dict mapping class_name → header snippet (first ~30 lines of
+    the class declaration). For C++, also looks up the .h file if chunks
+    contain ClassName::method patterns without a class declaration.
+    """
+    classes: dict[str, str] = {}  # class_name → declaration snippet
+
+    # 1. Find class declarations directly in the chunks
+    for chunk in chunks:
+        name = _extract_class_name(chunk)
+        if name and name not in classes:
+            # Grab the declaration context (from class line to ~30 lines after)
+            lines = chunk.splitlines()
+            for j, line in enumerate(lines):
+                if name in line and ("class " in line or "struct " in line):
+                    snippet = "\n".join(lines[j:j + 30])
+                    classes[name] = snippet
+                    break
+
+    # 2. For C++ method implementations (Foo::bar), find the class in headers
+    method_classes: set[str] = set()
+    for chunk in chunks:
+        cls = _extract_class_from_methods(chunk)
+        if cls and cls not in classes:
+            method_classes.add(cls)
+
+    # Look up header files for method classes
+    for cls_name in method_classes:
+        # Common patterns: ClassName.h, class_name.h, ClassName.hpp
+        candidates = [
+            f"{cls_name}.h", f"{cls_name}.hpp",
+            f"{cls_name.lower()}.h", f"{cls_name.lower()}.hpp",
+        ]
+        # Also try: convert CamelCase to snake_case
+        snake = _re.sub(r'(?<!^)(?=[A-Z])', '_', cls_name).lower()
+        if snake != cls_name.lower():
+            candidates.extend([f"{snake}.h", f"{snake}.hpp"])
+
+        for candidate in candidates:
+            match = _find_file(codebase, candidate)
+            if match:
+                content = read_file_sample(match, max_lines=60)
+                # Find the class declaration in the header
+                for pattern in _CLASS_PATTERNS:
+                    m = pattern.search(content)
+                    if m and m.group(1) == cls_name:
+                        # Grab from class line to ~30 lines after
+                        lines = content.splitlines()
+                        for j, line in enumerate(lines):
+                            if cls_name in line:
+                                classes[cls_name] = "\n".join(lines[j:j + 30])
+                                break
+                        break
+                if cls_name in classes:
+                    break
+
+    return classes
+
+
+CLASS_SUMMARY_SYSTEM = (
+    "You are a code analyst. Write 1-2 sentences describing what this class does "
+    "and its key responsibilities. Use the project's own vocabulary."
+)
+
+
+async def _generate_class_summaries(
+    model: str, classes: dict[str, str], rel_path: str,
+    file_summary: str, limiter: "AsyncRateLimiter",
+    tracker: Optional[TokenTracker] = None,
+) -> dict[str, str]:
+    """Generate summaries for classes found in a file.
+
+    Returns a dict mapping class_name → 1-2 sentence summary.
+    """
+    if not classes:
+        return {}
+
+    result: dict[str, str] = {}
+
+    async def _summarize_class(cls_name: str, snippet: str):
+        prompt = f"""File: {rel_path}
+{f'File purpose: {file_summary}' if file_summary else ''}
+
+Class/struct declaration:
+```
+{snippet[:2500]}
+```
+
+1-2 sentences describing what {cls_name} does and its key responsibilities:"""
+
+        try:
+            summary = await allm_call(model, CLASS_SUMMARY_SYSTEM, prompt,
+                                      max_tokens=100, tracker=tracker,
+                                      phase="Class summaries")
+            result[cls_name] = summary.strip()
+        except Exception:
+            pass
+
+    factories = [
+        (lambda cn=cls_name, sn=snippet: _summarize_class(cn, sn))
+        for cls_name, snippet in classes.items()
+    ]
+    await limiter.run_many(factories)
+    return result
+
+
+def _match_chunk_to_class(chunk_text: str, class_names: set[str]) -> Optional[str]:
+    """Determine which class a chunk belongs to.
+
+    Checks for: class declaration in chunk, ClassName::method patterns,
+    or self/this usage within a known class context.
+    """
+    # Direct class declaration
+    name = _extract_class_name(chunk_text)
+    if name and name in class_names:
+        return name
+
+    # C++ ClassName::method
+    cls = _extract_class_from_methods(chunk_text)
+    if cls and cls in class_names:
+        return cls
+
+    return None
 
 
 # ── R2R helpers (bootstrap, RAG search, auto-index) ───────────────────────────
@@ -1830,17 +2002,70 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         print(f"[Pass 2] Generated function context for {multi_chunk_count} "
               f"continuation chunks across {len(func_summaries)} multi-chunk functions")
 
+    # ── Generate class summaries ──────────────────────────────────────────
+    class_limiter = AsyncRateLimiter(
+        max_concurrent=max_concurrent, calls_per_minute=rpm,
+    )
+    # class_summaries: (rel_path, class_name) → summary string
+    class_summaries: dict[tuple[str, str], str] = {}
+    class_count = 0
+
+    for rel_path, chunks, mod in per_file_chunks:
+        classes = _detect_classes_in_file(chunks, rel_path, codebase)
+        if classes:
+            csums = await _generate_class_summaries(
+                model, classes, rel_path,
+                file_summaries.get(rel_path, ""),
+                limiter=class_limiter, tracker=tracker,
+            )
+            for cls_name, summary in csums.items():
+                class_summaries[(rel_path, cls_name)] = summary
+                class_count += 1
+
+    if class_count > 0:
+        print(f"[Pass 2] Generated summaries for {class_count} classes")
+
+    # Build global class summary lookup (class_name → summary)
+    # so chunks in .cpp files can find classes defined in .h files
+    global_class_summaries: dict[str, str] = {}
+    for (rp, cn), summary in class_summaries.items():
+        # Prefer longer summaries if same class found in multiple files
+        if cn not in global_class_summaries or len(summary) > len(global_class_summaries[cn]):
+            global_class_summaries[cn] = summary
+
+    # Per-file class names for direct matching
+    file_class_names: dict[str, set[str]] = {}
+    for (rp, cn) in class_summaries:
+        file_class_names.setdefault(rp, set()).add(cn)
+
     # ── Build work items ──────────────────────────────────────────────────
     for rel_path, chunks, mod in per_file_chunks:
         for i, chunk in enumerate(chunks):
             chunk_key = _make_chunk_key(rel_path, i)
             if chunk_key in done_keys:
                 continue
-            # Combine file summary + function context
-            context = file_summaries.get(rel_path, "")
+            # Combine file summary + class context + function context
+            context_parts: list[str] = []
+            fs = file_summaries.get(rel_path, "")
+            if fs:
+                context_parts.append(fs)
+
+            # Match chunk to a class and inject class summary
+            # First check classes found in this file, then global lookup
+            # (handles .cpp files referencing classes defined in .h files)
+            all_known = file_class_names.get(rel_path, set()) | set(global_class_summaries.keys())
+            if all_known:
+                cls = _match_chunk_to_class(chunk, all_known)
+                if cls:
+                    cls_summary = (class_summaries.get((rel_path, cls), "")
+                                   or global_class_summaries.get(cls, ""))
+                    if cls_summary:
+                        context_parts.append(f"Class {cls}: {cls_summary}")
+
             func_ctx = func_summaries.get((rel_path, i), "")
             if func_ctx:
-                context = f"{context}\n{func_ctx}" if context else func_ctx
+                context_parts.append(func_ctx)
+
             work_items.append({
                 "mod_name": mod.name,
                 "mod_desc": mod.description,
@@ -1848,7 +2073,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                 "rel_path": rel_path,
                 "chunk": chunk,
                 "chunk_index": i,
-                "file_summary": context,
+                "file_summary": "\n".join(context_parts),
             })
 
     # ── Dedup near-identical chunks (boilerplate, generated code) ────────
@@ -2059,6 +2284,9 @@ def main():
         # Function summaries estimate: ~20% of chunks are continuations, ~400 tok each
         func_summary_tokens = int(est_chunks * 0.2 * 400)
         est_total += func_summary_tokens
+        # Class summaries estimate: ~1 class per 5 files, ~500 tok each
+        class_summary_tokens = int(len(files) / 5 * 500)
+        est_total += class_summary_tokens
         # Pass 1 estimate
         pass1_tokens = 50000  # rough estimate for agent loop
         est_total += pass1_tokens
@@ -2073,6 +2301,7 @@ def main():
         print(f"  Est. Pass 1:       ~{pass1_tokens:,} tokens")
         print(f"  Est. file summaries: ~{file_summary_tokens:,} tokens ({len(files):,} files × ~500 tok)")
         print(f"  Est. func summaries: ~{func_summary_tokens:,} tokens (~20% multi-chunk functions)")
+        print(f"  Est. class summaries: ~{class_summary_tokens:,} tokens (~1 class per 5 files)")
         print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
         print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
         print(f"  Est. total tokens: ~{est_total:,}")
