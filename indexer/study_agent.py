@@ -1732,6 +1732,45 @@ async def _generate_file_summaries(
     return results
 
 
+def _classify_chunk(chunk_text: str) -> tuple[str, Optional[str]]:
+    """Classify a chunk and extract the primary symbol name.
+
+    Returns (chunk_type, symbol_name_or_none).
+    chunk_type is one of: "class_definition", "method_implementation",
+    "function_implementation", "file_level_code".
+    """
+    cls = _extract_class_name(chunk_text)
+    if cls:
+        return ("class_definition", cls)
+
+    func = _extract_function_name(chunk_text)
+    if func:
+        if "::" in func:
+            return ("method_implementation", func)
+        return ("function_implementation", func)
+
+    # Check for class method patterns without a clear signature on line 1
+    cls_from_methods = _extract_class_from_methods(chunk_text)
+    if cls_from_methods:
+        func = _extract_function_name(chunk_text)
+        label = f"{cls_from_methods}::{func}" if func else cls_from_methods
+        return ("method_implementation", label)
+
+    return ("file_level_code", None)
+
+
+def _prefix_summary(summary: str, chunk_type: str,
+                    symbol_name: Optional[str]) -> str:
+    """Prepend symbol name to summary if not already present."""
+    if not symbol_name:
+        return summary
+    # Don't double-prefix if LLM already included the name
+    if symbol_name in summary[:80]:
+        return summary
+    # Format: "ClassName::method — <summary>"
+    return f"{symbol_name} — {summary}"
+
+
 def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
                           mod_name: str, mod_desc: str, questions: list[str],
                           rel_path: str, chunk: str, chunk_index: int,
@@ -1768,12 +1807,15 @@ def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
             summary_text = improved
             refined = True
 
+    chunk_type, symbol_name = _classify_chunk(chunk)
+    summary_text = _prefix_summary(summary_text, chunk_type, symbol_name)
+
     return {
         "summary":     summary_text,
         "raw_code":    chunk,
         "source_file": rel_path,
         "module":      mod_name,
-        "chunk_type":  "function_summary",
+        "chunk_type":  chunk_type,
         "chunk_index": chunk_index,
         "refined":     refined,
     }
@@ -1900,12 +1942,15 @@ async def _async_summarize_one_chunk(
             summary_text = improved
             refined = True
 
+    chunk_type, symbol_name = _classify_chunk(chunk)
+    summary_text = _prefix_summary(summary_text, chunk_type, symbol_name)
+
     return {
         "summary":     summary_text,
         "raw_code":    chunk,
         "source_file": rel_path,
         "module":      mod_name,
-        "chunk_type":  "function_summary",
+        "chunk_type":  chunk_type,
         "chunk_index": chunk_index,
         "refined":     refined,
     }
@@ -2168,13 +2213,47 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
 
     await limiter.run_many(factories, on_result=on_result, on_error=on_error)
 
+    # ── Append file and class overview summaries for indexing ────────────
+    overview_count = 0
+    for rel_path, _chunks, mod in per_file_chunks:
+        fs = file_summaries.get(rel_path, "")
+        if fs:
+            summaries.append({
+                "summary": f"[File overview: {rel_path}] {fs}",
+                "raw_code": "",
+                "source_file": rel_path,
+                "module": mod.name,
+                "chunk_type": "file_overview",
+                "chunk_index": -1,
+            })
+            overview_count += 1
+
+    for (rel_path, cls_name), cls_summary in class_summaries.items():
+        if cls_summary:
+            # Find the module for this file
+            mod_name = ""
+            for rp, _ch, mod in per_file_chunks:
+                if rp == rel_path:
+                    mod_name = mod.name
+                    break
+            summaries.append({
+                "summary": f"[Class overview: {cls_name} in {rel_path}] {cls_summary}",
+                "raw_code": "",
+                "source_file": rel_path,
+                "module": mod_name,
+                "chunk_type": "class_overview",
+                "chunk_index": -2,
+            })
+            overview_count += 1
+
     # Final write
     if summaries_path:
         summaries_path.write_text(json.dumps(summaries, indent=2))
 
     print(f"\n[Pass 2] Done: {len(summaries)} summaries total "
           f"({completed_count} new, {total_cached} cached, "
-          f"{error_count} errors, {refined_count} refined)")
+          f"{error_count} errors, {refined_count} refined, "
+          f"{overview_count} overviews)")
     if _search_kb_failures > 0:
         print(f"  [warn] {_search_kb_failures} RAG queries failed — "
               f"is R2R running? (summaries were generated without KB context)")
