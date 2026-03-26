@@ -377,6 +377,172 @@ def chunk_file(path: Path, language: str = "python") -> list[str]:
         return result or []
 
 
+# ── Function-level chunk grouping ──────────────────────────────────────────────
+
+import re as _re
+
+# Patterns for function/method signatures across supported languages
+_FUNC_SIG_PATTERNS = [
+    # C/C++: return_type func_name(args) { or ::method(args) {
+    _re.compile(r'^\s*(?:[\w:*&<>,\s]+?)\s+(\w[\w:]*)\s*\([^)]*\)\s*(?:const)?\s*\{?\s*$', _re.MULTILINE),
+    # Python: def func_name(args):
+    _re.compile(r'^\s*(?:async\s+)?def\s+(\w+)\s*\(', _re.MULTILINE),
+    # Java/Go/Rust: func/fn/public void method_name(
+    _re.compile(r'^\s*(?:pub(?:lic)?\s+)?(?:static\s+)?(?:func|fn)\s+(\w+)\s*[(<]', _re.MULTILINE),
+    # JavaScript/TypeScript: function name( or async function name( or name(
+    _re.compile(r'^\s*(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*\(', _re.MULTILINE),
+    # Class methods: public/private/protected Type method_name(
+    _re.compile(r'^\s*(?:public|private|protected)\s+[\w<>\[\],\s]+\s+(\w+)\s*\(', _re.MULTILINE),
+]
+
+
+_KEYWORDS = frozenset({
+    "if", "else", "for", "while", "do", "switch", "case", "return", "break",
+    "continue", "try", "catch", "throw", "new", "delete", "class", "struct",
+    "enum", "typedef", "namespace", "using", "template", "typename", "const",
+    "static", "virtual", "override", "final", "auto", "register", "volatile",
+    "extern", "inline", "sizeof", "true", "false", "null", "nullptr", "this",
+    "self", "import", "from", "with", "as", "in", "is", "not", "and", "or",
+    "var", "let", "const", "elif", "except", "finally", "raise", "yield",
+    "lambda", "pass", "assert", "global", "nonlocal", "del",
+})
+
+
+def _extract_function_name(chunk_text: str) -> Optional[str]:
+    """Extract the primary function/method name from the first few lines of a chunk.
+
+    Looks at the first 5 lines for a function signature. Returns the function
+    name or None if no clear signature is found.
+    """
+    # Only look at first 5 lines to find the enclosing function
+    first_lines = "\n".join(chunk_text.splitlines()[:5])
+
+    for pattern in _FUNC_SIG_PATTERNS:
+        m = pattern.search(first_lines)
+        if m:
+            name = m.group(1)
+            # Filter out language keywords that matched the pattern
+            bare_name = name.split("::")[-1] if "::" in name else name
+            if bare_name.lower() in _KEYWORDS:
+                continue
+            return name
+    return None
+
+
+def _group_chunks_by_function(chunks: list[str]) -> list[list[int]]:
+    """Group consecutive chunk indices that belong to the same function.
+
+    Returns a list of groups, where each group is a list of chunk indices.
+    Single-chunk functions get a group of [i]. Multi-chunk functions get
+    [i, i+1, i+2, ...].
+
+    Detection heuristic: if chunk N+1 starts with indented code (no new
+    function signature at indent level 0) AND the overlap region matches
+    the end of chunk N, it's a continuation.
+    """
+    if not chunks:
+        return []
+
+    func_names = [_extract_function_name(c) for c in chunks]
+    groups: list[list[int]] = []
+    current_group: list[int] = [0]
+
+    for i in range(1, len(chunks)):
+        # Check if this chunk continues the same function as the previous
+        is_continuation = False
+
+        if func_names[i] and func_names[i - 1]:
+            # Same function name in consecutive chunks = continuation
+            if func_names[i] == func_names[i - 1]:
+                is_continuation = True
+
+        if not is_continuation:
+            # Check overlap: if the first lines of this chunk appear at the
+            # end of the previous chunk, CodeSplitter split mid-function
+            overlap_lines = chunks[i].splitlines()[:CHUNK_LINES_OVERLAP]
+            if overlap_lines:
+                prev_end = "\n".join(chunks[i - 1].splitlines()[-CHUNK_LINES_OVERLAP:])
+                overlap_text = "\n".join(overlap_lines)
+                if overlap_text.strip() and overlap_text.strip() in prev_end:
+                    # Has overlap AND first non-overlap line is indented
+                    # (still inside a function body)
+                    non_overlap = chunks[i].splitlines()[CHUNK_LINES_OVERLAP:]
+                    if non_overlap and non_overlap[0].startswith((" ", "\t")):
+                        is_continuation = True
+
+        if is_continuation:
+            current_group.append(i)
+        else:
+            groups.append(current_group)
+            current_group = [i]
+
+    groups.append(current_group)
+    return groups
+
+
+FUNC_SUMMARY_SYSTEM = (
+    "You are a code analyst. Write a single sentence describing what this "
+    "function/method does. Use specific names and domain concepts."
+)
+
+
+async def _generate_function_summaries(
+    model: str, chunks: list[str], groups: list[list[int]],
+    rel_path: str, file_summary: str,
+    limiter: "AsyncRateLimiter",
+    tracker: Optional[TokenTracker] = None,
+) -> dict[int, str]:
+    """Generate function summaries for multi-chunk functions.
+
+    Returns a dict mapping chunk_index → function summary string.
+    Only chunks that are continuations (index > 0 within their group) get entries.
+    The first chunk of each group doesn't need a function summary — it contains
+    the function signature and opening context.
+    """
+    # Identify multi-chunk groups
+    multi_groups = [g for g in groups if len(g) > 1]
+    if not multi_groups:
+        return {}
+
+    result: dict[int, str] = {}
+
+    async def _summarize_group(group: list[int]):
+        """Generate summary from the first chunk, apply to remaining chunks."""
+        first_chunk = chunks[group[0]]
+        func_name = _extract_function_name(first_chunk) or "unknown"
+
+        prompt = f"""File: {rel_path}
+{f'File purpose: {file_summary}' if file_summary else ''}
+Function: {func_name}
+
+```
+{first_chunk[:3000]}
+```
+
+One sentence describing what this function does:"""
+
+        try:
+            summary = await allm_call(model, FUNC_SUMMARY_SYSTEM, prompt,
+                                      max_tokens=80, tracker=tracker,
+                                      phase="Func summaries")
+            summary = summary.strip()
+            # Apply to all continuation chunks (not the first one)
+            for idx in group[1:]:
+                result[idx] = f"[Continuation of {func_name}()] {summary}"
+        except Exception:
+            # Fallback: just note it's a continuation
+            for idx in group[1:]:
+                result[idx] = f"[Continuation of {func_name}()]"
+
+    factories = [
+        (lambda g=group: _summarize_group(g))
+        for group in multi_groups
+    ]
+    await limiter.run_many(factories)
+
+    return result
+
+
 # ── R2R helpers (bootstrap, RAG search, auto-index) ───────────────────────────
 
 def _r2r_client():
@@ -1610,9 +1776,11 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         max_concurrent=max_concurrent, rpm=rpm, tracker=tracker, quiet=quiet,
     )
 
-    # ── Collect work items ────────────────────────────────────────────────
+    # ── Collect chunks and detect multi-chunk functions ──────────────────
     work_items: list[dict] = []
     skipped = 0
+    # Collect per-file chunk data for function grouping
+    per_file_chunks: list[tuple[str, list[str], "ModuleDefinition"]] = []
 
     rag_label = " (RAG-augmented)" if rag else ""
     print(f"\n[Pass 2] Collecting chunks from {len(module_map.modules)} modules{rag_label}...")
@@ -1634,20 +1802,54 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                 continue
 
             rel_path = str(fpath.relative_to(codebase))
+            per_file_chunks.append((rel_path, chunks, mod))
 
-            for i, chunk in enumerate(chunks):
-                chunk_key = _make_chunk_key(rel_path, i)
-                if chunk_key in done_keys:
-                    continue
-                work_items.append({
-                    "mod_name": mod.name,
-                    "mod_desc": mod.description,
-                    "questions": mod.questions,
-                    "rel_path": rel_path,
-                    "chunk": chunk,
-                    "chunk_index": i,
-                    "file_summary": file_summaries.get(rel_path, ""),
-                })
+    # ── Generate function summaries for multi-chunk functions ─────────
+    func_limiter = AsyncRateLimiter(
+        max_concurrent=max_concurrent, calls_per_minute=rpm,
+    )
+    # func_summaries: (rel_path, chunk_index) → function context string
+    func_summaries: dict[tuple[str, int], str] = {}
+    multi_chunk_count = 0
+
+    for rel_path, chunks, mod in per_file_chunks:
+        if len(chunks) > 1:
+            groups = _group_chunks_by_function(chunks)
+            multi_groups = [g for g in groups if len(g) > 1]
+            if multi_groups:
+                multi_chunk_count += sum(len(g) - 1 for g in multi_groups)
+                fsums = await _generate_function_summaries(
+                    model, chunks, groups, rel_path,
+                    file_summaries.get(rel_path, ""),
+                    limiter=func_limiter, tracker=tracker,
+                )
+                for chunk_idx, summary in fsums.items():
+                    func_summaries[(rel_path, chunk_idx)] = summary
+
+    if multi_chunk_count > 0:
+        print(f"[Pass 2] Generated function context for {multi_chunk_count} "
+              f"continuation chunks across {len(func_summaries)} multi-chunk functions")
+
+    # ── Build work items ──────────────────────────────────────────────────
+    for rel_path, chunks, mod in per_file_chunks:
+        for i, chunk in enumerate(chunks):
+            chunk_key = _make_chunk_key(rel_path, i)
+            if chunk_key in done_keys:
+                continue
+            # Combine file summary + function context
+            context = file_summaries.get(rel_path, "")
+            func_ctx = func_summaries.get((rel_path, i), "")
+            if func_ctx:
+                context = f"{context}\n{func_ctx}" if context else func_ctx
+            work_items.append({
+                "mod_name": mod.name,
+                "mod_desc": mod.description,
+                "questions": mod.questions,
+                "rel_path": rel_path,
+                "chunk": chunk,
+                "chunk_index": i,
+                "file_summary": context,
+            })
 
     # ── Dedup near-identical chunks (boilerplate, generated code) ────────
     def _chunk_signature(text: str, n: int = 3) -> frozenset:
@@ -1854,6 +2056,9 @@ def main():
         # File summaries estimate: ~500 tokens per file (prompt + completion)
         file_summary_tokens = len(files) * 500
         est_total += file_summary_tokens
+        # Function summaries estimate: ~20% of chunks are continuations, ~400 tok each
+        func_summary_tokens = int(est_chunks * 0.2 * 400)
+        est_total += func_summary_tokens
         # Pass 1 estimate
         pass1_tokens = 50000  # rough estimate for agent loop
         est_total += pass1_tokens
@@ -1867,6 +2072,7 @@ def main():
         print(f"  Est. chunks:       ~{est_chunks:,} (avg 3/file)")
         print(f"  Est. Pass 1:       ~{pass1_tokens:,} tokens")
         print(f"  Est. file summaries: ~{file_summary_tokens:,} tokens ({len(files):,} files × ~500 tok)")
+        print(f"  Est. func summaries: ~{func_summary_tokens:,} tokens (~20% multi-chunk functions)")
         print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
         print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
         print(f"  Est. total tokens: ~{est_total:,}")
