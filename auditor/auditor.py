@@ -145,7 +145,10 @@ def check_timestamp_staleness(doc_last_modified: str,
     if doc_dt is None:
         # No timestamp → can't determine, flag conservatively
         return True
-    now = datetime.now(tz=doc_dt.tzinfo if doc_dt.tzinfo else None)
+    # Normalize both to UTC to avoid naive-vs-aware comparison
+    if doc_dt.tzinfo is None:
+        doc_dt = doc_dt.replace(tzinfo=timezone.utc)
+    now = datetime.now(tz=timezone.utc)
     age_days = (now - doc_dt).days
     return age_days > threshold_days
 
@@ -193,7 +196,9 @@ def llm_compare(model: str, doc_file: str, doc_text: str,
             "explanation": str(result.get("explanation", "")),
         }
     except (json.JSONDecodeError, TypeError):
-        return {"consistent": True, "explanation": ""}
+        # Flag as inconsistent when we can't parse — conservative approach
+        return {"consistent": False,
+                "explanation": "LLM response was unparseable; flagging for manual review"}
 
 
 # ---------------------------------------------------------------------------
@@ -307,7 +312,7 @@ def main():
                         default=DEFAULT_THRESHOLD_DAYS,
                         help="Flag docs older than this many days "
                              "(default: %(default)s)")
-    parser.add_argument("--output", default=None,
+    parser.add_argument("--output", "--output-dir", default=None,
                         help="Path for conflict report JSON "
                              "(default: auditor/conflict_report.json)")
     parser.add_argument("--verbose", action="store_true",

@@ -114,13 +114,24 @@ and other prose documents into R2R.  It runs **before** the study agent
 so code summarization can pull doc knowledge via RAG.
 
 ```
-python -m doc_agent.doc_agent --docs /path/to/docs
+python -m doc_agent.doc_agent --docs /path/to/docs --model openai/gpt-4o-mini
+python -m doc_agent.doc_agent --docs /path/to/docs --no-summarize  # raw text only
 ```
 
 Architecture: pluggable sources (LocalFileSource, future: SharePoint,
 Confluence) → file-type parsers (Markdown, HTML, PDF, plain text) →
-section-aware chunking → direct R2R indexing of raw text.  No LLM
-calls needed — docs are already human-readable prose.
+section-aware chunking → LLM summarization with `source_kind`
+classification → R2R indexing.
+
+Each chunk is classified by `source_kind`:
+- `specification` — API contracts, formats, protocols
+- `rationale` — design decision explanations
+- `tutorial` — step-by-step instructions
+- `operational` — runbooks, deployment, troubleshooting
+- `reference` — API reference, parameter lists
+- `overview` — high-level architecture descriptions
+
+Use `--no-summarize` to skip LLM and index raw text (faster, cheaper).
 
 The study agent's `--bootstrap-docs` flag is deprecated in favor of
 doc_agent, which provides section-aware chunking, heading extraction,
@@ -161,8 +172,19 @@ Registered via `.mcp.json`:
 }
 ```
 
-Two tools: `search_codebase(query, module, source_type)` with hybrid search
-and source-type filtering ("code"/"doc"/"ticket"), and
+Two tools:
+
+`search_codebase(query, module, source_type, scope)` — hybrid search with:
+- `source_type` filter: "code"/"doc"/"ticket"
+- `scope` parameter for intent-based prioritization:
+  - `"implementation"` — boosts code results
+  - `"rationale"` — boosts docs/tickets with design rationale
+  - `"howto"` — boosts tutorials and operational guides
+  - `"troubleshooting"` — boosts tickets with workarounds/root causes
+  - `"architecture"` — boosts file/class overviews
+- Cross-source linking: when results come from one source type,
+  automatically checks for related knowledge in other sources
+
 `suggest_index_item(topic, summary, source_files, reasoning, raw_code, module)`.
 Logs every query to `mcp_server/query_log.jsonl`.
 
@@ -221,10 +243,12 @@ generic-code-reader/
 Runtime artifacts (gitignored):
 - `indexer/module_map.json` — Pass 1 output
 - `indexer/summaries.json` — Pass 2 output
+- `indexer/context_cache.json` — cached file/class/function summaries for resume
 - `indexer/file_hashes.json` — incremental change manifest
 - `indexer/cost_log.jsonl` — token usage log
 - `ticket_agent/ticket_summaries.json` — ticket agent output
 - `doc_agent/doc_hashes.json` — doc incremental change manifest
+- `doc_agent/cost_log.jsonl` — doc agent token usage log
 - `auditor/conflict_report.json` — doc↔code conflict report
 - `auditor/cost_log.jsonl` — auditor token usage log
 - `ticket_agent/ticket_hashes.json` — ticket incremental manifest

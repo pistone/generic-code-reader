@@ -59,7 +59,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from codebase_shared.utils import (  # noqa: E402
     TokenTracker, llm_call, allm_call, llm_tool_loop,
     RateLimitedExecutor, AsyncRateLimiter,
+    detect_rpm_from_proxy,
 )
+try:
+    from codebase_shared.colors import green, yellow, red, bold, dim, ok, warn, err  # noqa: E402
+except ImportError:
+    green = yellow = red = bold = dim = ok = warn = err = lambda x: x  # type: ignore
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -91,6 +96,7 @@ SKIP_TEST_DIRS = {"test", "tests", "testing", "test_data", "testdata",
                   "testcases", "test_fixtures", "fixtures"}
 
 _search_kb_failures = 0
+_quota_exhausted = False  # module-level flag, set when any phase hits quota
 
 # Cache for file lookups to avoid repeated rglob walks
 _file_index_cache: dict[Path, dict[str, list[Path]]] = {}
@@ -126,6 +132,52 @@ class ModuleMap(BaseModel):
 # llm_call imported from codebase_shared.utils
 
 # ── File utilities ─────────────────────────────────────────────────────────────
+
+LANG_EXT_MAP = {
+    "python": {".py"},
+    "javascript": {".js", ".mjs"},
+    "typescript": {".ts", ".tsx"},
+    "cpp": {".cpp", ".cc", ".cxx", ".h", ".hpp"},
+    "java": {".java"},
+    "go": {".go"},
+    "rust": {".rs"},
+}
+
+# Reverse map: extension → language
+_EXT_TO_LANG: dict[str, str] = {}
+for _lang, _exts in LANG_EXT_MAP.items():
+    for _ext in _exts:
+        _EXT_TO_LANG[_ext] = _lang
+
+
+def detect_language(codebase: Path) -> Optional[str]:
+    """Auto-detect the dominant language by counting file extensions.
+
+    Scans the top 3 directory levels (fast) and returns the language
+    with the most files, or None if no known language found.
+    """
+    counts: dict[str, int] = {}
+    for p in codebase.rglob("*"):
+        if not p.is_file():
+            continue
+        # Skip build/vendor dirs
+        if any(part in SKIP_DIRS for part in p.parts):
+            continue
+        lang = _EXT_TO_LANG.get(p.suffix)
+        if lang:
+            counts[lang] = counts.get(lang, 0) + 1
+    if not counts:
+        return None
+    winner = max(counts, key=counts.get)  # type: ignore[arg-type]
+    total = counts[winner]
+    # Report detection
+    runner_up = sorted(((c, l) for l, c in counts.items() if l != winner), reverse=True)
+    detail = f"{total} files"
+    if runner_up:
+        detail += f", also found {runner_up[0][1]}({runner_up[0][0]})"
+    print(f"{green('[Auto]')} Detected language: {bold(winner)} ({detail})")
+    return winner
+
 
 def collect_source_files(codebase: Path, language: str = "python",
                          include_tests: bool = False) -> list[Path]:
@@ -967,7 +1019,7 @@ async def _async_review_one_summary(model: str, entry: dict,
                                      tracker: Optional[TokenTracker] = None) -> tuple[bool, str]:
     """Async review of a single summary. Returns (was_edited, new_summary)."""
     query = f"{entry.get('module', '')} {entry.get('summary', '')[:120]}"
-    kb_context = search_kb(query, limit=3)
+    kb_context = await asyncio.to_thread(search_kb, query, 3)
     prompt = _build_review_prompt(entry, kb_context)
 
     raw = await allm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512,
@@ -1310,22 +1362,36 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     # Create dispatcher
     dispatch = _make_pass1_dispatch(codebase, files, language)
 
-    # Logging callback
+    # Logging callback — user-friendly progress
+    _explored_dirs: list[str] = []
+    _files_read = 0
+    _modules_so_far = 0
+
     def on_round(round_num: int, tool_name: str, args: dict):
+        nonlocal _files_read, _modules_so_far
         if tool_name == "expand_dirs":
-            print(f"  Round {round_num}: expand_dirs({args.get('dirs', [])})")
+            dirs = args.get("dirs", [])
+            _explored_dirs.extend(dirs)
+            area = dirs[0] if dirs else "..."
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Exploring {area}/ "
+                  f"({len(_explored_dirs)} dirs explored)")
         elif tool_name == "list_files":
-            print(f"  Round {round_num}: list_files({args.get('dir_path', '?')})")
+            dir_path = args.get("dir_path", "?")
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Listing {dir_path}/")
         elif tool_name == "read_files":
             paths = args.get("paths", [])
-            print(f"  Round {round_num}: read_files({len(paths)} files)")
+            _files_read += len(paths)
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Reading {len(paths)} files "
+                  f"({_files_read} total read)")
         elif tool_name == "search_kb":
-            print(f"  Round {round_num}: search_kb({args.get('query', '?')[:60]})")
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Searching KB: "
+                  f"{args.get('query', '?')[:50]}")
         elif tool_name == "define_modules":
             n = len(args.get("modules", []))
-            print(f"  Round {round_num}: define_modules({n} modules)")
+            _modules_so_far = n
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Defining {n} modules")
 
-    print(f"[Pass 1] Starting agent exploration with {model}...")
+    print(f"[Pass 1] Exploring codebase structure with {model}...")
 
     conversation, terminal_args = llm_tool_loop(
         model=model,
@@ -1485,111 +1551,6 @@ def _needs_reference_resolution(summary: str) -> Optional[str]:
     return None
 
 
-def _resolve_references(model: str, summary: str, raw_code: str,
-                         codebase: Path, rel_path: str,
-                         tracker: Optional[TokenTracker] = None) -> str:
-    """Try to resolve vague references in a summary by reading referenced files.
-
-    Extracts identifiers from the code chunk that look like cross-file references
-    (includes, imports, class prefixes), reads those files, and re-generates the
-    summary with extra context. Returns the improved summary, or the original
-    if resolution fails or finds nothing useful.
-    """
-    import re
-
-    # Extract cross-file references from the code
-    refs: list[str] = []
-
-    # C/C++ includes
-    for m in re.finditer(r'#include\s*[<"]([^>"]+)[>"]', raw_code):
-        refs.append(m.group(1))
-
-    # Python/JS imports
-    for m in re.finditer(r'(?:from|import)\s+([\w.]+)', raw_code):
-        refs.append(m.group(1).replace(".", "/"))
-
-    # Class::Method or Namespace::Class patterns (C++)
-    for m in re.finditer(r'(\w+)::\w+', raw_code):
-        refs.append(m.group(1))
-
-    if not refs:
-        return summary
-
-    # Try to read referenced files (up to 3)
-    extra_context_parts: list[str] = []
-    seen: set[str] = set()
-    for ref in refs[:6]:
-        if ref in seen:
-            continue
-        seen.add(ref)
-
-        # Try direct path
-        ref_path = codebase / ref
-        if not ref_path.exists():
-            # Try common patterns: same directory, .h/.hpp extension
-            parent = (codebase / rel_path).parent
-            for candidate in [parent / ref, parent / (ref + ".h"),
-                              parent / (ref + ".hpp")]:
-                if candidate.exists():
-                    ref_path = candidate
-                    break
-            else:
-                # Try cached file index on the basename
-                basename = Path(ref).name
-                match = _find_file(codebase, basename)
-                if not match:
-                    match = _find_file(codebase, basename + ".h")
-                if not match:
-                    match = _find_file(codebase, basename + ".hpp")
-                candidates = [match] if match else []
-                if candidates:
-                    ref_path = candidates[0]
-                else:
-                    continue
-
-        if ref_path.exists() and ref_path.is_file():
-            content = read_file_sample(ref_path, max_lines=40)
-            if len(content.strip()) > 20:
-                extra_context_parts.append(
-                    f"[{ref_path.relative_to(codebase)}]\n{content}"
-                )
-                if len(extra_context_parts) >= 3:
-                    break
-
-    if not extra_context_parts:
-        return summary
-
-    # Re-generate with extra context
-    extra_context = "\n\n".join(extra_context_parts)
-    refine_prompt = f"""The following summary of a code chunk has vague references.
-Rewrite it to be more specific using the referenced source files provided below.
-
-Original summary:
-{summary}
-
-Code chunk:
-```
-{raw_code[:2000]}
-```
-
-Referenced files:
-{extra_context}
-
-Write an improved 2-4 sentence summary. Be specific about what the referenced
-code does. Plain prose only."""
-
-    try:
-        improved = llm_call(model, PASS2_SYSTEM, refine_prompt,
-                            max_tokens=256,
-                            tracker=tracker, phase="Pass 2 (refine)")
-        improved = improved.strip()
-        if improved and len(improved) > 20:
-            return improved
-    except Exception:
-        pass
-
-    return summary
-
 def build_pass2_prompt(project_desc: str, module_name: str,
                        module_desc: str, questions: list[str],
                        source_file: str, raw_code: str,
@@ -1630,6 +1591,11 @@ Summary:"""
 def _make_chunk_key(source_file: str, chunk_index: int) -> str:
     """Unique key for a chunk, used to detect already-summarized chunks on resume."""
     return f"{source_file}::{chunk_index}"
+
+
+def _chunk_content_hash(text: str) -> str:
+    """Short hash of chunk content, used to verify chunk hasn't shifted on resume."""
+    return hashlib.sha256(text.encode()).hexdigest()[:12]
 
 
 # ── File-level summaries (pre-Pass 2) ────────────────────────────────────────
@@ -1728,7 +1694,13 @@ async def _generate_file_summaries(
     ]
 
     await limiter.run_many(factories, on_result=on_result, on_error=on_error)
-    print(f"[File summaries] Done: {len(results)}/{n} files summarized")
+    if limiter.quota_exhausted:
+        global _quota_exhausted
+        _quota_exhausted = True
+        print(f"[File summaries] ⚠ Quota exhausted after {len(results)}/{n} "
+              f"file summaries. Saving progress.")
+    else:
+        print(f"[File summaries] Done: {len(results)}/{n} files summarized")
     return results
 
 
@@ -1771,63 +1743,10 @@ def _prefix_summary(summary: str, chunk_type: str,
     return f"{symbol_name} — {summary}"
 
 
-def _summarize_one_chunk(model: str, codebase: Path, project_desc: str,
-                          mod_name: str, mod_desc: str, questions: list[str],
-                          rel_path: str, chunk: str, chunk_index: int,
-                          rag: bool = False,
-                          file_summary: str = "",
-                          tracker: Optional[TokenTracker] = None) -> dict:
-    """Summarize a single code chunk (sync, legacy). Runs in a worker thread."""
-    kb_context = search_kb(f"{mod_name} {chunk[:200]}", limit=3) if rag else ""
-    prompt = build_pass2_prompt(
-        project_desc=project_desc,
-        module_name=mod_name,
-        module_desc=mod_desc,
-        questions=questions,
-        source_file=rel_path,
-        raw_code=chunk,
-        kb_context=kb_context,
-        file_summary=file_summary,
-    )
 
-    summary_text = llm_call(model, PASS2_SYSTEM, prompt, max_tokens=512,
-                            tracker=tracker, phase="Pass 2")
-    summary_text = summary_text.strip()
-    if summary_text.lower().startswith("summary:"):
-        summary_text = summary_text[len("summary:"):].strip()
-
-    refined = False
-    vague = _needs_reference_resolution(summary_text)
-    if vague:
-        improved = _resolve_references(
-            model, summary_text, chunk, codebase, rel_path,
-            tracker=tracker,
-        )
-        if improved != summary_text:
-            summary_text = improved
-            refined = True
-
-    chunk_type, symbol_name = _classify_chunk(chunk)
-    summary_text = _prefix_summary(summary_text, chunk_type, symbol_name)
-
-    return {
-        "summary":     summary_text,
-        "raw_code":    chunk,
-        "source_file": rel_path,
-        "module":      mod_name,
-        "chunk_type":  chunk_type,
-        "chunk_index": chunk_index,
-        "refined":     refined,
-    }
-
-
-async def _async_resolve_references(model: str, summary: str, raw_code: str,
-                                     codebase: Path, rel_path: str,
-                                     tracker: Optional[TokenTracker] = None) -> str:
-    """Async version of _resolve_references. File I/O is sync (fast from cache),
-    only the LLM call is awaited."""
+def _extract_cross_file_refs(raw_code: str) -> list[str]:
+    """Extract cross-file references from code (includes, imports, namespaces)."""
     import re
-
     refs: list[str] = []
     for m in re.finditer(r'#include\s*[<"]([^>"]+)[>"]', raw_code):
         refs.append(m.group(1))
@@ -1835,49 +1754,58 @@ async def _async_resolve_references(model: str, summary: str, raw_code: str,
         refs.append(m.group(1).replace(".", "/"))
     for m in re.finditer(r'(\w+)::\w+', raw_code):
         refs.append(m.group(1))
+    return refs
 
+
+def _resolve_ref_to_path(ref: str, codebase: Path, rel_path: str) -> Optional[Path]:
+    """Try to resolve a cross-file reference to an actual file path."""
+    ref_path = codebase / ref
+    if ref_path.exists():
+        return ref_path
+    parent = (codebase / rel_path).parent
+    for candidate in [parent / ref, parent / (ref + ".h"),
+                      parent / (ref + ".hpp")]:
+        if candidate.exists():
+            return candidate
+    basename = Path(ref).name
+    for suffix in [basename, basename + ".h", basename + ".hpp"]:
+        match = _find_file(codebase, suffix)
+        if match:
+            return match
+    return None
+
+
+def _collect_ref_context(raw_code: str, codebase: Path,
+                         rel_path: str, max_refs: int = 3) -> str:
+    """Read referenced files and return combined context string."""
+    refs = _extract_cross_file_refs(raw_code)
     if not refs:
-        return summary
-
-    extra_context_parts: list[str] = []
+        return ""
+    parts: list[str] = []
     seen: set[str] = set()
     for ref in refs[:6]:
         if ref in seen:
             continue
         seen.add(ref)
-        ref_path = codebase / ref
-        if not ref_path.exists():
-            parent = (codebase / rel_path).parent
-            for candidate in [parent / ref, parent / (ref + ".h"),
-                              parent / (ref + ".hpp")]:
-                if candidate.exists():
-                    ref_path = candidate
-                    break
-            else:
-                basename = Path(ref).name
-                match = _find_file(codebase, basename)
-                if not match:
-                    match = _find_file(codebase, basename + ".h")
-                if not match:
-                    match = _find_file(codebase, basename + ".hpp")
-                if match:
-                    ref_path = match
-                else:
-                    continue
-
-        if ref_path.exists() and ref_path.is_file():
+        ref_path = _resolve_ref_to_path(ref, codebase, rel_path)
+        if ref_path and ref_path.is_file():
             content = read_file_sample(ref_path, max_lines=40)
             if len(content.strip()) > 20:
-                extra_context_parts.append(
-                    f"[{ref_path.relative_to(codebase)}]\n{content}"
-                )
-                if len(extra_context_parts) >= 3:
+                parts.append(f"[{ref_path.relative_to(codebase)}]\n{content}")
+                if len(parts) >= max_refs:
                     break
+    return "\n\n".join(parts)
 
-    if not extra_context_parts:
+
+async def _async_resolve_references(model: str, summary: str, raw_code: str,
+                                     codebase: Path, rel_path: str,
+                                     tracker: Optional[TokenTracker] = None) -> str:
+    """Resolve vague references in a summary by reading referenced files
+    and re-generating with extra context."""
+    extra_context = _collect_ref_context(raw_code, codebase, rel_path)
+    if not extra_context:
         return summary
 
-    extra_context = "\n\n".join(extra_context_parts)
     refine_prompt = f"""The following summary of a code chunk has vague references.
 Rewrite it to be more specific using the referenced source files provided below.
 
@@ -1914,7 +1842,8 @@ async def _async_summarize_one_chunk(
         rag: bool = False, file_summary: str = "",
         tracker: Optional[TokenTracker] = None) -> dict:
     """Async version: summarize a single code chunk."""
-    kb_context = search_kb(f"{mod_name} {chunk[:200]}", limit=3) if rag else ""
+    kb_context = (await asyncio.to_thread(search_kb, f"{mod_name} {chunk[:200]}", 3)
+                  if rag else "")
     prompt = build_pass2_prompt(
         project_desc=project_desc,
         module_name=mod_name,
@@ -1953,6 +1882,7 @@ async def _async_summarize_one_chunk(
         "chunk_type":  chunk_type,
         "chunk_index": chunk_index,
         "refined":     refined,
+        "content_hash": _chunk_content_hash(chunk),
     }
 
 
@@ -1971,27 +1901,51 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     If summaries_path is set, writes incrementally for crash-safety.
     """
     # Load existing summaries for resume support
+    # done_hashes maps chunk_key → content_hash so we can detect shifted chunks
     summaries: list[dict] = []
     done_keys: set[str] = set()
+    done_hashes: dict[str, str] = {}
     if summaries_path and summaries_path.exists():
         try:
             summaries = json.loads(summaries_path.read_text())
             for entry in summaries:
-                done_keys.add(_make_chunk_key(
+                key = _make_chunk_key(
                     entry.get("source_file", ""),
                     entry.get("chunk_index", 0),
-                ))
+                )
+                done_keys.add(key)
+                if "content_hash" in entry:
+                    done_hashes[key] = entry["content_hash"]
             if done_keys:
                 print(f"\n[Pass 2] Resuming — {len(done_keys)} chunks already summarized")
         except Exception:
             summaries = []
 
-    # ── Generate file-level summaries ────────────────────────────────────
+    # ── Load or generate file-level summaries ────────────────────────────
+    # Cache file/class/function summaries so resume doesn't re-generate them
+    context_cache_path = (summaries_path.parent / "context_cache.json"
+                          if summaries_path else None)
+    cached_context = {}
+    if context_cache_path and context_cache_path.exists():
+        try:
+            cached_context = json.loads(context_cache_path.read_text())
+            print(f"[Pass 2] Loaded context cache "
+                  f"({len(cached_context.get('file_summaries', {}))} file, "
+                  f"{len(cached_context.get('class_summaries', {}))} class, "
+                  f"{len(cached_context.get('func_summaries', {}))} func summaries)")
+        except Exception:
+            cached_context = {}
+
     project_desc = f"{module_map.project}: {module_map.description}"
-    file_summaries = await _generate_file_summaries(
-        model, codebase, module_map,
-        max_concurrent=max_concurrent, rpm=rpm, tracker=tracker, quiet=quiet,
-    )
+
+    if cached_context.get("file_summaries"):
+        file_summaries = cached_context["file_summaries"]
+        print(f"[File summaries] Loaded {len(file_summaries)} from cache")
+    else:
+        file_summaries = await _generate_file_summaries(
+            model, codebase, module_map,
+            max_concurrent=max_concurrent, rpm=rpm, tracker=tracker, quiet=quiet,
+        )
 
     # ── Collect chunks and detect multi-chunk functions ──────────────────
     work_items: list[dict] = []
@@ -2021,54 +1975,80 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             rel_path = str(fpath.relative_to(codebase))
             per_file_chunks.append((rel_path, chunks, mod))
 
-    # ── Generate function summaries for multi-chunk functions ─────────
-    func_limiter = AsyncRateLimiter(
-        max_concurrent=max_concurrent, calls_per_minute=rpm,
-    )
-    # func_summaries: (rel_path, chunk_index) → function context string
+    # ── Generate or load function summaries for multi-chunk functions ───
     func_summaries: dict[tuple[str, int], str] = {}
-    multi_chunk_count = 0
 
-    for rel_path, chunks, mod in per_file_chunks:
-        if len(chunks) > 1:
-            groups = _group_chunks_by_function(chunks)
-            multi_groups = [g for g in groups if len(g) > 1]
-            if multi_groups:
-                multi_chunk_count += sum(len(g) - 1 for g in multi_groups)
-                fsums = await _generate_function_summaries(
-                    model, chunks, groups, rel_path,
-                    file_summaries.get(rel_path, ""),
-                    limiter=func_limiter, tracker=tracker,
-                )
-                for chunk_idx, summary in fsums.items():
-                    func_summaries[(rel_path, chunk_idx)] = summary
-
-    if multi_chunk_count > 0:
-        print(f"[Pass 2] Generated function context for {multi_chunk_count} "
-              f"continuation chunks across {len(func_summaries)} multi-chunk functions")
-
-    # ── Generate class summaries ──────────────────────────────────────────
-    class_limiter = AsyncRateLimiter(
-        max_concurrent=max_concurrent, calls_per_minute=rpm,
-    )
-    # class_summaries: (rel_path, class_name) → summary string
-    class_summaries: dict[tuple[str, str], str] = {}
-    class_count = 0
-
-    for rel_path, chunks, mod in per_file_chunks:
-        classes = _detect_classes_in_file(chunks, rel_path, codebase)
-        if classes:
-            csums = await _generate_class_summaries(
-                model, classes, rel_path,
-                file_summaries.get(rel_path, ""),
-                limiter=class_limiter, tracker=tracker,
+    if not _quota_exhausted:
+        if cached_context.get("func_summaries"):
+            # Restore from cache — keys are "rel_path|chunk_idx" strings
+            for key, summary in cached_context["func_summaries"].items():
+                sep = "|" if "|" in key else "::"  # back-compat
+                rp, ci = key.rsplit(sep, 1)
+                func_summaries[(rp, int(ci))] = summary
+            print(f"[Pass 2] Loaded {len(func_summaries)} function summaries from cache")
+        else:
+            func_limiter = AsyncRateLimiter(
+                max_concurrent=max_concurrent, calls_per_minute=rpm,
             )
-            for cls_name, summary in csums.items():
-                class_summaries[(rel_path, cls_name)] = summary
-                class_count += 1
+            multi_chunk_count = 0
 
-    if class_count > 0:
-        print(f"[Pass 2] Generated summaries for {class_count} classes")
+            for rel_path, chunks, mod in per_file_chunks:
+                if _quota_exhausted:
+                    break
+                if len(chunks) > 1:
+                    groups = _group_chunks_by_function(chunks)
+                    multi_groups = [g for g in groups if len(g) > 1]
+                    if multi_groups:
+                        multi_chunk_count += sum(len(g) - 1 for g in multi_groups)
+                        fsums = await _generate_function_summaries(
+                            model, chunks, groups, rel_path,
+                            file_summaries.get(rel_path, ""),
+                            limiter=func_limiter, tracker=tracker,
+                        )
+                        for chunk_idx, summary in fsums.items():
+                            func_summaries[(rel_path, chunk_idx)] = summary
+                        if func_limiter.quota_exhausted:
+                            _quota_exhausted = True
+
+            if multi_chunk_count > 0:
+                print(f"[Pass 2] Generated function context for {multi_chunk_count} "
+                      f"continuation chunks across {len(func_summaries)} multi-chunk functions")
+
+    # ── Generate or load class summaries ──────────────────────────────────
+    class_summaries: dict[tuple[str, str], str] = {}
+
+    if not _quota_exhausted:
+        if cached_context.get("class_summaries"):
+            # Restore from cache — keys are "rel_path|class_name" strings
+            for key, summary in cached_context["class_summaries"].items():
+                sep = "|" if "|" in key else "::"  # back-compat
+                rp, cn = key.rsplit(sep, 1)
+                class_summaries[(rp, cn)] = summary
+            print(f"[Pass 2] Loaded {len(class_summaries)} class summaries from cache")
+        else:
+            class_limiter = AsyncRateLimiter(
+                max_concurrent=max_concurrent, calls_per_minute=rpm,
+            )
+            class_count = 0
+
+            for rel_path, chunks, mod in per_file_chunks:
+                if _quota_exhausted:
+                    break
+                classes = _detect_classes_in_file(chunks, rel_path, codebase)
+                if classes:
+                    csums = await _generate_class_summaries(
+                        model, classes, rel_path,
+                        file_summaries.get(rel_path, ""),
+                        limiter=class_limiter, tracker=tracker,
+                    )
+                    for cls_name, summary in csums.items():
+                        class_summaries[(rel_path, cls_name)] = summary
+                        class_count += 1
+                    if class_limiter.quota_exhausted:
+                        _quota_exhausted = True
+
+            if class_count > 0:
+                print(f"[Pass 2] Generated summaries for {class_count} classes")
 
     # Build global class summary lookup (class_name → summary)
     # so chunks in .cpp files can find classes defined in .h files
@@ -2083,12 +2063,47 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     for (rp, cn) in class_summaries:
         file_class_names.setdefault(rp, set()).add(cn)
 
+    # ── Save context cache (resume support) ──────────────────────────────
+    # Serialize tuple keys to strings for JSON compatibility
+    if context_cache_path:
+        _ctx = {
+            "file_summaries": file_summaries,
+            "class_summaries": {
+                f"{rp}|{cn}": s for (rp, cn), s in class_summaries.items()
+            },
+            "func_summaries": {
+                f"{rp}|{ci}": s for (rp, ci), s in func_summaries.items()
+            },
+        }
+        context_cache_path.write_text(json.dumps(_ctx, indent=2))
+        print(f"[Pass 2] Saved context cache ({len(file_summaries)} file, "
+              f"{len(class_summaries)} class, {len(func_summaries)} func)")
+
     # ── Build work items ──────────────────────────────────────────────────
+    stale_count = 0
     for rel_path, chunks, mod in per_file_chunks:
         for i, chunk in enumerate(chunks):
             chunk_key = _make_chunk_key(rel_path, i)
             if chunk_key in done_keys:
-                continue
+                # Verify content hasn't shifted since last run
+                if chunk_key in done_hashes:
+                    current_hash = _chunk_content_hash(chunk)
+                    if done_hashes[chunk_key] != current_hash:
+                        # Chunk content changed — remove stale summary, re-summarize
+                        stale_count += 1
+                        summaries = [
+                            s for s in summaries
+                            if _make_chunk_key(
+                                s.get("source_file", ""),
+                                s.get("chunk_index", 0),
+                            ) != chunk_key
+                        ]
+                        done_keys.discard(chunk_key)
+                        # Fall through to add as work item
+                    else:
+                        continue
+                else:
+                    continue
             # Combine file summary + class context + function context
             context_parts: list[str] = []
             fs = file_summaries.get(rel_path, "")
@@ -2122,35 +2137,49 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             })
 
     # ── Dedup near-identical chunks (boilerplate, generated code) ────────
-    def _chunk_signature(text: str, n: int = 3) -> frozenset:
+    # Uses content hash + length + structure to avoid false matches.
+    def _chunk_signature(text: str) -> tuple:
+        h = hashlib.sha256(text.strip().encode()).hexdigest()[:16]
         tokens = text.split()
-        if len(tokens) < n:
-            return frozenset(tokens)
-        return frozenset(tuple(tokens[i:i+n]) for i in range(0, len(tokens) - n + 1, 5))
+        lines = text.splitlines()
+        return (h, len(tokens), len(lines))
 
-    seen_sigs: dict[frozenset, str] = {}
+    seen_sigs: dict[tuple, str] = {}
     deduped: list[dict] = []
     dedup_count = 0
     for item in work_items:
         sig = _chunk_signature(item["chunk"])
         if sig in seen_sigs:
             dedup_count += 1
+            if not quiet:
+                print(f"  [dedup] {item['rel_path']}:{item['chunk_index']} "
+                      f"≈ {seen_sigs[sig]}")
             continue
-        seen_sigs[sig] = item["rel_path"]
+        seen_sigs[sig] = f"{item['rel_path']}:{item['chunk_index']}"
         deduped.append(item)
     if dedup_count > 0:
-        print(f"[Pass 2] Deduped {dedup_count} near-identical chunks")
+        print(f"[Pass 2] Deduped {dedup_count} exact-duplicate chunks")
     work_items = deduped
 
     if max_chunks is not None:
         work_items = work_items[:max_chunks]
 
     total_cached = len(done_keys)
+    if stale_count > 0:
+        print(f"[Pass 2] {stale_count} cached chunks had stale content — re-summarizing")
     print(f"[Pass 2] {len(work_items)} new chunks to summarize "
           f"({total_cached} cached, {skipped} files skipped)")
 
     if not work_items:
         print("[Pass 2] Nothing to do.")
+        return summaries
+
+    if _quota_exhausted:
+        print(f"\n⚠ Quota was exhausted during context generation. "
+              f"Saving {len(summaries)} existing summaries. "
+              f"Re-run to resume with {len(work_items)} remaining chunks.")
+        if summaries_path:
+            summaries_path.write_text(json.dumps(summaries, indent=2))
         return summaries
 
     # ── Process with async concurrency ────────────────────────────────────
@@ -2212,6 +2241,16 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     ]
 
     await limiter.run_many(factories, on_result=on_result, on_error=on_error)
+
+    # Save immediately after run_many completes (especially important on quota halt)
+    if summaries_path:
+        summaries_path.write_text(json.dumps(summaries, indent=2))
+
+    if limiter.quota_exhausted:
+        print(f"\n⚠ Quota exhausted after {completed_count} chunk summaries. "
+              f"{limiter.skipped_count} chunks skipped.")
+        print(f"  Progress saved to {summaries_path}. Re-run to resume.")
+        return summaries
 
     # ── Append file and class overview summaries for indexing ────────────
     overview_count = 0
@@ -2281,9 +2320,9 @@ def main():
     parser.add_argument("--output-dir", default=None,
                         help="Where to write module_map.json and summaries.json "
                              "(default: same dir as this script)")
-    parser.add_argument("--language", default="python",
+    parser.add_argument("--language", default=None,
                         choices=["python", "javascript", "typescript", "cpp", "java", "go", "rust"],
-                        help="Primary language of the codebase (default: python)")
+                        help="Primary language (auto-detected if omitted)")
     parser.add_argument("--docs", nargs="+", default=None,
                         help="Path(s) to docs files/directories. Used in Pass 1 context. "
                              "Also indexed into R2R when --bootstrap-docs is set. "
@@ -2317,6 +2356,8 @@ def main():
                              "Higher values use more memory but better saturate high RPM limits.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Estimate token cost without running any LLM calls")
+    parser.add_argument("--yes", "-y", action="store_true",
+                        help="Skip cost confirmation prompt")
     parser.add_argument("--verbose", action="store_true",
                         help="Print detailed progress (tool calls, reference resolution)")
     parser.add_argument("--quiet", action="store_true",
@@ -2337,6 +2378,15 @@ def main():
     module_map_path = output_dir / "module_map.json"
     summaries_path  = output_dir / "summaries.json"
 
+    # ── Auto-detect language if not specified ────────────────────────────────
+    if args.language is None:
+        detected = detect_language(codebase)
+        if detected:
+            args.language = detected
+        else:
+            print("Could not auto-detect language. Use --language to specify.")
+            sys.exit(1)
+
     # ── Collect source files ────────────────────────────────────────────────────
     files = collect_source_files(codebase, language=args.language,
                                  include_tests=args.include_tests)
@@ -2347,31 +2397,47 @@ def main():
     else:
         print(f"Model: {args.model}")
     if not files:
-        print("No source files found. Check --codebase and --language.")
+        print(red("No source files found.") + " Check --codebase and --language.")
         sys.exit(1)
 
-    # ── Dry-run: estimate cost and exit ─────────────────────────────────────
-    if args.dry_run:
-        # Quick estimate: ~3 chunks per file on average
-        est_chunks = len(files) * 3
-        est_prompt_tokens = est_chunks * 2000
-        est_completion_tokens = est_chunks * 500
-        est_total = est_prompt_tokens + est_completion_tokens
-        # File summaries estimate: ~500 tokens per file (prompt + completion)
-        file_summary_tokens = len(files) * 500
-        est_total += file_summary_tokens
-        # Function summaries estimate: ~20% of chunks are continuations, ~400 tok each
-        func_summary_tokens = int(est_chunks * 0.2 * 400)
-        est_total += func_summary_tokens
-        # Class summaries estimate: ~1 class per 5 files, ~500 tok each
-        class_summary_tokens = int(len(files) / 5 * 500)
-        est_total += class_summary_tokens
-        # Pass 1 estimate
-        pass1_tokens = 50000  # rough estimate for agent loop
-        est_total += pass1_tokens
-        rate_per_mtok = 5.0  # rough average
-        est_cost = est_total / 1_000_000 * rate_per_mtok
+    # ── Cost estimate ─────────────────────────────────────────────────────────
+    est_chunks = len(files) * 3
+    est_prompt_tokens = est_chunks * 2000
+    est_completion_tokens = est_chunks * 500
+    est_total = est_prompt_tokens + est_completion_tokens
+    file_summary_tokens = len(files) * 500
+    est_total += file_summary_tokens
+    func_summary_tokens = int(est_chunks * 0.2 * 400)
+    est_total += func_summary_tokens
+    class_summary_tokens = int(len(files) / 5 * 500)
+    est_total += class_summary_tokens
+    pass1_tokens = 50000
+    est_total += pass1_tokens
+    # Try to get real pricing from litellm's model database
+    rate_per_mtok = 5.0  # fallback: ~GPT-4o blended rate
+    _pricing_source = "default estimate"
+    try:
+        from litellm import get_model_info
+        _cost_model = args.model_fast or args.model
+        info = get_model_info(_cost_model)
+        input_cpt = info.get("input_cost_per_token", 0)
+        output_cpt = info.get("output_cost_per_token", 0)
+        if input_cpt and output_cpt:
+            # Weighted blend: ~80% prompt, ~20% completion
+            rate_per_mtok = (input_cpt * 0.8 + output_cpt * 0.2) * 1_000_000
+            _pricing_source = _cost_model
+    except Exception:
+        pass
+    est_cost = est_total / 1_000_000 * rate_per_mtok
 
+    total_calls = est_chunks
+    if args.passes > 1:
+        review_tokens = est_chunks * 1500
+        est_total += review_tokens * (args.passes - 1)
+        total_calls += int(est_chunks * 0.7)
+    est_minutes = total_calls / args.rpm
+
+    if args.dry_run:
         print(f"\n{'='*60}")
         print(f"  DRY RUN — Cost Estimate")
         print(f"{'='*60}")
@@ -2384,18 +2450,10 @@ def main():
         print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
         print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
         print(f"  Est. total tokens: ~{est_total:,}")
-        print(f"  Est. cost:         ~${est_cost:.2f} (at ${rate_per_mtok}/MTok)")
+        print(f"  Est. cost:         ~${est_cost:.2f} (at ${rate_per_mtok:.2f}/MTok — {_pricing_source})")
         if args.passes > 1:
-            review_tokens = est_chunks * 1500
-            review_cost = review_tokens / 1_000_000 * rate_per_mtok
-            est_total += review_tokens * (args.passes - 1)
             print(f"  Est. review:       ~{review_tokens:,} tokens/pass × {args.passes - 1} pass(es)")
             print(f"  Est. total w/review: ~{est_total:,} tokens (~${est_total / 1_000_000 * rate_per_mtok:.2f})")
-        # Wall time estimate
-        total_calls = est_chunks  # Pass 2
-        if args.passes > 1:
-            total_calls += int(est_chunks * 0.7)  # ~70% reviewed per pass
-        est_minutes = total_calls / args.rpm
         if est_minutes > 60:
             print(f"  Est. wall time:    ~{est_minutes / 60:.1f} hours (at {args.rpm} RPM)")
         else:
@@ -2406,6 +2464,35 @@ def main():
         print(f"\n  Note: Actual cost depends on model, file sizes, and content.")
         print(f"  Run without --dry-run to proceed.")
         return
+
+    # Show cost estimate and confirm (unless --yes)
+    if not args.yes:
+        est_cost_total = est_total / 1_000_000 * rate_per_mtok
+        if est_minutes > 60:
+            time_str = f"~{est_minutes / 60:.1f} hours"
+        else:
+            time_str = f"~{int(est_minutes)} minutes"
+        print(f"\nEstimate: ~{est_chunks:,} chunks, ~${est_cost_total:.2f}, {time_str} at {args.rpm} RPM")
+        if not args.model_fast and len(files) > 100:
+            print(f"  Tip: --model-fast openai/gpt-4o-mini cuts Pass 2 cost ~90%")
+        try:
+            answer = input("Proceed? [Y/n] ").strip().lower()
+            if answer and answer not in ("y", "yes"):
+                print("Aborted.")
+                return
+        except (EOFError, KeyboardInterrupt):
+            print("\nAborted.")
+            return
+
+    # ── Smart RPM detection ─────────────────────────────────────────────────────
+    # If user didn't explicitly set --rpm, try to detect from proxy headers
+    if args.rpm == parser.get_default("rpm"):
+        detected_rpm = detect_rpm_from_proxy(args.model_fast or args.model)
+        if detected_rpm and detected_rpm != args.rpm:
+            print(f"{green('[Auto]')} Detected rate limit: {bold(str(detected_rpm))} RPM from proxy headers")
+            args.rpm = detected_rpm
+            # Recalculate ETA with new RPM
+            est_minutes = total_calls / args.rpm
 
     # ── Incremental: filter to changed files only ──────────────────────────────
     hash_manifest_path = output_dir / "file_hashes.json"
@@ -2448,6 +2535,7 @@ def main():
             bootstrap_docs(Path(doc_path))
 
     tracker = TokenTracker()
+    _start_time = time.time()
 
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
     if not args.pass2_only:
@@ -2484,6 +2572,12 @@ def main():
     if args.pass1_only:
         print("\nPass 1 complete. Run with --pass2-only to generate summaries.")
         return
+
+    # ── Show ETA ─────────────────────────────────────────────────────────────
+    if est_minutes > 60:
+        print(f"\nEstimated time remaining: ~{est_minutes / 60:.1f} hours at {args.rpm} RPM")
+    elif est_minutes > 1:
+        print(f"\nEstimated time remaining: ~{int(est_minutes)} minutes at {args.rpm} RPM")
 
     # ── Iterative Pass 2 + Review ────────────────────────────────────────────────
     #
@@ -2544,20 +2638,49 @@ def main():
         save_hash_manifest(hash_manifest_path, new_manifest)
         print(f"[Incremental] Saved file hashes to {hash_manifest_path}")
 
-    if args.passes == 1:
-        print(f"\n[Done] {len(summaries)} summaries written to {summaries_path}")
-        print(f"       Next: python indexer.py --index {summaries_path}")
-    else:
-        print(f"\n[Done] Final summaries in {summaries_path} (already indexed in R2R)")
+    # Always index into R2R (previously only done for --passes > 1)
+    if summaries:
+        print(f"\n[Index] Indexing {len(summaries)} summaries into R2R...")
+        index_summaries_to_r2r(summaries)
 
-    # ── Token usage summary ────────────────────────────────────────────────────
+    # ── Token usage + cost log ─────────────────────────────────────────────────
+    total_tokens = 0
     if tracker.phases:
-        print(f"\n{tracker.summary()}")
+        total_tokens = sum(
+            p["prompt"] + p["completion"] for p in tracker.phases.values()
+        )
         cost_log_path = output_dir / "cost_log.jsonl"
         entry = tracker.to_log_entry(model=args.model, codebase=codebase.name)
         with cost_log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
-        print(f"[Tokens] Logged to {cost_log_path}")
+
+    # ── Post-run summary card ──────────────────────────────────────────────────
+    elapsed = time.time() - _start_time
+
+    n_modules = len(module_map.modules) if module_map else 0
+    cost_str = f"~${total_tokens / 1_000_000 * rate_per_mtok:.2f}" if total_tokens else "n/a"
+    if elapsed > 3600:
+        time_str = f"{elapsed / 3600:.1f}h"
+    elif elapsed > 60:
+        time_str = f"{elapsed / 60:.0f}m"
+    else:
+        time_str = f"{elapsed:.0f}s"
+
+    w = 44
+    hr = green("=" * w)
+    print(f"\n{hr}")
+    print(f"  {ok('Study Complete')}")
+    print(f"  Files: {len(files):,}  Chunks: {len(summaries):,}  Modules: {n_modules}")
+    print(f"  Tokens: {total_tokens:,}  Cost: {cost_str}  Time: {time_str}")
+    if _quota_exhausted:
+        print(f"  {warn('Quota exhausted')} — partial results saved. Re-run to resume.")
+    print(f"{hr}")
+    print(f"\n  Next: Open Claude Code in this directory")
+    print(f"  Try: {dim('\"How does X work?\"')} or {dim('\"Where is Y implemented?\"')}")
+    print()
+
+    if tracker.phases:
+        print(dim(tracker.summary()))
 
 
 if __name__ == "__main__":

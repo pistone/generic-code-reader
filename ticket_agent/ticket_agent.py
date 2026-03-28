@@ -25,7 +25,10 @@ from r2r import R2RClient
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from codebase_shared.utils import TokenTracker, llm_call, load_manifest, save_manifest  # noqa: E402
+from codebase_shared.utils import (  # noqa: E402
+    TokenTracker, llm_call, load_manifest, save_manifest,
+    _is_quota_error,
+)
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")
@@ -207,6 +210,15 @@ def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
     indexed: dict[str, str] = {}
 
     for i, entry in enumerate(entries):
+        # Map ticket category to source_kind for unified filtering
+        _category_to_kind = {
+            "root_cause": "rationale",
+            "workaround": "operational",
+            "design_decision": "rationale",
+            "pattern": "reference",
+        }
+        source_kind = _category_to_kind.get(entry["category"], "reference")
+
         try:
             resp = client.documents.create(
                 raw_text=entry["summary"],
@@ -215,6 +227,7 @@ def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
                     "module":        entry["category"],
                     "chunk_type":    "ticket_summary",
                     "source_type":   "ticket",
+                    "source_kind":   source_kind,
                     "doc_title":     entry["title"],
                     "last_modified": entry.get("resolved", ""),
                 },
@@ -283,7 +296,7 @@ def main():
             sys.exit(1)
         try:
             entries = json.loads(summaries_path.read_text())
-        except (json.JSONDecodeError, Exception) as e:
+        except (json.JSONDecodeError, OSError) as e:
             print(f"Error: {summaries_path} is corrupted: {e}")
             sys.exit(1)
         print(f"Re-indexing {len(entries)} saved ticket summaries into R2R...")
@@ -331,92 +344,135 @@ def main():
         candidates = changed
 
     # Steps 3-4: extract knowledge
+    #   Manifest is saved after each ticket so we can resume on quota exhaustion.
     client = R2RClient(R2R_URL)
     useful_entries: list[dict] = []
     not_useful = 0
+    duplicates = 0
 
-    print(f"\nExtracting knowledge from {len(candidates)} ticket(s)...")
+    # Load existing summaries for merging
+    existing_summaries: list[dict] = []
+    if summaries_path.exists():
+        try:
+            existing_summaries = json.loads(summaries_path.read_text())
+        except Exception:
+            existing_summaries = []
+    existing_keys = {e["key"] for e in existing_summaries}
+
+    # Skip tickets already in manifest (resume support)
+    remaining: list[dict] = []
     for t in candidates:
+        key = t.get("key", "")
+        if key and key in manifest and manifest[key].get("hash") == ticket_hash(t):
+            if not args.quiet:
+                print(f"  {key}: already processed, skipping")
+            continue
+        remaining.append(t)
+
+    if not remaining:
+        print("[Resume] All candidate tickets already processed.")
+        return
+
+    print(f"\nExtracting knowledge from {len(remaining)} ticket(s)"
+          f" ({len(candidates) - len(remaining)} already done)...")
+
+    quota_hit = False
+    for i, t in enumerate(remaining, 1):
         key = t.get("key", "unknown")
         context = build_ticket_context(t)
-        result = extract_knowledge(args.model, context, tracker=tracker)
+        try:
+            result = extract_knowledge(args.model, context, tracker=tracker)
+        except Exception as e:
+            if _is_quota_error(str(e).lower()):
+                print(f"\n⚠ Quota exhausted at ticket {key} "
+                      f"({i}/{len(remaining)})")
+                print(f"  Progress saved. Re-run to resume.")
+                quota_hit = True
+                break
+            raise
 
         if not result["useful"]:
             not_useful += 1
             if not args.quiet:
-                print(f"  {key}: not useful")
+                print(f"  [{i}/{len(remaining)}] {key}: not useful")
+            # Mark in manifest so we don't re-process
+            manifest[key] = {"hash": ticket_hash(t), "doc_id": None}
         else:
             # Step 5: dedup
             if dedup_against_kb(client, result["summary"]):
+                duplicates += 1
                 if not args.quiet:
-                    print(f"  {key}: duplicate (skipped)")
+                    print(f"  [{i}/{len(remaining)}] {key}: duplicate (skipped)")
+                manifest[key] = {"hash": ticket_hash(t), "doc_id": None}
             else:
-                useful_entries.append({
+                entry = {
                     "key": key,
                     "title": t.get("title", ""),
                     "summary": result["summary"],
                     "category": result["category"],
                     "resolved": t.get("resolved", ""),
-                })
-                if not args.quiet:
-                    print(f"  {key}: [{result['category']}] {result['summary'][:80]}...")
+                }
+                useful_entries.append(entry)
 
+                # Save to summaries file immediately
+                if key not in existing_keys:
+                    existing_summaries.append(entry)
+                    existing_keys.add(key)
+                else:
+                    existing_summaries = [
+                        entry if e["key"] == key else e
+                        for e in existing_summaries
+                    ]
+                summaries_path.write_text(
+                    json.dumps(existing_summaries, indent=2))
+
+                if not args.quiet:
+                    print(f"  [{i}/{len(remaining)}] {key}: "
+                          f"[{result['category']}] "
+                          f"{result['summary'][:80]}...")
+
+                # Mark in manifest (no doc_id yet — indexing comes later)
+                manifest[key] = {
+                    "hash": ticket_hash(t),
+                    "doc_id": None,
+                    "extracted": True,
+                }
+
+        # Save manifest after each ticket (resume support)
+        save_manifest(manifest_path, manifest)
         time.sleep(0.3)  # rate limit
 
     print(f"\nExtraction: {len(useful_entries)} useful, "
-          f"{not_useful} not useful, "
-          f"{len(candidates) - len(useful_entries) - not_useful} duplicates")
+          f"{not_useful} not useful, {duplicates} duplicates")
 
-    # Save extracted summaries to disk (so --index-only can replay)
-    if useful_entries:
-        # Merge with any previously saved summaries
-        existing_summaries: list[dict] = []
-        if summaries_path.exists():
-            try:
-                existing_summaries = json.loads(summaries_path.read_text())
-            except Exception:
-                existing_summaries = []
-        existing_keys = {e["key"] for e in existing_summaries}
-        for entry in useful_entries:
-            if entry["key"] not in existing_keys:
-                existing_summaries.append(entry)
-            else:
-                # Update existing entry
-                existing_summaries = [
-                    entry if e["key"] == entry["key"] else e
-                    for e in existing_summaries
-                ]
-        summaries_path.write_text(json.dumps(existing_summaries, indent=2))
-        print(f"Saved {len(existing_summaries)} total summaries to {summaries_path}")
+    if existing_summaries:
+        print(f"Saved {len(existing_summaries)} total summaries "
+              f"to {summaries_path}")
 
-    # Step 6: index
-    if useful_entries:
-        print(f"\nIndexing {len(useful_entries)} ticket summaries into R2R...")
-        indexed = index_ticket_summaries(useful_entries)
+    # Step 6: index (skip entries already indexed in a prior run)
+    to_index = [
+        e for e in useful_entries
+        if not manifest.get(e["key"], {}).get("doc_id")
+    ]
+    if to_index:
+        print(f"\nIndexing {len(to_index)} ticket summaries into R2R"
+              f" ({len(useful_entries) - len(to_index)} already indexed)...")
+        indexed = index_ticket_summaries(to_index)
 
-        # Update manifest with indexed tickets
-        for entry in useful_entries:
+        # Update manifest with doc_ids from indexing
+        for entry in to_index:
             key = entry["key"]
             doc_id = indexed.get(key)
             if doc_id is None:
-                continue  # indexing failed for this entry
-            # Find the original ticket to compute hash
-            orig = next((t for t in candidates if t.get("key") == key), {})
+                continue
+            orig = next((t for t in remaining if t.get("key") == key), {})
             manifest[key] = {
                 "hash": ticket_hash(orig),
                 "doc_id": doc_id,
             }
+        save_manifest(manifest_path, manifest)
     else:
         print("\nNo new knowledge to index.")
-
-    # Mark non-useful tickets in manifest too (so we don't re-process them)
-    for t in candidates:
-        key = t.get("key", "")
-        if key and key not in manifest:
-            manifest[key] = {"hash": ticket_hash(t), "doc_id": None}
-
-    # Save manifest
-    save_manifest(manifest_path, manifest)
 
     # Token tracking
     if tracker.phases:
@@ -425,7 +481,11 @@ def main():
         with cost_log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
 
-    print(f"\n[Done] {len(useful_entries)} ticket knowledge entries indexed")
+    if quota_hit:
+        print(f"\n[Paused] {len(useful_entries)} entries extracted so far. "
+              f"Re-run to continue from ticket {i}/{len(remaining)}.")
+    else:
+        print(f"\n[Done] {len(useful_entries)} ticket knowledge entries indexed")
 
 
 if __name__ == "__main__":

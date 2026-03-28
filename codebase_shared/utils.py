@@ -8,7 +8,9 @@ Provides:
   - load_manifest / save_manifest: JSON file persistence for incremental mode
 """
 
+import asyncio
 import json
+import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -19,10 +21,16 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 class TokenTracker:
-    """Accumulates prompt/completion token counts per phase."""
+    """Accumulates prompt/completion token counts per phase.
+
+    Thread-safe: uses a lock to protect concurrent updates from
+    async tasks sharing the same tracker instance.
+    """
 
     def __init__(self):
+        import threading
         self.phases: dict[str, dict[str, int]] = {}
+        self._lock = threading.Lock()
 
     def _ensure_phase(self, phase: str) -> dict[str, int]:
         if phase not in self.phases:
@@ -32,11 +40,12 @@ class TokenTracker:
     def record(self, phase: str, response) -> None:
         """Extract usage from a litellm response object."""
         usage = getattr(response, "usage", None)
-        p = self._ensure_phase(phase)
-        if usage:
-            p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
-            p["completion"] += getattr(usage, "completion_tokens", 0) or 0
-        p["calls"] += 1
+        with self._lock:
+            p = self._ensure_phase(phase)
+            if usage:
+                p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+                p["completion"] += getattr(usage, "completion_tokens", 0) or 0
+            p["calls"] += 1
 
     def record_streaming(self, phase: str, chunks: list) -> None:
         """Extract usage from the last chunk of a streaming response."""
@@ -48,19 +57,21 @@ class TokenTracker:
             choices = getattr(last, "choices", [])
             if choices:
                 usage = getattr(choices[0], "usage", None)
-        p = self._ensure_phase(phase)
-        if usage:
-            p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
-            p["completion"] += getattr(usage, "completion_tokens", 0) or 0
-        p["calls"] += 1
+        with self._lock:
+            p = self._ensure_phase(phase)
+            if usage:
+                p["prompt"] += getattr(usage, "prompt_tokens", 0) or 0
+                p["completion"] += getattr(usage, "completion_tokens", 0) or 0
+            p["calls"] += 1
 
     def record_estimate(self, phase: str, prompt_chars: int,
                         completion_chars: int) -> None:
         """Fallback: estimate tokens from character count (÷4)."""
-        p = self._ensure_phase(phase)
-        p["prompt"] += prompt_chars // 4
-        p["completion"] += completion_chars // 4
-        p["calls"] += 1
+        with self._lock:
+            p = self._ensure_phase(phase)
+            p["prompt"] += prompt_chars // 4
+            p["completion"] += completion_chars // 4
+            p["calls"] += 1
 
     def summary(self) -> str:
         """Return a formatted summary string."""
@@ -98,6 +109,14 @@ class TokenTracker:
         return entry
 
 
+def _extract_content(response) -> str:
+    """Safely extract text content from a litellm response."""
+    choices = getattr(response, "choices", None)
+    if not choices:
+        return ""
+    return choices[0].message.content or ""
+
+
 # ---------------------------------------------------------------------------
 # LLM call
 # ---------------------------------------------------------------------------
@@ -126,7 +145,7 @@ def llm_call_multi(model: str, system: str, messages: list[dict],
 
     if tracker and phase:
         tracker.record(phase, response)
-    return response.choices[0].message.content or ""
+    return _extract_content(response)
 
 
 def llm_call(model: str, system: str, user: str,
@@ -171,7 +190,7 @@ def llm_call(model: str, system: str, user: str,
     else:
         if tracker and phase:
             tracker.record(phase, response)
-        return response.choices[0].message.content or ""
+        return _extract_content(response)
 
 
 async def allm_call(model: str, system: str, user: str,
@@ -200,7 +219,33 @@ async def allm_call(model: str, system: str, user: str,
 
     if tracker and phase:
         tracker.record(phase, response)
-    return response.choices[0].message.content or ""
+    return _extract_content(response)
+
+
+async def allm_call_multi(model: str, system: str, messages: list[dict],
+                          max_tokens: int = 4096,
+                          json_mode: bool = False,
+                          tracker: Optional[TokenTracker] = None,
+                          phase: str = ""):
+    """
+    Async multi-turn LLM call via litellm.acompletion.
+
+    messages is a list of {"role": "user"|"assistant", "content": "..."} dicts.
+    The system prompt is prepended automatically.
+    """
+    from litellm import acompletion
+
+    full_messages = [{"role": "system", "content": system}] + messages
+
+    kwargs = dict(model=model, messages=full_messages, max_tokens=max_tokens)
+    if json_mode:
+        kwargs["response_format"] = {"type": "json_object"}
+
+    response = await acompletion(**kwargs)
+
+    if tracker and phase:
+        tracker.record(phase, response)
+    return _extract_content(response)
 
 
 def llm_tool_loop(
@@ -311,7 +356,7 @@ class RateLimitedExecutor:
 
     def _wait_for_slot(self):
         """Block until the next rate-limit slot is available."""
-        import time as _time
+
         with self._lock:
             now = _time.monotonic()
             wait = self._last_call + self._interval - now
@@ -336,7 +381,7 @@ class RateLimitedExecutor:
                     err_str = str(e).lower()
                     if "rate" in err_str or "429" in err_str or "too many" in err_str:
                         last_err = e
-                        import time as _time
+                
                         backoff = min(60, 10 * (2 ** attempt))
                         _time.sleep(backoff)
                     else:
@@ -358,6 +403,33 @@ class RateLimitedExecutor:
 # Async rate-limited concurrency
 # ---------------------------------------------------------------------------
 
+class QuotaExhaustedError(Exception):
+    """Raised when LLM quota/budget is exhausted (not a transient rate limit)."""
+    pass
+
+
+def _is_quota_error(err_str: str) -> bool:
+    """Detect hard quota exhaustion vs transient rate limits.
+
+    Uses multi-word phrases to avoid false positives on generic words
+    like 'exceeded' appearing in unrelated errors.
+    """
+    quota_signals = (
+        "quota", "insufficient_quota", "budget exceeded",
+        "budget limit", "billing", "spending limit",
+        "allowance exceeded", "credits exhausted",
+        "token limit exceeded", "exceeded your current quota",
+        "exceeded your quota",
+    )
+    return any(s in err_str for s in quota_signals)
+
+
+def _is_rate_limit_error(err_str: str) -> bool:
+    """Detect transient rate-limit errors (retryable)."""
+    return ("rate" in err_str or "429" in err_str
+            or "too many" in err_str or "throttl" in err_str)
+
+
 class AsyncRateLimiter:
     """Asyncio-based rate limiter with semaphore for concurrency control.
 
@@ -372,22 +444,30 @@ class AsyncRateLimiter:
     - No GIL contention on I/O
     - Token-bucket sleeps don't block other coroutines
     - Rate limit retries with exponential backoff
+
+    Quota detection: when a hard quota/budget error is detected (not a
+    transient 429), all pending tasks are cancelled immediately so progress
+    can be saved.  Check limiter.quota_exhausted after run_many() returns.
     """
 
     def __init__(self, max_concurrent: int = 50,
                  calls_per_minute: int = 500,
                  max_retries: int = 3):
-        import asyncio
+
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._interval = 60.0 / calls_per_minute
         self._lock = asyncio.Lock()
         self._last_call = 0.0
         self._max_retries = max_retries
+        self._halted = False
+        self.quota_exhausted = False
+        self.completed_count = 0
+        self.skipped_count = 0
 
     async def _wait_for_slot(self):
         """Reserve a rate-limit slot, sleep if needed."""
-        import asyncio
-        import time as _time
+
+
         async with self._lock:
             now = _time.monotonic()
             wait = self._last_call + self._interval - now
@@ -397,28 +477,33 @@ class AsyncRateLimiter:
         if wait > 0:
             await asyncio.sleep(wait)
 
-    async def run(self, coro, max_retries: Optional[int] = None):
-        """Run a coroutine with rate limiting, concurrency control, and retry."""
-        import asyncio
-        retries = max_retries if max_retries is not None else self._max_retries
+    def halt(self, reason: str = ""):
+        """Stop all pending work. Already-running tasks will finish."""
+        self._halted = True
+        if reason:
+            print(f"\n⚠ Halting: {reason}")
+
+    async def run(self, coro):
+        """Run a single coroutine with rate limiting and concurrency control.
+
+        No retry logic — a coroutine can only be awaited once.
+        For retries, use run_many() with coroutine factories instead.
+        """
+        if self._halted:
+            raise QuotaExhaustedError("Limiter halted")
         async with self._semaphore:
-            last_err = None
-            for attempt in range(retries + 1):
-                await self._wait_for_slot()
-                try:
-                    return await coro
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if "rate" in err_str or "429" in err_str or "too many" in err_str:
-                        last_err = e
-                        backoff = min(60, 10 * (2 ** attempt))
-                        await asyncio.sleep(backoff)
-                        # Recreate coroutine — can't await same one twice
-                        # Caller must handle this by passing a factory
-                        raise  # let caller retry with a new coroutine
-                    else:
-                        raise
-            raise last_err  # type: ignore[misc]
+            if self._halted:
+                raise QuotaExhaustedError("Limiter halted")
+            await self._wait_for_slot()
+            try:
+                return await coro
+            except Exception as e:
+                err_str = str(e).lower()
+                if _is_quota_error(err_str):
+                    self.quota_exhausted = True
+                    self.halt(f"Quota exhausted: {e}")
+                    raise QuotaExhaustedError(str(e)) from e
+                raise
 
     async def run_many(self, coro_factories: list,
                        on_result=None, on_error=None):
@@ -430,27 +515,53 @@ class AsyncRateLimiter:
         on_result(index, result) and on_error(index, exception) are called
         as tasks complete.
 
-        Returns list of results (None for failed tasks).
+        When a quota/budget error is detected, all remaining tasks are
+        cancelled and the method returns early.  Check self.quota_exhausted
+        and self.completed_count / self.skipped_count afterward.
+
+        Returns list of results (None for failed/skipped tasks).
         """
-        import asyncio
+
 
         results = [None] * len(coro_factories)
 
         async def _run_one(idx, factory):
+            if self._halted:
+                self.skipped_count += 1
+                return
+
             last_err = None
             for attempt in range(self._max_retries + 1):
+                if self._halted:
+                    self.skipped_count += 1
+                    return
+
                 async with self._semaphore:
+                    if self._halted:
+                        self.skipped_count += 1
+                        return
+
                     await self._wait_for_slot()
                     try:
                         result = await factory()
                         results[idx] = result
+                        self.completed_count += 1
                         if on_result:
                             on_result(idx, result)
                         return
                     except Exception as e:
                         err_str = str(e).lower()
-                        if ("rate" in err_str or "429" in err_str
-                                or "too many" in err_str):
+                        if _is_quota_error(err_str):
+                            self.quota_exhausted = True
+                            self.halt(
+                                f"Quota exhausted — {self.completed_count} "
+                                f"completed, saving progress. "
+                                f"Re-run to resume."
+                            )
+                            if on_error:
+                                on_error(idx, e)
+                            return
+                        if _is_rate_limit_error(err_str):
                             last_err = e
                             backoff = min(60, 10 * (2 ** attempt))
                             await asyncio.sleep(backoff)
@@ -462,6 +573,12 @@ class AsyncRateLimiter:
                 on_error(idx, last_err)
 
         await asyncio.gather(*[_run_one(i, f) for i, f in enumerate(coro_factories)])
+
+        if self.quota_exhausted:
+            print(f"\n⚠ Quota exhausted after {self.completed_count} completions. "
+                  f"{self.skipped_count} tasks skipped. "
+                  f"Progress saved — re-run to resume.")
+
         return results
 
 
@@ -474,8 +591,8 @@ def load_manifest(path: Path) -> dict:
     if path.exists():
         try:
             return json.loads(path.read_text())
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[warn] Could not load manifest {path}: {e}")
     return {}
 
 
@@ -499,3 +616,48 @@ def save_queue(path: Path, queue: list) -> None:
     """Write a JSON queue (list) to disk."""
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(queue, indent=2))
+
+
+# ---------------------------------------------------------------------------
+# Smart RPM detection
+# ---------------------------------------------------------------------------
+
+def detect_rpm_from_proxy(model: str) -> Optional[int]:
+    """Probe the LLM proxy for rate limit headers and return detected RPM.
+
+    Makes a minimal LLM call and inspects response headers for standard
+    rate limit info (x-ratelimit-limit-requests, x-ratelimit-limit, etc.).
+    Returns None if detection fails or no headers found.
+    """
+    try:
+        from litellm import completion
+        response = completion(
+            model=model,
+            messages=[{"role": "user", "content": "hi"}],
+            max_tokens=1,
+        )
+        # litellm stores raw response headers in _hidden_params
+        hidden = getattr(response, "_hidden_params", {})
+        headers = hidden.get("additional_headers", {}) or {}
+        if not headers:
+            # Some providers put headers elsewhere
+            headers = hidden.get("headers", {}) or {}
+
+        # Common header names for request rate limits
+        for header_name in (
+            "x-ratelimit-limit-requests",
+            "x-ratelimit-limit",
+            "ratelimit-limit",
+            "x-rate-limit-requests",
+        ):
+            val = headers.get(header_name)
+            if val:
+                try:
+                    rpm = int(val)
+                    if rpm > 0:
+                        return rpm
+                except (ValueError, TypeError):
+                    continue
+        return None
+    except Exception:
+        return None

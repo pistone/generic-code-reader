@@ -213,11 +213,15 @@ def review_one(entry: dict, model: str, codebase: Optional[Path],
     file_contents: dict[str, str] = {}
     for rel_path in entry.get("source_files", [])[:3]:  # cap at 3 files
         if codebase:
-            # Try direct relative path first, then rglob on basename
-            fpath = codebase / rel_path
+            fpath = (codebase / rel_path).resolve()
+            # Ensure resolved path stays within codebase (no path traversal)
+            if not str(fpath).startswith(str(codebase.resolve())):
+                file_contents[rel_path] = f"[blocked: path escapes codebase]"
+                continue
             if not fpath.exists():
                 candidates = list(codebase.rglob(Path(rel_path).name))
-                fpath = candidates[0] if candidates else codebase / rel_path
+                if candidates:
+                    fpath = candidates[0]
         else:
             fpath = Path(rel_path)
 
@@ -237,10 +241,14 @@ def review_one(entry: dict, model: str, codebase: Optional[Path],
     # 4. Parse decision
     try:
         data = json.loads(raw)
-        # Normalise decision string
-        data["decision"] = data.get("decision", "reject").strip().lower().split()[0]
-        if data["decision"] not in ("approve", "edit", "reject"):
-            data["decision"] = "reject"
+        # Normalise decision string — match first valid keyword
+        raw_decision = data.get("decision", "reject").strip().lower()
+        matched = "reject"
+        for valid in ("approve", "edit", "reject"):
+            if valid in raw_decision:
+                matched = valid
+                break
+        data["decision"] = matched
         return ReviewDecision(**data)
     except Exception as e:
         print(f"  [warn] could not parse LLM response: {e}\n  Raw: {raw[:300]}")

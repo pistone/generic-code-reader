@@ -20,12 +20,14 @@ reviewer/rejected_queue.json
 # Generated artifacts
 indexer/module_map.json
 indexer/summaries.json
+indexer/context_cache.json
 indexer/file_hashes.json
 indexer/cost_log.jsonl
 reviewer/cost_log.jsonl
 
 # Doc agent artifacts
 doc_agent/doc_hashes.json
+doc_agent/cost_log.jsonl
 
 # Auditor artifacts
 auditor/conflict_report.json
