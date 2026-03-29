@@ -99,6 +99,8 @@ def main():
                         help="Override language auto-detection")
     parser.add_argument("--passes", type=int, default=1,
                         help="Summarize+review iterations (default: 1)")
+    parser.add_argument("--exclude", nargs="+", default=None,
+                        help="Additional directories to skip (e.g. --exclude generated proto_out)")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process changed files/docs")
     parser.add_argument("--rpm", type=int, default=60,
@@ -151,6 +153,8 @@ def main():
         study_cmd += ["--language", args.language]
     if args.model_fast:
         study_cmd += ["--model-fast", args.model_fast]
+    if args.exclude:
+        study_cmd += ["--exclude"] + args.exclude
     if args.incremental:
         study_cmd.append("--incremental")
     if args.dry_run:

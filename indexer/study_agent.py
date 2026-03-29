@@ -3001,6 +3001,9 @@ def main():
     parser.add_argument("--incremental", action="store_true",
                         help="Only re-summarize files whose content has changed since "
                              "the last run. Uses a hash manifest (file_hashes.json).")
+    parser.add_argument("--exclude", nargs="+", default=None,
+                        help="Additional directories to skip. Can specify multiple: "
+                             "--exclude generated proto_out experimental")
     parser.add_argument("--include-tests", action="store_true",
                         help="Include test files and test directories (skipped by default)")
     parser.add_argument("--workers", type=int, default=4,
@@ -3027,6 +3030,11 @@ def main():
 
     if args.passes < 1:
         args.passes = 1
+
+    # Add user-specified exclusions to SKIP_DIRS
+    if args.exclude:
+        SKIP_DIRS.update(args.exclude)
+        print(f"[Config] Excluding additional dirs: {', '.join(args.exclude)}")
 
     output_dir = Path(args.output_dir).resolve() if args.output_dir else Path(__file__).parent
     output_dir.mkdir(parents=True, exist_ok=True)
