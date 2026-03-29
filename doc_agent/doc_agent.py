@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -29,8 +30,8 @@ from doc_agent.sources import LocalFileSource, RawDocument
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from codebase_shared.utils import (  # noqa: E402
-    TokenTracker, llm_call, load_manifest, save_manifest,
-    _is_quota_error,
+    TokenTracker, llm_call, allm_call, load_manifest, save_manifest,
+    _is_quota_error, AsyncRateLimiter,
 )
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
@@ -78,7 +79,7 @@ Output this JSON:
 
 def summarize_chunk(model: str, chunk: dict,
                     tracker: Optional[TokenTracker] = None) -> dict:
-    """Summarize a single doc chunk via LLM. Returns updated chunk dict."""
+    """Summarize a single doc chunk via LLM (sync). Returns updated chunk dict."""
     prompt = SUMMARIZE_PROMPT.format(
         doc_title=chunk["doc_title"],
         heading=chunk.get("heading", ""),
@@ -98,6 +99,93 @@ def summarize_chunk(model: str, chunk: dict,
         chunk["summary"] = chunk["text"][:200].strip()
         chunk["source_kind"] = "overview"
     return chunk
+
+
+async def _async_summarize_chunk(model: str, chunk: dict,
+                                  tracker: Optional[TokenTracker] = None) -> dict:
+    """Summarize a single doc chunk via async LLM call. Returns updated chunk dict."""
+    prompt = SUMMARIZE_PROMPT.format(
+        doc_title=chunk["doc_title"],
+        heading=chunk.get("heading", ""),
+        source_file=chunk["source_file"],
+        text=chunk["text"][:3000],
+    )
+    try:
+        raw = await allm_call(model, SUMMARIZE_SYSTEM, prompt,
+                              max_tokens=256, json_mode=True,
+                              tracker=tracker, phase="DocSummary")
+        result = json.loads(raw)
+        chunk["summary"] = result.get("summary", "")
+        chunk["source_kind"] = result.get("source_kind", "overview")
+    except (json.JSONDecodeError, TypeError) as e:
+        print(f"  [warn] summarize failed for {chunk.get('source_file', '?')}: {e}")
+        chunk["summary"] = chunk["text"][:200].strip()
+        chunk["source_kind"] = "overview"
+    return chunk
+
+
+async def _summarize_chunks_async(
+    model: str,
+    all_file_chunks: list[tuple[str, str, list[dict]]],
+    tracker: Optional[TokenTracker] = None,
+    max_concurrent: int = 20,
+    rpm: int = 500,
+    quiet: bool = False,
+) -> tuple[list[tuple[str, str, list[dict]]], bool]:
+    """Summarize all chunks across all files concurrently.
+
+    Args:
+        all_file_chunks: list of (source_path, content_hash, chunks) tuples
+        Returns: (completed file chunks, quota_hit flag)
+    """
+    limiter = AsyncRateLimiter(max_concurrent=max_concurrent,
+                               calls_per_minute=rpm)
+
+    total_chunks = sum(len(fc[2]) for fc in all_file_chunks)
+    done = 0
+
+    async def _do_one(chunk: dict) -> dict:
+        nonlocal done
+        result = await _async_summarize_chunk(model, chunk, tracker=tracker)
+        done += 1
+        if not quiet and done % 10 == 0:
+            print(f"  [summarize] {done}/{total_chunks} chunks done")
+        return result
+
+    # Build tasks: (coroutine_factory, callback) pairs for run_many
+    tasks = []
+    chunk_to_file: dict[int, int] = {}  # chunk index → file index
+    flat_chunks = []
+    for file_idx, (path, chash, chunks) in enumerate(all_file_chunks):
+        for chunk in chunks:
+            chunk_idx = len(flat_chunks)
+            flat_chunks.append(chunk)
+            chunk_to_file[chunk_idx] = file_idx
+            tasks.append(chunk)
+
+    # Use gather with rate limiting
+    async def _run_one(chunk: dict):
+        if limiter._halted:
+            return
+        try:
+            await limiter._wait_for_slot()
+            async with limiter._semaphore:
+                await _do_one(chunk)
+        except Exception as e:
+            err_str = str(e).lower()
+            if _is_quota_error(err_str):
+                limiter.halt("Quota exhausted")
+                limiter.quota_exhausted = True
+            else:
+                print(f"  [warn] LLM error: {e}")
+
+    await asyncio.gather(*[_run_one(c) for c in flat_chunks],
+                         return_exceptions=True)
+
+    if not quiet:
+        print(f"  [summarize] {done}/{total_chunks} chunks done")
+
+    return all_file_chunks, limiter.quota_exhausted
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +360,10 @@ def main():
                         help="Print detailed progress (each chunk, LLM responses)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-chunk progress")
+    parser.add_argument("--max-concurrent", type=int, default=20,
+                        help="Max concurrent LLM calls (default: 20)")
+    parser.add_argument("--rpm", type=int, default=500,
+                        help="Rate limit: requests per minute (default: 500)")
     args = parser.parse_args()
 
     output_dir = Path(__file__).resolve().parent
@@ -316,19 +408,17 @@ def main():
     else:
         print("LLM summarization disabled (--no-summarize)")
 
-    # 3. Parse → chunk → (summarize) → index
-    #    Manifest is saved after each file so we can resume on quota exhaustion.
+    # 3. Parse → chunk all files first
     total_chunks = 0
     total_files = len(raw_docs)
-    quota_hit = False
+    file_work: list[tuple[RawDocument, str, list[dict], str]] = []  # (raw, hash, chunks, last_mod)
+
     for file_idx, raw in enumerate(raw_docs, 1):
-        # Skip files already completed (resume support)
         current_hash = file_hash(raw.content_bytes)
         existing = manifest.get(raw.path, {})
         if (existing.get("hash") == current_hash
                 and existing.get("doc_ids")
                 and not args.incremental):
-            # Already processed with same content — skip
             if not args.quiet:
                 print(f"  [{file_idx}/{total_files}] {raw.path}: "
                       f"already done, skipping")
@@ -346,50 +436,49 @@ def main():
         chunks = chunk_document(parsed)
         last_mod = (raw.last_modified.isoformat()
                     if raw.last_modified else "")
+        file_work.append((raw, current_hash, chunks, last_mod))
 
-        # LLM summarization pass
+    quota_hit = False
+    if not file_work:
+        print("All documents already processed.")
+    else:
+        all_chunks_count = sum(len(fw[2]) for fw in file_work)
+        print(f"\n  {len(file_work)} file(s), {all_chunks_count} chunk(s) to process")
+
+        # 4. Async LLM summarization (all chunks concurrently)
         quota_hit = False
         if use_llm:
-            for i, chunk in enumerate(chunks):
-                try:
-                    summarize_chunk(args.model, chunk, tracker=tracker)
-                except Exception as e:
-                    err_str = str(e).lower()
-                    if _is_quota_error(err_str):
-                        print(f"\n⚠ Quota exhausted at {raw.path} "
-                              f"chunk {i+1}/{len(chunks)}")
-                        print(f"  Progress saved. Re-run to resume.")
-                        quota_hit = True
-                        break
-                    # Transient errors (timeout, network) — skip chunk, continue
-                    print(f"  [warn] {raw.path} chunk {i+1}: LLM error: {e}")
-                    continue
-                if not args.quiet:
-                    kind = chunk.get("source_kind", "?")
-                    print(f"  [{file_idx}/{total_files}] "
-                          f"{raw.path} chunk {i+1}/{len(chunks)}: {kind}")
-                time.sleep(0.2)  # basic rate limiting
+            all_file_chunks = [(fw[0].path, fw[1], fw[2]) for fw in file_work]
+            _, quota_hit = asyncio.run(
+                _summarize_chunks_async(
+                    args.model, all_file_chunks,
+                    tracker=tracker,
+                    max_concurrent=args.max_concurrent,
+                    rpm=args.rpm,
+                    quiet=args.quiet,
+                )
+            )
 
-        if quota_hit:
-            # Don't index partial file — leave it for next run
-            break
+        # 5. Index files that were fully summarized
+        for raw, current_hash, chunks, last_mod in file_work:
+            # Skip files with unsummarized chunks (quota hit mid-file)
+            if use_llm and any(not c.get("summary") for c in chunks):
+                print(f"  [skip] {raw.path}: incomplete summarization, "
+                      f"will retry next run")
+                continue
 
-        # purge old indexed docs before re-indexing
-        purge_old_docs(raw.path, manifest)
+            purge_old_docs(raw.path, manifest)
+            doc_ids = index_chunks(chunks, last_mod)
+            total_chunks += len(chunks)
+            print(f"  {raw.path}: {len(chunks)} chunk(s) indexed")
 
-        print(f"  [{file_idx}/{total_files}] {raw.path}: "
-              f"{len(chunks)} chunk(s)")
-        doc_ids = index_chunks(chunks, last_mod)
-        total_chunks += len(chunks)
+            manifest[raw.path] = {
+                "hash": current_hash,
+                "doc_ids": doc_ids,
+            }
+            save_manifest(manifest_path, manifest)
 
-        # Update manifest and save immediately (resume support)
-        manifest[raw.path] = {
-            "hash": current_hash,
-            "doc_ids": doc_ids,
-        }
-        save_manifest(manifest_path, manifest)
-
-    # 4. Final manifest save (redundant but explicit)
+    # Final manifest save (redundant but explicit)
     save_manifest(manifest_path, manifest)
 
     # Token tracking
@@ -399,9 +488,12 @@ def main():
         with cost_log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
 
-    if quota_hit:
-        print(f"\n[Paused] {total_chunks} chunks from {file_idx - 1} doc(s) "
-              f"indexed. Re-run to continue from file {file_idx}/{total_files}.")
+    if file_work and quota_hit:
+        indexed = sum(1 for r, h, c, l in file_work
+                      if manifest.get(r.path, {}).get("doc_ids"))
+        print(f"\n[Paused] {total_chunks} chunks from {indexed} doc(s) "
+              f"indexed. Re-run to continue ({len(file_work) - indexed} "
+              f"remaining).")
     else:
         print(f"\n[Done] {total_chunks} chunks from {len(raw_docs)} doc(s) "
               f"indexed into R2R")
