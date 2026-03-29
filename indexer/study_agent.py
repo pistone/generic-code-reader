@@ -3617,7 +3617,9 @@ def main():
         print(f"  {warn('Quota exhausted')} — partial results saved. Re-run to resume.")
     print(f"{hr}")
     print(f"\n  Next: Open Claude Code in this directory")
-    print(f"  Try: {dim('\"How does X work?\"')} or {dim('\"Where is Y implemented?\"')}")
+    example1 = dim('"How does X work?"')
+    example2 = dim('"Where is Y implemented?"')
+    print(f"  Try: {example1} or {example2}")
     print()
 
     if tracker.phases:
