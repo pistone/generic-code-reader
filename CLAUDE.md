@@ -366,6 +366,145 @@ the MCP server) and `*/cost_log.jsonl` (written by each agent).
 
 ---
 
+## Deployment Guide — Running on a Large Codebase
+
+### Prerequisites
+
+You need: Python 3.11+, Docker (for R2R), and at least one LLM API key.
+
+The tool reads environment variables — if they're already in your shell
+(e.g. from company tooling, a secrets manager, or `.bashrc`), you do NOT
+need a `.env` file. The variables it looks for:
+
+| Variable | Required? | Default |
+|----------|-----------|---------|
+| `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY` / `GROQ_API_KEY`) | At least one | — |
+| `OPENAI_API_BASE` | Only if using a company LLM proxy | — |
+| `LLM_MODEL` | No | `openai/gpt-4o` |
+| `R2R_URL` | No | `http://localhost:7272` |
+
+### Step-by-step
+
+```bash
+# 1. Clone and install
+git clone <repo> && cd generic-code-reader
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
+
+# 2. Start R2R (vector database)
+cd r2r && docker compose up -d && cd ..
+# Wait ~30s for it to be healthy. Verify:
+curl http://localhost:7272/v3/health
+
+# 3. Run preflight check (verifies env vars, R2R, model access)
+python preflight.py
+
+# 4. Run everything in one command
+python run.py \
+    --codebase /path/to/src \
+    --docs /path/to/design-docs \      # optional
+    --tickets /path/to/jira-export \   # optional
+    --model openai/gpt-4o \
+    --model-fast openai/gpt-4o-mini \
+    --max-concurrent 10 \
+    --rpm 100
+```
+
+### Tuning for your environment
+
+**`--max-concurrent`**: How many parallel LLM calls.
+- Company shared proxy: `5-10` (don't hog shared quota)
+- Company dedicated quota: `15-25`
+- OpenAI direct: `20-50`
+- Local Ollama/vLLM: `2-4` (GPU-bottlenecked)
+
+**`--rpm`**: Requests per minute cap. Start with `100` for company
+proxies, increase if no 429 errors. OpenAI Tier 1 = 500 RPM.
+
+**`--exclude`**: Skip directories that shouldn't be indexed:
+```bash
+python run.py --codebase /path/to/src \
+    --exclude generated proto_out third_party test
+```
+
+**`--codebase` can point to a subdirectory**: If you only want to index
+`src/core/engine/`, point `--codebase` there. Cross-file references
+outside that subtree won't be resolved (e.g., `#include "networking/socket.h"`
+from a sibling directory). C++ includes depend on build system `-I` flags
+and cannot be reliably resolved statically.
+
+### Quota and cost management
+
+**Cost estimation**: Before processing, the tool shows an estimated cost
+and prompts "Proceed? [Y/n]". Use `--yes` to skip the prompt.
+
+**Dry run**: `--dry-run` shows what would happen without making LLM calls.
+Cost estimates use litellm's pricing database. If your model isn't in
+litellm's database (e.g., a custom company endpoint), the estimate will
+show "unknown" — the tool still works, it just can't predict cost.
+
+**Quota exhaustion**: If the LLM returns a quota/budget error mid-run,
+all agents halt gracefully, save progress, and print a resume message.
+Re-run the same command to continue from where it stopped. The manifest
+files (`*_hashes.json`) track what's done.
+
+**Resume behavior**: Files already in the manifest with matching content
+hash are skipped. Only incomplete/new files are re-processed. You pay
+zero tokens for already-completed files.
+
+### Common issues
+
+**Pass 1 finds too few modules (e.g., 2 modules for a 10K-file repo)**:
+This means the LLM didn't explore enough before concluding. The current
+defaults (20 exploration rounds, depth-scaled tree) should prevent this.
+If it still happens:
+- Check the model — smaller/cheaper models are more likely to rush.
+  Use at least GPT-4o or Claude Sonnet for Pass 1.
+- Check the tree output in the logs — if the initial tree is too shallow,
+  the LLM doesn't see the structure it needs to explore.
+- You can re-run Pass 1 only with `--pass1-only` to iterate quickly.
+
+**Doc agent is slow**: The doc agent now uses async concurrent
+summarization (default 20 concurrent). If it's still slow:
+- Increase `--max-concurrent` (if your LLM endpoint allows)
+- Increase `--rpm` (if no 429 errors)
+- Use `--no-summarize` for a fast first pass (indexes raw text, lower
+  search quality but immediate)
+
+**Study agent killed mid-run**: Re-run the same command. It reads
+`summaries.json` and the file hash manifest to skip completed work.
+Content hashes verify integrity — if a file was edited between runs,
+its cached summary is discarded and the file is re-processed.
+
+**R2R not responding**: `docker compose -f r2r/compose.yaml ps` to check.
+It takes ~30s to start. `run.py` retries for 30s automatically.
+
+### Post-run
+
+```bash
+# Check KB health
+python status.py
+
+# Start MCP server for Claude Code
+# (already configured in .mcp.json — just open Claude Code in this directory)
+
+# Run auditor to check for doc↔code conflicts
+python -m auditor.auditor --model openai/gpt-4o-mini
+
+# Measure KB effectiveness over time
+python dashboard.py --period 7d --by-module
+```
+
+### Incremental updates
+
+When source code changes, re-run with `--incremental`:
+```bash
+python run.py --codebase /path/to/src --incremental
+```
+Only files with changed content hashes are re-processed.
+
+---
+
 ## Dependencies
 
 All LLM calls go through `litellm` — works with OpenAI, Anthropic,
@@ -375,3 +514,93 @@ company servers). Set `LLM_MODEL` to the litellm model string.
 Embeddings go through R2R's litellm integration. For on-premise
 deployment, change `base_model` in `r2r.toml` to point at your
 internal embedding server.
+
+---
+
+## Internals — What the deployment agent needs to know
+
+### How Pass 1 (module discovery) works
+
+Pass 1 is an **LLM tool-calling loop**, not a static analysis. The LLM
+gets a depth-limited directory tree and 5 tools: `expand_dirs`,
+`list_files`, `read_files`, `search_kb`, and `define_modules`.
+
+It explores iteratively for up to 20 rounds, then calls `define_modules`
+as the terminal tool. If it doesn't call it in time, it's forced.
+
+**The initial tree depth scales with codebase size**:
+- <500 files: depth 3
+- 500-5000 files: depth 4
+- 5000+ files: depth 5
+
+**Known behavior**: The LLM may rush to conclude with too few modules.
+The system prompt explicitly tells it to explore broadly first and that
+a large codebase typically has 5-20+ modules. If the model still
+produces too few modules, it likely needs a better model (GPT-4o or
+Claude Sonnet, not Haiku/Mini).
+
+If the LLM hits max rounds without calling `define_modules`, there's a
+fallback that forces the tool call, and then a directory-based fallback
+if that also fails.
+
+### How Pass 2 (summarization) works
+
+Pass 2 is **async concurrent** — all chunks are summarized in parallel
+via `AsyncRateLimiter`. The concurrency is controlled by
+`--max-concurrent` (default 50) and `--rpm` (default 500).
+
+The pipeline per chunk:
+1. File-level summary (1 sentence) — shared across all chunks in the file
+2. Class-level summary — shared across chunks in the same class
+3. Function pre-pass — for multi-chunk functions, scans the full function
+   to generate targeted questions
+4. Chunk summary — the main LLM call, receives all the above as context
+5. Call graph inversion — post-pass, no LLM, extracts "calls/called by"
+6. Function card synthesis — for multi-chunk functions, one more LLM call
+
+**Resume**: `summaries.json` is saved incrementally. Each entry has a
+`content_hash` (SHA256 of the chunk text). On resume, the hash is
+verified — if the file was edited, stale summaries are discarded.
+
+**Deduplication**: Chunks are deduped by exact content hash + length +
+line count. Duplicates are logged and skipped.
+
+### How the doc agent works
+
+The doc agent is **also async concurrent** now (was sequential before).
+Chunks across all files are summarized in parallel, then indexed per-file.
+
+If a chunk fails summarization due to transient errors (timeout, network),
+it falls back to raw text (first 300 chars) rather than skipping the
+entire file. Only quota exhaustion causes a full halt.
+
+The manifest saves after each file is indexed. On resume, files with
+matching hash + doc_ids in the manifest are skipped.
+
+### AsyncRateLimiter
+
+The shared rate limiter (`codebase_shared/utils.py`) provides:
+- Semaphore-based concurrency control
+- Token-bucket rate limiting (RPM)
+- Quota detection: on hard budget errors, sets `_halted=True` and all
+  pending tasks skip immediately
+- `quota_exhausted` flag for callers to check after `run_many()` returns
+- Thread-safe token tracking via `TokenTracker` with `threading.Lock`
+
+### Quota detection
+
+`_is_quota_error(err_str)` checks for multi-word phrases to avoid false
+positives. The signals include: "quota", "insufficient_quota", "budget
+exceeded", "spending limit", "credits exhausted", etc.
+
+Transient 429 rate limits are NOT treated as quota errors — they trigger
+retry with backoff. Only hard budget/billing errors trigger halt.
+
+### File structure conventions
+
+- `*_hashes.json` — incremental change manifests (file path → content hash + doc_ids)
+- `cost_log.jsonl` — per-run token usage logs (one JSON line per run)
+- `summaries.json` — main study agent output (list of chunk summaries)
+- `module_map.json` — Pass 1 output (project name, description, modules list)
+- `staging_queue.json` — MCP suggestions awaiting review
+- `query_log.jsonl` — MCP search queries with full answers (for eval)

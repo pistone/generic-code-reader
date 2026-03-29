@@ -144,11 +144,14 @@ async def _summarize_chunks_async(
     total_chunks = sum(len(fc[2]) for fc in all_file_chunks)
     done = 0
 
+    # Print every N chunks, scaling with total (at least every 5)
+    print_interval = max(1, min(10, total_chunks // 10))
+
     async def _do_one(chunk: dict) -> dict:
         nonlocal done
         result = await _async_summarize_chunk(model, chunk, tracker=tracker)
         done += 1
-        if not quiet and done % 10 == 0:
+        if not quiet and (done % print_interval == 0 or done == total_chunks):
             print(f"  [summarize] {done}/{total_chunks} chunks done")
         return result
 
@@ -438,6 +441,10 @@ def main():
                     if raw.last_modified else "")
         file_work.append((raw, current_hash, chunks, last_mod))
 
+    skipped = total_files - len(file_work)
+    if skipped > 0:
+        print(f"  ({skipped} file(s) already done, skipped)")
+
     quota_hit = False
     if not file_work:
         print("All documents already processed.")
@@ -459,13 +466,22 @@ def main():
                 )
             )
 
-        # 5. Index files that were fully summarized
+        # 5. Index all files — fill in missing summaries with raw text
         for raw, current_hash, chunks, last_mod in file_work:
-            # Skip files with unsummarized chunks (quota hit mid-file)
-            if use_llm and any(not c.get("summary") for c in chunks):
-                print(f"  [skip] {raw.path}: incomplete summarization, "
-                      f"will retry next run")
-                continue
+            missing = sum(1 for c in chunks if not c.get("summary"))
+            if missing:
+                if quota_hit:
+                    # Quota exhausted: don't index partial work, leave for next run
+                    print(f"  [skip] {raw.path}: {missing}/{len(chunks)} chunks "
+                          f"unsummarized (quota), will retry next run")
+                    continue
+                # Transient failures: fill in raw text so the file still gets indexed
+                for c in chunks:
+                    if not c.get("summary"):
+                        c["summary"] = c["text"][:300].strip()
+                        c["source_kind"] = c.get("source_kind", "overview")
+                print(f"  [warn] {raw.path}: {missing}/{len(chunks)} chunks "
+                      f"used raw text fallback")
 
             purge_old_docs(raw.path, manifest)
             doc_ids = index_chunks(chunks, last_mod)

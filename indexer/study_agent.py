@@ -1474,16 +1474,21 @@ async def run_review(model: str, summaries: list[dict],
 PASS1_SYSTEM = (
     "You are a senior software architect exploring a codebase to build a "
     "semantic knowledge base. Use the provided tools to explore the directory "
-    "structure and read key files. When you understand the architecture, call "
-    "define_modules to define the module map.\n\n"
+    "structure and read key files. When you have thoroughly explored the "
+    "codebase, call define_modules to define the module map.\n\n"
     "Guidelines:\n"
+    "- IMPORTANT: Explore broadly BEFORE defining modules. Use expand_dirs on "
+    "every major directory. Read at least one key file per area. Do NOT rush "
+    "to call define_modules after only 2-3 exploration rounds.\n"
+    "- A large codebase typically has 5-20+ modules — if you only see 2-3, "
+    "you haven't explored enough. Keep exploring.\n"
     "- Each module should map to a directory or group of related directories\n"
     "- Every source file should belong to exactly one module\n"
     "- Write 3-6 domain-specific questions per module (use the project's vocabulary)\n"
     "- Focus questions on HOW things work internally, not just WHAT they are"
 )
 
-MAX_EXPLORE_ROUNDS = 8   # cap on interactive exploration rounds
+MAX_EXPLORE_ROUNDS = 20  # cap on interactive exploration rounds
 MAX_FILES_PER_READ = 8   # max files per read_files call
 
 
@@ -1703,8 +1708,9 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     """
     print(f"\n[Pass 1] {len(files)} source files found.")
 
-    # Build initial tree
-    tree = build_directory_tree(codebase, files, max_depth=3)
+    # Build initial tree — deeper for larger codebases
+    initial_depth = 3 if len(files) < 500 else 4 if len(files) < 5000 else 5
+    tree = build_directory_tree(codebase, files, max_depth=initial_depth)
     tree_lines = len(tree.split("\n"))
     print(f"[Pass 1] Directory tree: {tree_lines} lines, {len(tree)} chars")
 
@@ -1713,14 +1719,24 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     if docs_context:
         docs_section = f"\n\nDesign documentation (excerpts):\n{docs_context}"
 
+    # Count top-level dirs to set expectations
+    top_dirs = set()
+    for f in files:
+        rel = f.relative_to(codebase)
+        if len(rel.parts) > 1:
+            top_dirs.add(rel.parts[0])
+
     initial_prompt = (
         f"Explore this {language} codebase and define its modules.\n\n"
         f"Directory tree (depth-limited, counts on truncated nodes):\n"
         f"```\n{tree}\n```"
         f"{docs_section}\n\n"
-        f"Use the tools to explore directories and read key files. "
-        f"When you understand the architecture, call define_modules. "
-        f"You have up to {MAX_EXPLORE_ROUNDS} exploration rounds."
+        f"This codebase has {len(files)} files across {len(top_dirs)} "
+        f"top-level directories. Explore broadly first — expand the major "
+        f"directories, read a few key files in each area, then define modules. "
+        f"A project this size likely has 5-20+ distinct modules.\n\n"
+        f"You have {MAX_EXPLORE_ROUNDS} exploration rounds — use at least "
+        f"half of them exploring before calling define_modules."
     )
 
     # Create dispatcher
