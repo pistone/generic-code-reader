@@ -346,6 +346,26 @@ precision, recall, F1) and an aggregate summary.
 
 ---
 
+## Token Savings Dashboard
+
+Measures how much the KB saves vs raw file reads.
+
+```bash
+python dashboard.py                     # terminal summary
+python dashboard.py --period 7d         # last 7 days only
+python dashboard.py --model claude-opus  # cost estimates for Opus pricing
+python dashboard.py --by-module         # breakdown by module
+python dashboard.py --detail            # per-query table
+python dashboard.py --json              # machine-readable output
+```
+
+Shows: tokens saved, dollar savings, ROI (indexing cost vs cumulative
+savings), team size projections, top repeated queries, and per-module
+breakdown. Reads from `mcp_server/query_log.jsonl` (auto-populated by
+the MCP server) and `*/cost_log.jsonl` (written by each agent).
+
+---
+
 ## Dependencies
 
 All LLM calls go through `litellm` — works with OpenAI, Anthropic,
