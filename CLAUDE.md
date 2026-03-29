@@ -25,10 +25,20 @@ produces a knowledge base tailored to that domain's vocabulary.
 │    - Produces: module_map.json (modules + questions)    │
 │                                                         │
 │  Pass 2: Summarization                                  │
-│    - Chunks files with tree-sitter (AST boundaries)     │
-│    - LLM generates domain-aware summaries per chunk     │
-│    - With --rag: queries KB before each chunk            │
-│    - Produces: summaries.json                           │
+│    2a. File summaries — 1-sentence per file             │
+│    2b. Function pre-pass — for multi-chunk functions,   │
+│        scans signature + structure → generates targeted  │
+│        per-chunk questions ("Focus on: ...")             │
+│    2c. Class summaries — 1-sentence per class           │
+│    2d. Chunk summarization — domain-aware summaries     │
+│        informed by file/class/function context           │
+│        + pre-pass questions + optional RAG context       │
+│    2e. Call graph inversion — zero LLM cost, extracts   │
+│        calls/called-by from summaries + code, enriches  │
+│        summaries with "Called by: ..." annotations       │
+│    2f. Function cards — for multi-chunk functions,       │
+│        synthesizes contract/phases/decisions/complexity  │
+│    - Produces: summaries.json, call_graph.json          │
 │                                                         │
 │  Pass 3+: Review (when --passes > 1)                    │
 │    - LLM reviews each summary for accuracy              │
@@ -102,8 +112,11 @@ so searches for exact identifiers match the source directly.
 
 - **Pass 1**: Module discovery — LLM groups files into modules and
   generates domain-specific question lists
-- **Pass 2**: Summarization — per-chunk summaries guided by module
-  questions, optionally RAG-augmented from design docs
+- **Pass 2**: Summarization with multi-level context:
+  - Function pre-pass generates targeted questions per chunk
+  - Chunk summaries guided by file/class/function context + questions
+  - Call graph inversion adds "Called by" annotations (no LLM cost)
+  - Function cards synthesize contract/phases/decisions for complex functions
 - **Pass 3+**: Review — LLM reviews each summary against KB context,
   rewrites weak ones. Converges when edit rate < 5%
 
@@ -242,7 +255,8 @@ generic-code-reader/
 
 Runtime artifacts (gitignored):
 - `indexer/module_map.json` — Pass 1 output
-- `indexer/summaries.json` — Pass 2 output
+- `indexer/summaries.json` — Pass 2 output (chunks, overviews, function cards)
+- `indexer/call_graph.json` — call graph: calls, called_by, stats
 - `indexer/context_cache.json` — cached file/class/function summaries for resume
 - `indexer/file_hashes.json` — incremental change manifest
 - `indexer/cost_log.jsonl` — token usage log
@@ -257,6 +271,78 @@ Runtime artifacts (gitignored):
 - `mcp_server/query_log.jsonl` — search query audit log
 - `reviewer/rejected_queue.json` — rejected suggestions
 - `reviewer/cost_log.jsonl` — reviewer token usage log
+
+---
+
+## Explorer Agent (Autonomous)
+
+An alternative to the study agent's fixed pipeline. The explorer agent
+decides what to read, how deep to go, and when to stop.
+
+```bash
+python -m explorer_agent.explorer_agent \
+    --codebase /path/to/src \
+    --context-root /path/to/repo   # optional: follow refs outside subtree
+```
+
+It maintains a knowledge state with modules, hypotheses, and confidence
+scores. Output is compatible with the study agent's `summaries.json`
+schema and can be indexed into R2R the same way.
+
+Use this when you want deep exploration of a specific area rather than
+broad coverage of the whole codebase.
+
+---
+
+## Evaluating KB Effectiveness
+
+The MCP server logs every `search_codebase` call — including the full
+question, answer, and result files — to `mcp_server/query_log.jsonl`.
+
+### Workflow
+
+1. **Use the KB naturally.** Have Claude resolve tickets or answer
+   questions while the MCP server is running. Queries accumulate.
+
+2. **Extract a reusable benchmark** from real usage:
+   ```bash
+   python eval/eval_kb.py extract --query-log mcp_server/query_log.jsonl
+   # → eval/test_questions.jsonl (deduped, with expected files)
+   ```
+
+3. **Evaluate** with one of three modes:
+
+   **Replay** — re-run logged queries against the current (or rebuilt) KB:
+   ```bash
+   python eval/eval_kb.py replay --query-log mcp_server/query_log.jsonl
+   ```
+
+   **Compare** — same queries against two KBs (e.g. study_agent vs
+   explorer_agent, or old vs new). Run two R2R instances on different ports:
+   ```bash
+   python eval/eval_kb.py compare \
+       --questions eval/test_questions.jsonl \
+       --kb-a http://localhost:7272 \
+       --kb-b http://localhost:7273 \
+       --judge    # optional: LLM judges which answer is better
+   ```
+
+   **Blind** — score KB quality and recall against expected files:
+   ```bash
+   python eval/eval_kb.py blind \
+       --questions eval/test_questions.jsonl
+   ```
+
+Each mode produces a JSON results file with per-query scores (quality,
+precision, recall, F1) and an aggregate summary.
+
+### Artifacts
+
+- `mcp_server/query_log.jsonl` — full question+answer log (auto-generated)
+- `eval/test_questions.jsonl` — curated benchmark (extracted or hand-written)
+- `eval/replay_results.json` — replay eval output
+- `eval/compare_results.json` — A/B comparison output
+- `eval/blind_results.json` — blind eval output
 
 ---
 

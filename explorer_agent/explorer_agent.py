@@ -271,7 +271,11 @@ class CodebaseView:
             elif self.context_root:
                 # Try under context_root: exact path first, then filename match
                 ctx_p = (self.context_root / rel_path).resolve()
-                if ctx_p.exists() and str(ctx_p).startswith(str(self.context_root)):
+                try:
+                    _in_ctx = ctx_p.is_relative_to(self.context_root)
+                except AttributeError:
+                    _in_ctx = str(ctx_p).startswith(str(self.context_root) + os.sep)
+                if ctx_p.exists() and _in_ctx:
                     p = ctx_p
                 else:
                     self._ensure_context_index()
@@ -308,52 +312,102 @@ class CodebaseView:
             return {"error": str(e)}
 
     def search_content(self, pattern: str, max_results: int = 10) -> list[dict]:
-        """Simple grep-like search across files.
+        """Search files for a pattern using ripgrep (fast) or grep (fallback).
 
         Searches root first. If context_root is set and results are sparse,
         also searches the wider context (tagged with [context] prefix).
         """
+        import subprocess
+        import shutil
+
+        results: list[dict] = []
+
+        def _run_search(search_dir: Path, tag: str = "") -> list[dict]:
+            """Run rg or grep and parse results."""
+            remaining = max_results - len(results)
+            if remaining <= 0:
+                return []
+
+            rg = shutil.which("rg")
+            if rg:
+                cmd = [
+                    rg, "--no-heading", "--line-number", "--max-count",
+                    str(remaining), "--max-columns", "200",
+                    "--case-sensitive", "--iglob", "!.git",
+                    pattern, str(search_dir),
+                ]
+            else:
+                cmd = [
+                    "grep", "-rn", "--max-count", str(remaining),
+                    "-I",  # skip binary files
+                    pattern, str(search_dir),
+                ]
+
+            try:
+                proc = subprocess.run(
+                    cmd, capture_output=True, text=True,
+                    timeout=30, errors="replace",
+                )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                # Fall back to Python search for this directory
+                return self._python_search(search_dir, pattern, remaining, tag)
+
+            hits = []
+            for line in proc.stdout.splitlines():
+                if len(results) + len(hits) >= max_results:
+                    break
+                # Format: filepath:lineno:text
+                parts = line.split(":", 2)
+                if len(parts) >= 3:
+                    try:
+                        fpath = Path(parts[0])
+                        rel = str(fpath.relative_to(search_dir))
+                        hits.append({
+                            "file": f"{tag}{rel}" if tag else rel,
+                            "line": int(parts[1]),
+                            "text": parts[2].strip()[:200],
+                        })
+                    except (ValueError, Exception):
+                        continue
+            return hits
+
+        # Search exploration root first
+        results.extend(_run_search(self.root))
+
+        # If few results and context_root available, widen the search
+        if len(results) < max_results and self.context_root:
+            results.extend(_run_search(self.context_root, tag="[context] "))
+
+        return results
+
+    def _python_search(self, search_dir: Path, pattern: str,
+                       max_results: int, tag: str = "") -> list[dict]:
+        """Fallback: Python-based search when rg/grep unavailable."""
         import re
-        self._ensure_index()
         results = []
         try:
             regex = re.compile(pattern, re.IGNORECASE)
         except re.error:
             return [{"error": f"Invalid pattern: {pattern}"}]
 
-        def _search_files(file_list, base_path, tag=""):
-            for f in file_list:
-                if len(results) >= max_results:
-                    break
-                try:
-                    content = f.read_text(encoding="utf-8", errors="replace")
-                    for i, line in enumerate(content.splitlines(), 1):
-                        if regex.search(line):
-                            rel = str(f.relative_to(base_path))
-                            results.append({
-                                "file": f"{tag}{rel}" if tag else rel,
-                                "line": i,
-                                "text": line.strip()[:200],
-                            })
-                            if len(results) >= max_results:
-                                break
-                except Exception:
-                    continue
-
-        # Search exploration root first
-        _search_files(self._all_files, self.root)  # type: ignore
-
-        # If few results and context_root available, widen the search
-        if len(results) < max_results and self.context_root:
-            self._ensure_context_index()
-            # Collect context files not already under root
-            ctx_files = []
-            for name, paths in (self._context_index or {}).items():
-                for p in paths:
-                    if not p.is_relative_to(self.root):
-                        ctx_files.append(p)
-            _search_files(ctx_files, self.context_root, tag="[context] ")
-
+        self._ensure_index()
+        for f in (self._all_files or []):
+            if len(results) >= max_results:
+                break
+            try:
+                content = f.read_text(encoding="utf-8", errors="replace")
+                for i, line in enumerate(content.splitlines(), 1):
+                    if regex.search(line):
+                        rel = str(f.relative_to(search_dir))
+                        results.append({
+                            "file": f"{tag}{rel}" if tag else rel,
+                            "line": i,
+                            "text": line.strip()[:200],
+                        })
+                        if len(results) >= max_results:
+                            break
+            except Exception:
+                continue
         return results
 
     def tree(self, max_depth: int = 2) -> str:

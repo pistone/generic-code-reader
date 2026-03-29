@@ -354,13 +354,16 @@ def main():
                 try:
                     summarize_chunk(args.model, chunk, tracker=tracker)
                 except Exception as e:
-                    if _is_quota_error(str(e).lower()):
+                    err_str = str(e).lower()
+                    if _is_quota_error(err_str):
                         print(f"\n⚠ Quota exhausted at {raw.path} "
                               f"chunk {i+1}/{len(chunks)}")
                         print(f"  Progress saved. Re-run to resume.")
                         quota_hit = True
                         break
-                    raise
+                    # Transient errors (timeout, network) — skip chunk, continue
+                    print(f"  [warn] {raw.path} chunk {i+1}: LLM error: {e}")
+                    continue
                 if not args.quiet:
                     kind = chunk.get("source_kind", "?")
                     print(f"  [{file_idx}/{total_files}] "

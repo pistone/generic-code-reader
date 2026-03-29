@@ -456,7 +456,8 @@ class AsyncRateLimiter:
 
         self._semaphore = asyncio.Semaphore(max_concurrent)
         self._interval = 60.0 / calls_per_minute
-        self._lock = asyncio.Lock()
+        self._lock = asyncio.Lock()         # protects _last_call for rate limiting
+        self._counter_lock = asyncio.Lock() # protects completed/skipped counts
         self._last_call = 0.0
         self._max_retries = max_retries
         self._halted = False
@@ -527,27 +528,33 @@ class AsyncRateLimiter:
 
         async def _run_one(idx, factory):
             if self._halted:
-                self.skipped_count += 1
+                async with self._counter_lock:
+                    self.skipped_count += 1
                 return
 
             last_err = None
             for attempt in range(self._max_retries + 1):
                 if self._halted:
-                    self.skipped_count += 1
+                    async with self._counter_lock:
+                        self.skipped_count += 1
                     return
 
                 async with self._semaphore:
                     if self._halted:
-                        self.skipped_count += 1
+                        async with self._counter_lock:
+                            self.skipped_count += 1
                         return
 
                     await self._wait_for_slot()
                     try:
                         result = await factory()
                         results[idx] = result
-                        self.completed_count += 1
+                        async with self._counter_lock:
+                            self.completed_count += 1
                         if on_result:
-                            on_result(idx, result)
+                            _cb_result = on_result(idx, result)
+                            if asyncio.iscoroutine(_cb_result):
+                                await _cb_result
                         return
                     except Exception as e:
                         err_str = str(e).lower()

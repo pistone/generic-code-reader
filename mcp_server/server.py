@@ -67,14 +67,26 @@ def get_client() -> R2RClient:
     return R2RClient(R2R_URL)
 
 
-def _log_query(query: str, num_results: int, approx_tokens: int) -> None:
-    """Append one line to the query log for experiment measurement."""
+def _log_query(query: str, num_results: int, approx_tokens: int,
+               answer: str = "", scope: str = "", module: str = "",
+               source_type: str = "",
+               result_files: list[str] | None = None) -> None:
+    """Append one line to the query log for experiment measurement.
+
+    Logs both the question and the full answer so that queries can be
+    replayed against a different KB (or no KB) for A/B comparison.
+    """
     try:
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "query": query,
+            "scope": scope,
+            "module": module,
+            "source_type": source_type,
             "num_results": num_results,
             "approx_tokens": approx_tokens,
+            "result_files": result_files or [],
+            "answer": answer,
         }
         with LOG_FILE.open("a") as f:
             f.write(json.dumps(entry) + "\n")
@@ -252,7 +264,18 @@ def search_codebase(query: str, module: str = "",
     if cross_note:
         full_output += "\n\n" + cross_note
     approx_tokens = len(full_output) // 4
-    _log_query(query, len(hits), approx_tokens)
+
+    # Extract result file list for evaluation
+    result_files = []
+    for h in hits:
+        meta = h.metadata or {}
+        src = meta.get("source_file", "")
+        if src and src not in result_files:
+            result_files.append(src)
+
+    _log_query(query, len(hits), approx_tokens,
+               answer=full_output, scope=scope, module=module,
+               source_type=source_type, result_files=result_files)
 
     return full_output
 

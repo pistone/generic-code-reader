@@ -172,7 +172,12 @@ def main():
     if conflict_path.exists():
         try:
             conflicts = json.loads(conflict_path.read_text())
-            n = len(conflicts) if isinstance(conflicts, list) else 0
+            if isinstance(conflicts, dict):
+                n = len(conflicts.get("conflicts", []))
+            elif isinstance(conflicts, list):
+                n = len(conflicts)
+            else:
+                n = 0
             if n:
                 print(f"  Conflicts: {n} doc/code conflicts found (auditor/conflict_report.json)")
         except Exception:

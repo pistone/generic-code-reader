@@ -215,7 +215,12 @@ def review_one(entry: dict, model: str, codebase: Optional[Path],
         if codebase:
             fpath = (codebase / rel_path).resolve()
             # Ensure resolved path stays within codebase (no path traversal)
-            if not str(fpath).startswith(str(codebase.resolve())):
+            try:
+                _in_codebase = fpath.is_relative_to(codebase.resolve())
+            except AttributeError:
+                # Python < 3.9 fallback
+                _in_codebase = str(fpath).startswith(str(codebase.resolve()) + os.sep)
+            if not _in_codebase:
                 file_contents[rel_path] = f"[blocked: path escapes codebase]"
                 continue
             if not fpath.exists():

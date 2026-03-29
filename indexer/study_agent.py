@@ -98,17 +98,41 @@ SKIP_TEST_DIRS = {"test", "tests", "testing", "test_data", "testdata",
 _search_kb_failures = 0
 _quota_exhausted = False  # module-level flag, set when any phase hits quota
 
+# Regex for extracting function calls from summaries (for call graph inversion)
+import re as _re_mod
+_CALL_PATTERNS = [
+    # "calls Foo::bar()", "invokes Foo::bar", "delegates to Foo::bar"
+    _re_mod.compile(r'(?:calls?|invokes?|delegates?\s+to|forwards?\s+to)\s+'
+                    r'(?:`)?(\w[\w:]*(?:::\w+)?)\s*(?:\(\))?(?:`)?', _re_mod.IGNORECASE),
+    # "via Foo::bar()" or "through Foo::bar()"
+    _re_mod.compile(r'(?:via|through)\s+(?:`)?(\w[\w:]*(?:::\w+)?)\s*(?:\(\))?(?:`)?',
+                    _re_mod.IGNORECASE),
+    # "uses Foo::bar()" — only if followed by () to avoid "uses the cache"
+    _re_mod.compile(r'(?:uses)\s+(?:`)?(\w[\w:]*(?:::\w+)?)\s*\(\)(?:`)?', _re_mod.IGNORECASE),
+]
+
 # Cache for file lookups to avoid repeated rglob walks
 _file_index_cache: dict[Path, dict[str, list[Path]]] = {}
 
 def _find_file(codebase: Path, filename: str) -> Optional[Path]:
-    """Find a file by name using a cached index. O(1) after first call."""
+    """Find a file by name using a cached index. O(1) after first call.
+
+    Only indexes source/config files — skips binaries, build artifacts,
+    and directories in SKIP_DIRS.
+    """
     if codebase not in _file_index_cache:
-        # Build index once: map basename -> list of full paths
         index: dict[str, list[Path]] = {}
         for p in codebase.rglob("*"):
-            if p.is_file():
-                index.setdefault(p.name, []).append(p)
+            if not p.is_file():
+                continue
+            if p.suffix in SKIP_SUFFIXES:
+                continue
+            if any(part in SKIP_DIRS for part in p.parts):
+                continue
+            # Only index files with known extensions (skip binaries, images, etc.)
+            if p.suffix and p.suffix not in _INDEXABLE_SUFFIXES:
+                continue
+            index.setdefault(p.name, []).append(p)
         _file_index_cache[codebase] = index
 
     matches = _file_index_cache.get(codebase, {}).get(filename, [])
@@ -149,6 +173,14 @@ for _lang, _exts in LANG_EXT_MAP.items():
     for _ext in _exts:
         _EXT_TO_LANG[_ext] = _lang
 
+# Extensions worth indexing for _find_file (source + headers + configs)
+_INDEXABLE_SUFFIXES = set()
+for _exts in LANG_EXT_MAP.values():
+    _INDEXABLE_SUFFIXES.update(_exts)
+_INDEXABLE_SUFFIXES.update({".h", ".hpp", ".hxx", ".hh", ".inl",
+                            ".json", ".yaml", ".yml", ".toml", ".cfg",
+                            ".md", ".rst", ".txt"})
+
 
 def detect_language(codebase: Path) -> Optional[str]:
     """Auto-detect the dominant language by counting file extensions.
@@ -157,15 +189,24 @@ def detect_language(codebase: Path) -> Optional[str]:
     with the most files, or None if no known language found.
     """
     counts: dict[str, int] = {}
-    for p in codebase.rglob("*"):
-        if not p.is_file():
-            continue
-        # Skip build/vendor dirs
-        if any(part in SKIP_DIRS for part in p.parts):
-            continue
-        lang = _EXT_TO_LANG.get(p.suffix)
-        if lang:
-            counts[lang] = counts.get(lang, 0) + 1
+    max_depth = 3
+
+    def _walk(directory: Path, depth: int):
+        if depth > max_depth:
+            return
+        try:
+            entries = list(directory.iterdir())
+        except PermissionError:
+            return
+        for p in entries:
+            if p.is_file():
+                lang = _EXT_TO_LANG.get(p.suffix)
+                if lang:
+                    counts[lang] = counts.get(lang, 0) + 1
+            elif p.is_dir() and p.name not in SKIP_DIRS:
+                _walk(p, depth + 1)
+
+    _walk(codebase, 0)
     if not counts:
         return None
     winner = max(counts, key=counts.get)  # type: ignore[arg-type]
@@ -554,6 +595,13 @@ FUNC_SUMMARY_SYSTEM = (
     "function/method does. Use specific names and domain concepts."
 )
 
+# Feature 3: Pre-pass context system — generates both a summary and
+# per-chunk targeted questions for multi-chunk functions.
+FUNC_PREPASS_SYSTEM = (
+    "You are a senior code analyst performing a pre-scan of a function. "
+    "Output ONLY valid JSON — no markdown, no text outside the JSON."
+)
+
 
 async def _generate_function_summaries(
     model: str, chunks: list[str], groups: list[list[int]],
@@ -561,12 +609,15 @@ async def _generate_function_summaries(
     limiter: "AsyncRateLimiter",
     tracker: Optional[TokenTracker] = None,
 ) -> dict[int, str]:
-    """Generate function summaries for multi-chunk functions.
+    """Generate function context for multi-chunk functions (Feature 3: pre-pass).
 
-    Returns a dict mapping chunk_index → function summary string.
-    Only chunks that are continuations (index > 0 within their group) get entries.
-    The first chunk of each group doesn't need a function summary — it contains
-    the function signature and opening context.
+    For each multi-chunk function, scans the function signature + structure
+    to generate:
+    - A 1-sentence summary (applied to continuation chunks)
+    - Per-chunk targeted questions (injected into chunk summarization prompts)
+
+    Returns a dict mapping chunk_index → context string.
+    The first chunk gets context too (with questions), not just continuations.
     """
     # Identify multi-chunk groups
     multi_groups = [g for g in groups if len(g) > 1]
@@ -575,41 +626,328 @@ async def _generate_function_summaries(
 
     result: dict[int, str] = {}
 
-    async def _summarize_group(group: list[int]):
-        """Generate summary from the first chunk, apply to remaining chunks."""
+    async def _prepass_group(group: list[int]):
+        """Pre-scan a multi-chunk function: generate summary + per-chunk questions."""
         first_chunk = chunks[group[0]]
         func_name = _extract_function_name(first_chunk) or "unknown"
+
+        # Build a structural overview of each chunk (cheap, no LLM)
+        chunk_overviews = []
+        for i, idx in enumerate(group):
+            chunk_text = chunks[idx] if idx < len(chunks) else ""
+            lines = chunk_text.splitlines()
+            n_lines = len(lines)
+            # Extract key structural features
+            has_if = sum(1 for l in lines if _re.search(r'\bif\s*\(', l))
+            has_loop = sum(1 for l in lines if _re.search(r'\b(?:for|while)\s*\(', l))
+            has_try = sum(1 for l in lines if _re.search(r'\b(?:try|catch)\b', l))
+            has_return = sum(1 for l in lines if _re.search(r'\breturn\b', l))
+            # First 2 non-empty lines as preview
+            preview_lines = [l.strip() for l in lines if l.strip()][:2]
+            preview = "; ".join(preview_lines)[:120]
+
+            chunk_overviews.append(
+                f"Chunk {i+1}/{len(group)} (idx={idx}, {n_lines} lines): "
+                f"{has_if} branches, {has_loop} loops, {has_try} try/catch, "
+                f"{has_return} returns. Preview: {preview}"
+            )
 
         prompt = f"""File: {rel_path}
 {f'File purpose: {file_summary}' if file_summary else ''}
 Function: {func_name}
+Chunks: {len(group)}
 
+Function signature and opening:
 ```
-{first_chunk[:3000]}
+{first_chunk[:2000]}
 ```
 
-One sentence describing what this function does:"""
+Chunk structure:
+{chr(10).join(chunk_overviews)}
+
+Analyze this function and output JSON:
+{{
+  "summary": "1 sentence: what this function does",
+  "params": ["param_name: brief role"],
+  "chunk_questions": [
+    ["question to answer when reading chunk 1"],
+    ["question to answer when reading chunk 2"],
+    ...
+  ]
+}}
+
+For chunk_questions, generate 1-2 targeted questions per chunk based on the
+structural hints above. Examples of good questions:
+- "What validation rules are checked before processing?"
+- "Under what conditions does the retry loop give up?"
+- "What state is mutated in the error handling path?"
+- "What cleanup happens when the function exits early?"
+
+These questions will guide a per-chunk summarizer to focus on what matters."""
 
         try:
-            summary = await allm_call(model, FUNC_SUMMARY_SYSTEM, prompt,
-                                      max_tokens=80, tracker=tracker,
-                                      phase="Func summaries")
-            summary = summary.strip()
-            # Apply to all continuation chunks (not the first one)
-            for idx in group[1:]:
-                result[idx] = f"[Continuation of {func_name}()] {summary}"
-        except Exception:
-            # Fallback: just note it's a continuation
+            raw = await allm_call(model, FUNC_PREPASS_SYSTEM, prompt,
+                                  max_tokens=400, tracker=tracker,
+                                  phase="Func pre-pass")
+            raw = raw.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```", 2)[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            data = json.loads(raw)
+        except (json.JSONDecodeError, Exception):
+            # Fallback: basic summary, no questions
             for idx in group[1:]:
                 result[idx] = f"[Continuation of {func_name}()]"
+            return
+
+        summary = data.get("summary", f"{func_name}: unknown purpose")
+        params = data.get("params", [])
+        chunk_questions = data.get("chunk_questions", [])
+
+        params_str = "; ".join(params) if params else ""
+        base_context = f"[Function: {func_name}] {summary}"
+        if params_str:
+            base_context += f"\nParameters: {params_str}"
+
+        # Apply context to ALL chunks in the group (including the first)
+        for i, idx in enumerate(group):
+            parts = [base_context]
+
+            if i > 0:
+                parts[0] = f"[Continuation of {func_name}()] {summary}"
+                if params_str:
+                    parts.append(f"Parameters: {params_str}")
+
+            # Add chunk-specific questions
+            if i < len(chunk_questions) and chunk_questions[i]:
+                questions = chunk_questions[i]
+                if isinstance(questions, list):
+                    q_text = "; ".join(questions)
+                else:
+                    q_text = str(questions)
+                parts.append(f"Focus on: {q_text}")
+
+            result[idx] = "\n".join(parts)
 
     factories = [
-        (lambda g=group: _summarize_group(g))
+        (lambda g=group: _prepass_group(g))
         for group in multi_groups
     ]
     await limiter.run_many(factories)
 
     return result
+
+
+# ── Feature 2: Function card synthesis (post-pass, 1 LLM call per function) ──
+
+FUNC_CARD_SYSTEM = (
+    "You are a senior code analyst. Generate a structured function card that "
+    "captures the contract, phases, and key decisions of a function. "
+    "Use the project's own vocabulary. Output ONLY valid JSON."
+)
+
+
+async def _synthesize_function_cards(
+    model: str, summaries: list[dict], call_graph: dict,
+    per_file_chunks: list[tuple[str, list[str], "ModuleDefinition"]],
+    limiter: "AsyncRateLimiter",
+    tracker: Optional[TokenTracker] = None,
+    quiet: bool = False,
+) -> list[dict]:
+    """Generate rich function cards for multi-chunk functions.
+
+    After all chunks are summarized, this reads their summaries + raw code
+    to produce a comprehensive function card with contract, phases, data flow.
+    Returns a list of function_card summary entries to append.
+    """
+    # Build a lookup: (source_file, chunk_index) → summary entry
+    chunk_lookup: dict[tuple[str, int], dict] = {}
+    for entry in summaries:
+        key = (entry.get("source_file", ""), entry.get("chunk_index", -1))
+        if key[1] >= 0:
+            chunk_lookup[key] = entry
+
+    # Build chunk lists per file
+    file_chunks_map: dict[str, list[str]] = {}
+    for rel_path, chunks, _mod in per_file_chunks:
+        file_chunks_map[rel_path] = chunks
+
+    # Identify multi-chunk functions
+    called_by = call_graph.get("called_by", {})
+    calls_map = call_graph.get("calls", {})
+    cards: list[dict] = []
+
+    async def _gen_card(rel_path: str, group: list[int], mod_name: str):
+        chunks = file_chunks_map.get(rel_path, [])
+        if not chunks or group[0] >= len(chunks):
+            return
+
+        first_chunk = chunks[group[0]]
+        func_name = _extract_function_name(first_chunk) or "unknown"
+
+        # Gather all chunk summaries for this function
+        chunk_summaries = []
+        combined_code = []
+        for idx in group:
+            entry = chunk_lookup.get((rel_path, idx))
+            if entry:
+                chunk_summaries.append(f"Chunk {idx}: {entry.get('summary', '')}")
+            if idx < len(chunks):
+                combined_code.append(chunks[idx])
+
+        if not chunk_summaries:
+            return
+
+        # Gather call graph info
+        callers = called_by.get(func_name, [])
+        callees = calls_map.get(func_name, [])
+        callers_str = ", ".join(callers[:5]) if callers else "unknown"
+        callees_str = ", ".join(callees[:5]) if callees else "none detected"
+
+        # Combine code (truncated) for the LLM to see the full function
+        full_code = "\n".join(combined_code)
+        # Truncate to ~6K chars to stay within context limits
+        if len(full_code) > 6000:
+            full_code = full_code[:3000] + "\n\n... [truncated] ...\n\n" + full_code[-2000:]
+
+        prompt = f"""Function: {func_name}
+File: {rel_path}
+
+Chunk-level summaries (already generated):
+{chr(10).join(chunk_summaries)}
+
+Call graph:
+  Called by: {callers_str}
+  Calls: {callees_str}
+
+Full source code:
+```
+{full_code}
+```
+
+Generate a function card as a JSON object with these fields:
+{{
+  "name": "{func_name}",
+  "purpose": "1-2 sentence description of what this function does and why",
+  "contract": {{
+    "params": ["param_name: description", ...],
+    "returns": "what it returns",
+    "preconditions": ["condition that must be true before calling"],
+    "postconditions": ["what is guaranteed after successful return"],
+    "throws": ["ExceptionType: when"],
+    "side_effects": ["what state it mutates beyond return value"]
+  }},
+  "phases": [
+    {{"name": "phase name", "description": "what happens", "lines_approx": "1-80"}}
+  ],
+  "key_decisions": ["notable design choices, hardcoded values, TODOs"],
+  "complexity": "low|medium|high"
+}}
+
+Be specific. Use actual parameter names, types, exception types from the code.
+If you can't determine a field, use an empty list or "unknown"."""
+
+        try:
+            raw = await allm_call(model, FUNC_CARD_SYSTEM, prompt,
+                                  max_tokens=800, tracker=tracker,
+                                  phase="Func cards")
+            raw = raw.strip()
+            # Try to parse JSON
+            if raw.startswith("```"):
+                raw = raw.split("```", 2)[1]
+                if raw.startswith("json"):
+                    raw = raw[4:]
+            card_data = json.loads(raw)
+        except (json.JSONDecodeError, Exception):
+            # Fallback: create a basic card from chunk summaries
+            card_data = {
+                "name": func_name,
+                "purpose": " ".join(s.split(": ", 1)[-1] for s in chunk_summaries[:2]),
+                "contract": {},
+                "phases": [],
+                "key_decisions": [],
+                "complexity": "medium",
+            }
+
+        # Format as a readable summary for the KB
+        card_text = _format_function_card(card_data, rel_path, callers, callees)
+
+        cards.append({
+            "summary": card_text,
+            "raw_code": "",  # Don't duplicate — raw code already indexed per-chunk
+            "source_file": rel_path,
+            "module": mod_name,
+            "chunk_type": "function_card",
+            "chunk_index": -3,  # Negative to distinguish from real chunks
+            "function_card": card_data,  # Structured data for programmatic use
+        })
+
+    # Collect multi-chunk function groups
+    factories = []
+    for rel_path, chunks, mod in per_file_chunks:
+        if len(chunks) <= 1:
+            continue
+        groups = _group_chunks_by_function(chunks)
+        multi_groups = [g for g in groups if len(g) > 1]
+        for group in multi_groups:
+            factories.append(
+                (lambda rp=rel_path, g=group, mn=mod.name: _gen_card(rp, g, mn))
+            )
+
+    if not factories:
+        return []
+
+    if not quiet:
+        print(f"\n[Function cards] Generating {len(factories)} function cards...")
+
+    await limiter.run_many(factories)
+
+    if not quiet:
+        print(f"[Function cards] Generated {len(cards)} cards")
+
+    return cards
+
+
+def _format_function_card(card: dict, rel_path: str,
+                          callers: list[str], callees: list[str]) -> str:
+    """Format a function card dict into readable text for the KB."""
+    parts = [f"[Function card: {card.get('name', '?')} in {rel_path}]"]
+    parts.append(f"Purpose: {card.get('purpose', 'unknown')}")
+
+    contract = card.get("contract", {})
+    if contract:
+        if contract.get("params"):
+            parts.append("Parameters: " + "; ".join(contract["params"][:8]))
+        if contract.get("returns"):
+            parts.append(f"Returns: {contract['returns']}")
+        if contract.get("preconditions"):
+            parts.append("Preconditions: " + "; ".join(contract["preconditions"]))
+        if contract.get("postconditions"):
+            parts.append("Postconditions: " + "; ".join(contract["postconditions"]))
+        if contract.get("throws"):
+            parts.append("Throws: " + "; ".join(contract["throws"]))
+        if contract.get("side_effects"):
+            parts.append("Side effects: " + "; ".join(contract["side_effects"]))
+
+    phases = card.get("phases", [])
+    if phases:
+        phase_strs = [f"{p.get('name', '?')}: {p.get('description', '?')}"
+                      for p in phases[:6]]
+        parts.append("Phases: " + " → ".join(phase_strs))
+
+    decisions = card.get("key_decisions", [])
+    if decisions:
+        parts.append("Key decisions: " + "; ".join(decisions[:5]))
+
+    if callers:
+        parts.append("Called by: " + ", ".join(callers[:5]))
+    if callees:
+        parts.append("Calls: " + ", ".join(callees[:5]))
+
+    parts.append(f"Complexity: {card.get('complexity', 'unknown')}")
+
+    return "\n".join(parts)
 
 
 # ── Class-level summaries ──────────────────────────────────────────────────────
@@ -881,18 +1219,35 @@ def _create_or_replace(client, raw_text: str, metadata: dict) -> str:
 
 
 def _index_one_entry(client, entry: dict) -> tuple[str, Optional[str], Optional[str]]:
-    """Index one summary + raw_code into R2R. Returns (src_file, doc_id, code_doc_id)."""
+    """Index one summary + raw_code into R2R. Returns (src_file, doc_id, code_doc_id).
+
+    Entries with skip_index=True are not indexed (summary is kept in
+    summaries.json for completeness but doesn't go into the vector DB).
+    """
     src_file = entry.get("source_file", "")
     module = entry.get("module", "")
     doc_id = None
     code_doc_id = None
 
+    # Low-value chunks flagged by the LLM — skip indexing
+    if entry.get("skip_index"):
+        return (src_file, None, None)
+
+    chunk_type = entry.get("chunk_type", "function_summary")
+    # Function cards get a dedicated source_kind for better search scoping
+    source_kind = "reference"
+    if chunk_type == "function_card":
+        source_kind = "specification"
+    elif chunk_type in ("file_overview", "class_overview"):
+        source_kind = "overview"
+
     try:
         doc_id = _create_or_replace(client, entry["summary"], {
             "source_file": src_file,
             "module": module,
-            "chunk_type": entry.get("chunk_type", "function_summary"),
+            "chunk_type": chunk_type,
             "source_type": "code",
+            "source_kind": source_kind,
         })
     except Exception as e:
         print(f"  [warn] {src_file}: summary index failed: {e}")
@@ -924,8 +1279,13 @@ def index_summaries_to_r2r(summaries: list[dict], index_workers: int = 8) -> Non
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
     client = _r2r_client()
+    skip_count = sum(1 for e in summaries if e.get("skip_index"))
     n = len(summaries)
-    print(f"\n[Index] Indexing {n} summaries + raw code into R2R ({index_workers} workers)...")
+    if skip_count:
+        print(f"\n[Index] Indexing {n - skip_count} summaries into R2R "
+              f"({skip_count} low-value skipped, {index_workers} workers)...")
+    else:
+        print(f"\n[Index] Indexing {n} summaries + raw code into R2R ({index_workers} workers)...")
 
     # Map future → index so we can write back doc_ids
     with ThreadPoolExecutor(max_workers=index_workers) as pool:
@@ -1024,7 +1384,11 @@ async def _async_review_one_summary(model: str, entry: dict,
 
     raw = await allm_call(model, REVIEW_SYSTEM, prompt, max_tokens=512,
                           json_mode=True, tracker=tracker, phase="Review")
-    data = json.loads(raw)
+    try:
+        data = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        # Malformed LLM response — treat as "keep, no edit"
+        return (False, "")
     if not data.get("keep") and data.get("improved", "").strip():
         return (True, data["improved"].strip())
     return (False, "")
@@ -1561,16 +1925,36 @@ def build_pass2_prompt(project_desc: str, module_name: str,
         f"\nRelevant context from the knowledge base (use this vocabulary):\n{kb_context}\n"
         if kb_context else ""
     )
-    file_section = (
-        f"\nFile purpose: {file_summary}\n"
-        if file_summary else ""
-    )
+    # The file_summary field may contain:
+    # - A plain file summary ("This file implements X")
+    # - Function pre-pass context ("[Function: foo] ... Focus on: ...")
+    # - Combined context from multiple sources
+    context_section = ""
+    focus_section = ""
+    if file_summary:
+        # Split out "Focus on:" directives for special handling
+        lines = file_summary.split("\n")
+        context_lines = []
+        focus_lines = []
+        for line in lines:
+            if line.startswith("Focus on:"):
+                focus_lines.append(line[len("Focus on:"):].strip())
+            else:
+                context_lines.append(line)
+        if context_lines:
+            context_section = "\nContext:\n" + "\n".join(context_lines) + "\n"
+        if focus_lines:
+            focus_section = (
+                "\n\nAdditionally, address these specific questions about this chunk:\n"
+                + "\n".join(f"- {q}" for q in focus_lines)
+            )
+
     return f"""Project: {project_desc}
 Module: {module_name} — {module_desc}
 
 Domain questions this module answers:
 {questions_text}
-{kb_section}{file_section}
+{kb_section}{context_section}
 Source file: {source_file}
 Code chunk:
 ```
@@ -1582,8 +1966,12 @@ Requirements:
 - Use the project's own vocabulary (class names, function names, domain concepts)
 - State what this code DOES, not just what it IS
 - Mention which of the domain questions above this chunk addresses (if any)
+- Note what other functions/methods this code calls (if any)
 - If trivial (imports-only, constants, empty stub), one sentence is enough
 - Plain prose only — no markdown, no bullets
+- Start with SKIP: if this chunk has near-zero search value (pure imports/includes,
+  trivial getters/setters, boilerplate logging, empty stubs). The summary will still
+  be saved but won't be indexed into the search database.{focus_section}
 
 Summary:"""
 
@@ -1744,6 +2132,222 @@ def _prefix_summary(summary: str, chunk_type: str,
 
 
 
+# ── Feature 1: Call graph inversion (zero LLM cost) ──────────────────────────
+
+def _extract_calls_from_summary(summary: str) -> list[str]:
+    """Extract function/method names that a summary says this code calls."""
+    calls: list[str] = []
+    for pattern in _CALL_PATTERNS:
+        for m in pattern.finditer(summary):
+            name = m.group(1).strip("`")
+            # Filter out common false positives
+            bare = name.split("::")[-1] if "::" in name else name
+            if bare.lower() in _KEYWORDS or len(bare) < 2:
+                continue
+            if name not in calls:
+                calls.append(name)
+    return calls
+
+
+def _extract_calls_from_code(raw_code: str) -> list[str]:
+    """Extract function/method call targets from raw source code.
+
+    Complements summary-based extraction — catches calls the LLM
+    didn't mention in the summary.
+    """
+    calls: list[str] = []
+    seen: set[str] = set()
+
+    # C++: Namespace::Class::method( or function(
+    for m in _re.finditer(r'(?<![.\w])(\w[\w:]*(?:::\w+)+)\s*\(', raw_code):
+        name = m.group(1)
+        bare = name.split("::")[-1]
+        if bare.lower() not in _KEYWORDS and name not in seen and len(bare) >= 2:
+            calls.append(name)
+            seen.add(name)
+
+    # Plain function calls: func_name( — filter out control-flow keywords
+    for m in _re.finditer(r'(?<![.\w:])([a-zA-Z_]\w{2,})\s*\(', raw_code):
+        name = m.group(1)
+        if (name.lower() not in _KEYWORDS and name not in seen
+                and not name[0].isupper()):  # skip type constructors like String(
+            # Heuristic: skip ALL_CAPS (likely macros)
+            if name != name.upper():
+                calls.append(name)
+                seen.add(name)
+
+    return calls
+
+
+def build_call_graph(summaries: list[dict]) -> dict:
+    """Build a call graph from summaries: who calls whom and who is called by whom.
+
+    Returns:
+        {
+            "calls": {"FileA::func1": ["FileB::func2", "FileC::func3"], ...},
+            "called_by": {"FileB::func2": ["FileA::func1"], ...},
+            "functions": {"func1": {"file": "path/a.cpp", "module": "mod", ...}, ...},
+        }
+    """
+    # Step 1: Build a registry of all known functions/methods
+    # Maps symbol_name → {file, module, chunk_type, summary_preview}
+    functions: dict[str, dict] = {}
+    # Also build basename → list of qualified names for fuzzy matching
+    basename_index: dict[str, list[str]] = {}
+
+    for entry in summaries:
+        chunk_type = entry.get("chunk_type", "")
+        if chunk_type in ("file_overview", "class_overview"):
+            continue
+
+        summary = entry.get("summary", "")
+        source_file = entry.get("source_file", "")
+        module = entry.get("module", "")
+        raw_code = entry.get("raw_code", "")
+
+        # Extract the defining symbol from this chunk
+        symbol = None
+        if " — " in summary[:120]:
+            # Our summaries are prefixed: "ClassName::method — description"
+            symbol = summary.split(" — ", 1)[0].strip()
+        if not symbol and raw_code:
+            func = _extract_function_name(raw_code)
+            if func:
+                symbol = func
+
+        if symbol and symbol not in functions:
+            functions[symbol] = {
+                "file": source_file,
+                "module": module,
+                "chunk_type": chunk_type,
+                "preview": summary[:120],
+            }
+            # Index by basename for fuzzy matching
+            bare = symbol.split("::")[-1] if "::" in symbol else symbol
+            basename_index.setdefault(bare, []).append(symbol)
+
+    # Step 2: For each summary, extract what it calls
+    calls: dict[str, list[str]] = {}
+    called_by: dict[str, list[str]] = {}
+
+    for entry in summaries:
+        chunk_type = entry.get("chunk_type", "")
+        if chunk_type in ("file_overview", "class_overview"):
+            continue
+
+        summary = entry.get("summary", "")
+        raw_code = entry.get("raw_code", "")
+        source_file = entry.get("source_file", "")
+
+        # Identify the caller
+        caller = None
+        if " — " in summary[:120]:
+            caller = summary.split(" — ", 1)[0].strip()
+        if not caller and raw_code:
+            caller = _extract_function_name(raw_code)
+        if not caller:
+            caller = f"{source_file}:chunk{entry.get('chunk_index', '?')}"
+
+        # Extract callees from both summary text and code
+        callees_from_summary = _extract_calls_from_summary(summary)
+        callees_from_code = _extract_calls_from_code(raw_code) if raw_code else []
+
+        # Merge and resolve callees
+        all_callees: list[str] = []
+        seen_callees: set[str] = set()
+
+        for callee in callees_from_summary + callees_from_code:
+            if callee in seen_callees or callee == caller:
+                continue
+            seen_callees.add(callee)
+
+            # Try to resolve to a known function
+            resolved = None
+            if callee in functions:
+                resolved = callee
+            else:
+                # Fuzzy: match by basename
+                bare = callee.split("::")[-1] if "::" in callee else callee
+                candidates = basename_index.get(bare, [])
+                if len(candidates) == 1:
+                    resolved = candidates[0]
+                elif candidates:
+                    # Multiple matches — prefer one in a different file (cross-file ref)
+                    cross = [c for c in candidates if functions[c]["file"] != source_file]
+                    resolved = cross[0] if cross else candidates[0]
+
+            if resolved:
+                all_callees.append(resolved)
+
+        if all_callees:
+            calls[caller] = all_callees
+            for callee in all_callees:
+                called_by.setdefault(callee, [])
+                if caller not in called_by[callee]:
+                    called_by[callee].append(caller)
+
+    return {
+        "calls": calls,
+        "called_by": called_by,
+        "functions": functions,
+    }
+
+
+def _enrich_summaries_with_call_graph(summaries: list[dict],
+                                       call_graph: dict) -> int:
+    """Append 'Called by: ...' to summaries that have known callers.
+
+    Modifies summaries in-place. Returns count of enriched entries.
+    """
+    called_by = call_graph.get("called_by", {})
+    functions = call_graph.get("functions", {})
+    enriched = 0
+
+    for entry in summaries:
+        chunk_type = entry.get("chunk_type", "")
+        if chunk_type in ("file_overview", "class_overview"):
+            continue
+
+        summary = entry.get("summary", "")
+        raw_code = entry.get("raw_code", "")
+
+        # Identify this entry's symbol
+        symbol = None
+        if " — " in summary[:120]:
+            symbol = summary.split(" — ", 1)[0].strip()
+        if not symbol and raw_code:
+            symbol = _extract_function_name(raw_code)
+
+        if not symbol or symbol not in called_by:
+            continue
+
+        callers = called_by[symbol]
+        if not callers:
+            continue
+
+        # Format caller list with files
+        caller_strs = []
+        for c in callers[:5]:  # cap at 5 to keep summary readable
+            info = functions.get(c, {})
+            f = info.get("file", "")
+            if f:
+                caller_strs.append(f"{c} ({f})")
+            else:
+                caller_strs.append(c)
+
+        suffix = f" Called by: {', '.join(caller_strs)}"
+        if len(callers) > 5:
+            suffix += f" and {len(callers) - 5} more"
+        suffix += "."
+
+        # Don't duplicate if already has "Called by"
+        if "Called by:" not in summary:
+            entry["summary"] = summary.rstrip() + suffix
+            enriched += 1
+
+    return enriched
+
+
 def _extract_cross_file_refs(raw_code: str) -> list[str]:
     """Extract cross-file references from code (includes, imports, namespaces)."""
     import re
@@ -1861,8 +2465,14 @@ async def _async_summarize_one_chunk(
     if summary_text.lower().startswith("summary:"):
         summary_text = summary_text[len("summary:"):].strip()
 
+    # Check if the LLM tagged this as low-value
+    skip_index = False
+    if summary_text.upper().startswith("SKIP:"):
+        skip_index = True
+        summary_text = summary_text[5:].strip()
+
     refined = False
-    if _needs_reference_resolution(summary_text):
+    if not skip_index and _needs_reference_resolution(summary_text):
         improved = await _async_resolve_references(
             model, summary_text, chunk, codebase, rel_path,
             tracker=tracker,
@@ -1882,6 +2492,7 @@ async def _async_summarize_one_chunk(
         "chunk_type":  chunk_type,
         "chunk_index": chunk_index,
         "refined":     refined,
+        "skip_index":  skip_index,
         "content_hash": _chunk_content_hash(chunk),
     }
 
@@ -1900,6 +2511,8 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     With rag=True, queries the KB before each chunk to inject relevant context.
     If summaries_path is set, writes incrementally for crash-safety.
     """
+    global _quota_exhausted
+
     # Load existing summaries for resume support
     # done_hashes maps chunk_key → content_hash so we can detect shifted chunks
     summaries: list[dict] = []
@@ -2195,33 +2808,36 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     completed_count = 0
     refined_count = 0
     error_count = 0
+    # Lock protects summaries list + counters against concurrent on_result calls
+    _result_lock = asyncio.Lock()
 
-    def on_result(idx, entry):
+    async def on_result(idx, entry):
         nonlocal completed_count, refined_count
-        ref_tag = ""
-        if entry.pop("refined", False):
-            ref_tag = " [refined]"
-            refined_count += 1
+        async with _result_lock:
+            ref_tag = ""
+            if entry.pop("refined", False):
+                ref_tag = " [refined]"
+                refined_count += 1
 
-        summaries.append(entry)
-        completed_count += 1
-        n = completed_count
+            summaries.append(entry)
+            completed_count += 1
+            n = completed_count
 
-        elapsed = time.monotonic() - start_time
-        if n > 1 and elapsed > 0:
-            rate = n / elapsed * 60
-            remaining = (len(work_items) - n) / (n / elapsed)
-            eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
-        else:
-            eta = ""
-        if not quiet:
-            print(f"  [{n:>4}/{len(work_items)}] "
-                  f"{work_items[idx]['rel_path']}:{work_items[idx]['chunk_index']} → "
-                  f"{len(entry['summary'])} chars{ref_tag}{eta}")
+            elapsed = time.monotonic() - start_time
+            if n > 1 and elapsed > 0:
+                rate = n / elapsed * 60
+                remaining = (len(work_items) - n) / (n / elapsed)
+                eta = f"  [{rate:.1f}/min, ~{int(remaining//60)}m{int(remaining%60):02d}s left]"
+            else:
+                eta = ""
+            if not quiet:
+                print(f"  [{n:>4}/{len(work_items)}] "
+                      f"{work_items[idx]['rel_path']}:{work_items[idx]['chunk_index']} → "
+                      f"{len(entry['summary'])} chars{ref_tag}{eta}")
 
-        # Incremental write every 10 completions
-        if summaries_path and n % 10 == 0:
-            summaries_path.write_text(json.dumps(summaries, indent=2))
+            # Incremental write every 10 completions — snapshot while holding lock
+            if summaries_path and n % 10 == 0:
+                summaries_path.write_text(json.dumps(list(summaries), indent=2))
 
     def on_error(idx, exc):
         nonlocal error_count
@@ -2285,6 +2901,46 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             })
             overview_count += 1
 
+    # ── Feature 1: Call graph inversion (no LLM cost) ──────────────────
+    call_graph = build_call_graph(summaries)
+    n_functions = len(call_graph.get("functions", {}))
+    n_edges = sum(len(v) for v in call_graph.get("called_by", {}).values())
+    enriched = _enrich_summaries_with_call_graph(summaries, call_graph)
+    print(f"[Call graph] {n_functions} functions, {n_edges} edges, "
+          f"{enriched} summaries enriched with 'Called by'")
+
+    # Save call graph as a standalone artifact
+    if summaries_path:
+        cg_path = summaries_path.parent / "call_graph.json"
+        # Serialize only the calls/called_by (functions dict is large)
+        cg_export = {
+            "calls": call_graph.get("calls", {}),
+            "called_by": call_graph.get("called_by", {}),
+            "stats": {
+                "functions": n_functions,
+                "edges": n_edges,
+                "enriched_summaries": enriched,
+            },
+        }
+        cg_path.write_text(json.dumps(cg_export, indent=2))
+
+    # ── Feature 2: Function card synthesis ────────────────────────────────
+    func_card_count = 0
+    if not _quota_exhausted:
+        card_limiter = AsyncRateLimiter(
+            max_concurrent=min(max_concurrent, 20),  # conservative for card gen
+            calls_per_minute=rpm,
+        )
+        func_cards = await _synthesize_function_cards(
+            model, summaries, call_graph, per_file_chunks,
+            limiter=card_limiter, tracker=tracker, quiet=quiet,
+        )
+        if func_cards:
+            summaries.extend(func_cards)
+            func_card_count = len(func_cards)
+            if card_limiter.quota_exhausted:
+                _quota_exhausted = True
+
     # Final write
     if summaries_path:
         summaries_path.write_text(json.dumps(summaries, indent=2))
@@ -2292,7 +2948,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     print(f"\n[Pass 2] Done: {len(summaries)} summaries total "
           f"({completed_count} new, {total_cached} cached, "
           f"{error_count} errors, {refined_count} refined, "
-          f"{overview_count} overviews)")
+          f"{overview_count} overviews, {func_card_count} function cards)")
     if _search_kb_failures > 0:
         print(f"  [warn] {_search_kb_failures} RAG queries failed — "
               f"is R2R running? (summaries were generated without KB context)")
@@ -2407,8 +3063,10 @@ def main():
     est_total = est_prompt_tokens + est_completion_tokens
     file_summary_tokens = len(files) * 500
     est_total += file_summary_tokens
-    func_summary_tokens = int(est_chunks * 0.2 * 400)
-    est_total += func_summary_tokens
+    func_prepass_tokens = int(est_chunks * 0.2 * 600)   # pre-pass with questions
+    est_total += func_prepass_tokens
+    func_card_tokens = int(est_chunks * 0.15 * 1200)   # function card synthesis
+    est_total += func_card_tokens
     class_summary_tokens = int(len(files) / 5 * 500)
     est_total += class_summary_tokens
     pass1_tokens = 50000
@@ -2445,7 +3103,8 @@ def main():
         print(f"  Est. chunks:       ~{est_chunks:,} (avg 3/file)")
         print(f"  Est. Pass 1:       ~{pass1_tokens:,} tokens")
         print(f"  Est. file summaries: ~{file_summary_tokens:,} tokens ({len(files):,} files × ~500 tok)")
-        print(f"  Est. func summaries: ~{func_summary_tokens:,} tokens (~20% multi-chunk functions)")
+        print(f"  Est. func pre-pass:  ~{func_prepass_tokens:,} tokens (~20% multi-chunk funcs × ~600 tok)")
+        print(f"  Est. func cards:     ~{func_card_tokens:,} tokens (~15% multi-chunk funcs × ~1200 tok)")
         print(f"  Est. class summaries: ~{class_summary_tokens:,} tokens (~1 class per 5 files)")
         print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
         print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
