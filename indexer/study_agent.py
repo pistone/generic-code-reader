@@ -3138,8 +3138,9 @@ def main():
     parser = argparse.ArgumentParser(
         description="Study agent: multi-pass codebase analysis → module_map.json + summaries.json"
     )
-    parser.add_argument("--codebase", required=True,
-                        help="Root directory of the codebase to analyze")
+    parser.add_argument("--codebase", nargs="+", required=True,
+                        help="Root directory(ies) of the codebase to analyze. "
+                             "Multiple paths supported: --codebase /path/a /path/b")
     parser.add_argument("--model", default=DEFAULT_MODEL,
                         help=(
                             "litellm model string (default: %(default)s). "
@@ -3166,13 +3167,24 @@ def main():
                         help="Query the KB before each chunk in Pass 2 for richer context. "
                              "Most useful after --bootstrap-docs.")
     parser.add_argument("--passes", type=int, default=1,
-                        help="Number of summarize+review iterations (default: 1 = no review). "
-                             "With --passes 3: runs Pass 2, indexes, reviews, repeats up to 3x "
-                             "or until edit rate drops below 5%%.")
+                        help="(Deprecated) Number of summarize+review iterations. "
+                             "Use --refine instead for targeted review of weak summaries.")
     parser.add_argument("--pass1-only", action="store_true",
-                        help="Only run Pass 1 (module discovery)")
+                        help="Only run Pass 1 (module discovery). "
+                             "Produces module_map.json. Run --pass2-only next.")
     parser.add_argument("--pass2-only", action="store_true",
                         help="Only run Pass 2 (requires existing module_map.json)")
+    parser.add_argument("--review-only", action="store_true",
+                        help="Only run review on existing summaries.json — "
+                             "re-reads each summary, rewrites weak ones using KB context. "
+                             "Requires existing summaries.json.")
+    parser.add_argument("--index-only", action="store_true",
+                        help="Only index existing summaries.json into R2R. "
+                             "Useful after editing summaries manually or re-running review.")
+    parser.add_argument("--refine", action="store_true",
+                        help="After Pass 2, automatically re-run LLM on summaries that contain "
+                             "vague references ('delegates to', 'defined elsewhere', etc.). "
+                             "Much cheaper than --passes 2: only touches ~5%% of summaries.")
     parser.add_argument("--max-chunks", type=int, default=None,
                         help="Cap total chunks in Pass 2 (good for quick demos)")
     parser.add_argument("--incremental", action="store_true",
@@ -3200,10 +3212,14 @@ def main():
                         help="Suppress per-chunk progress, show only phase summaries")
     args = parser.parse_args()
 
-    codebase = Path(args.codebase).resolve()
-    if not codebase.is_dir():
-        print(f"Error: --codebase '{codebase}' is not a directory")
-        sys.exit(1)
+    # Resolve multiple --codebase paths
+    codebases = [Path(p).resolve() for p in args.codebase]
+    for cb in codebases:
+        if not cb.is_dir():
+            print(f"Error: --codebase '{cb}' is not a directory")
+            sys.exit(1)
+    # Primary codebase is the first one (used for relative paths and output naming)
+    codebase = codebases[0]
 
     if args.passes < 1:
         args.passes = 1
@@ -3228,11 +3244,20 @@ def main():
             print("Could not auto-detect language. Use --language to specify.")
             sys.exit(1)
 
-    # ── Collect source files ────────────────────────────────────────────────────
-    files = collect_source_files(codebase, language=args.language,
-                                 include_tests=args.include_tests)
+    # ── Collect source files from all codebase paths ─────────────────────────
+    files: list[Path] = []
+    for cb in codebases:
+        cb_files = collect_source_files(cb, language=args.language,
+                                        include_tests=args.include_tests)
+        files.extend(cb_files)
     skip_note = "" if args.include_tests else " (excluding tests — use --include-tests to change)"
-    print(f"Found {len(files)} {args.language} source files under {codebase}{skip_note}")
+    if len(codebases) > 1:
+        print(f"Found {len(files)} {args.language} source files across {len(codebases)} codebases{skip_note}")
+        for cb in codebases:
+            n = sum(1 for f in files if str(f).startswith(str(cb)))
+            print(f"  {cb}: {n} files")
+    else:
+        print(f"Found {len(files)} {args.language} source files under {codebase}{skip_note}")
     if args.model_fast:
         print(f"Models: {args.model} (Pass 1 + Review), {args.model_fast} (Pass 2 bulk)")
     else:
@@ -3381,6 +3406,36 @@ def main():
     tracker = TokenTracker()
     _start_time = time.time()
 
+    # ── Index-only mode: just push existing summaries to R2R ─────────────────
+    if args.index_only:
+        if not summaries_path.exists():
+            print(f"Error: {summaries_path} not found. Run Pass 2 first.")
+            sys.exit(1)
+        summaries = json.loads(summaries_path.read_text())
+        print(f"[Index-only] Indexing {len(summaries)} summaries from {summaries_path}")
+        index_summaries_to_r2r(summaries)
+        print("[Index-only] Done.")
+        return
+
+    # ── Review-only mode: re-review existing summaries ───────────────────────
+    if args.review_only:
+        if not summaries_path.exists():
+            print(f"Error: {summaries_path} not found. Run Pass 2 first.")
+            sys.exit(1)
+        summaries = json.loads(summaries_path.read_text())
+        print(f"[Review-only] Reviewing {len(summaries)} summaries from {summaries_path}")
+        summaries, edit_rate = asyncio.run(run_review(
+            args.model, summaries, tracker=tracker,
+            workers=args.workers, rpm=args.rpm,
+            max_concurrent=args.max_concurrent,
+            quiet=args.quiet,
+        ))
+        summaries_path.write_text(json.dumps(summaries, indent=2))
+        print(f"[Review-only] Done. Edit rate: {edit_rate:.1%}")
+        print(f"  Run with --index-only to push updated summaries to R2R.")
+        tracker.print_summary()
+        return
+
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
     if not args.pass2_only:
         docs_context = None
@@ -3482,7 +3537,34 @@ def main():
         save_hash_manifest(hash_manifest_path, new_manifest)
         print(f"[Incremental] Saved file hashes to {hash_manifest_path}")
 
-    # Always index into R2R (previously only done for --passes > 1)
+    # ── Targeted refine: re-summarize only vague summaries ──────────────────
+    if args.refine and summaries and not _quota_exhausted:
+        vague_indices = []
+        for i, entry in enumerate(summaries):
+            s = entry.get("summary", "")
+            marker = _needs_reference_resolution(s)
+            if marker and not entry.get("skip_index"):
+                vague_indices.append((i, marker))
+
+        if vague_indices:
+            print(f"\n[Refine] Found {len(vague_indices)} summaries with vague references — re-reviewing")
+            refined_summaries, edit_rate = asyncio.run(run_review(
+                args.model,
+                [summaries[i] for i, _ in vague_indices],
+                tracker=tracker,
+                workers=args.workers, rpm=args.rpm,
+                max_concurrent=args.max_concurrent,
+                quiet=args.quiet,
+            ))
+            # Write back improved summaries
+            for (orig_idx, _), refined in zip(vague_indices, refined_summaries):
+                summaries[orig_idx] = refined
+            summaries_path.write_text(json.dumps(summaries, indent=2))
+            print(f"[Refine] Done. {len(vague_indices)} reviewed, edit rate: {edit_rate:.1%}")
+        else:
+            print(f"\n[Refine] No vague summaries found — skipping")
+
+    # Always index into R2R
     if summaries:
         print(f"\n[Index] Indexing {len(summaries)} summaries into R2R...")
         index_summaries_to_r2r(summaries)

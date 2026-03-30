@@ -85,8 +85,8 @@ def main():
   python run.py --codebase /path/to/src --model bedrock/anthropic.claude-sonnet
   python run.py --codebase /path/to/src --dry-run
 """)
-    parser.add_argument("--codebase", required=True,
-                        help="Root directory of the codebase to analyze")
+    parser.add_argument("--codebase", nargs="+", required=True,
+                        help="Root directory(ies) to analyze. Multiple: --codebase /a /b")
     parser.add_argument("--docs", nargs="+", default=None,
                         help="Design docs/directories to index (optional)")
     parser.add_argument("--tickets", default=None,
@@ -113,16 +113,21 @@ def main():
                         help="Skip confirmation prompts")
     args = parser.parse_args()
 
-    codebase = Path(args.codebase).resolve()
-    if not codebase.is_dir():
-        print(f"Error: '{codebase}' is not a directory")
-        sys.exit(1)
+    codebases = [Path(p).resolve() for p in args.codebase]
+    for cb in codebases:
+        if not cb.is_dir():
+            print(f"Error: '{cb}' is not a directory")
+            sys.exit(1)
+    codebase = codebases[0]  # primary
 
     project_dir = Path(__file__).resolve().parent
     python = sys.executable
 
     print(f"\ngeneric-code-reader")
-    print(f"Codebase: {codebase}")
+    if len(codebases) > 1:
+        print(f"Codebases: {', '.join(str(cb) for cb in codebases)}")
+    else:
+        print(f"Codebase: {codebase}")
     if args.docs:
         print(f"Docs:     {', '.join(args.docs)}")
     print()
@@ -144,7 +149,7 @@ def main():
 
     # Step 2: Study codebase
     study_cmd = [python, str(project_dir / "indexer" / "study_agent.py"),
-                 "--codebase", str(codebase),
+                 "--codebase"] + [str(cb) for cb in codebases] + [
                  "--model", args.model,
                  "--passes", str(args.passes),
                  "--rpm", str(args.rpm),
