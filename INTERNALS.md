@@ -47,9 +47,12 @@ summarized or indexed.
 ### Test file filtering
 
 `collect_source_files()` excludes test dirs by exact match
-(SKIP_TEST_DIRS: "test", "tests", "testing", etc.) AND prefix match
-("test_*", "testutil", "tests_*"). Guards against false positives
-like "testament" by requiring `_`, `-`, `s`, or digit after the prefix.
+(SKIP_TEST_DIRS: "test", "tests", "testing", etc.) AND regex match
+via `_TEST_DIR_RE`. The regex uses an **explicit prefix allowlist**
+(`_XTEST_PREFIXES`) for `{prefix}test` patterns (jtest, cstest, gtest,
+unittest, etc.) to avoid false positives on English words like "latest",
+"fastest", "attest", "contest". Add project-specific prefixes to
+`_XTEST_PREFIXES` if needed.
 
 Also excludes test files by name pattern (test_*.py, *_test.cpp,
 *_spec.ts, etc.). Use `--include-tests` to override.

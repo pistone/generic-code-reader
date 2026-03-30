@@ -94,29 +94,48 @@ SKIP_DIRS    = {"__pycache__", ".git", ".hg", ".svn", "node_modules",
                 ".build", "_build"}
 SKIP_TEST_DIRS = {"test", "tests", "testing", "test_data", "testdata",
                   "testcases", "test_fixtures", "fixtures"}
-# Prefixes for test directory names — matches "testutil", "test_helpers", etc.
-_TEST_DIR_PREFIXES = ("test", "mock", "fake", "stub")
 # Keywords that identify a module as test-related (case-insensitive match)
 _TEST_MODULE_KEYWORDS = {"test", "testing", "mock", "fake", "stub",
                          "fixture", "harness", "benchmark"}
 
+# Compiled regex for test directory detection.
+# Matches: test, tests, testing, test_*, *test, *tests, *testing
+# Also: jtest, cstest, rstest, ktest, jstest, unittest, testutil, etc.
+# Does NOT match: "latest", "fastest", "greatest", "contest", "attest",
+# Test directory detection: explicit prefix allowlist avoids false positives
+# on English words like "latest", "fastest", "attest", "contest", "detest".
+# Add entries to _XTEST_PREFIXES for project-specific conventions.
+import re as _re_test
+
+# Known short prefixes that form test dir names: {prefix}test(s)
+# e.g. jtest (Java), cstest (C#), rstest (Rust), gtest (Google Test), unittest
+_XTEST_PREFIXES = (
+    'j', 'k', 'g', 'c', 'u', 'e', 'i', 'p', 'n',   # single-letter
+    'js', 'cs', 'rs', 'ts', 'go',                      # two-letter
+    'cpp', 'sys', 'api', 'gui', 'cli', 'net',          # three-letter
+    'unit', 'perf', 'fuzz', 'load', 'func',            # four-letter
+)
+_xtest_alt = '|'.join(sorted(_XTEST_PREFIXES, key=len, reverse=True))
+
+_TEST_DIR_RE = _re_test.compile(
+    r'^(?:tests?|testing)(?:[_\-s]|$|[a-z])'           # starts with test: test, testutil, testcases
+    r'|^(?:' + _xtest_alt + r')tests?(?:[_\-]|$)'      # known prefix + test: jtest, cstest, gtest
+    r'|^(?:mock|fake|stub|fixture|benchmark)',           # known non-test prefixes
+    _re_test.IGNORECASE,
+)
+
 
 def _is_test_path(p: Path) -> bool:
-    """Check if a path is test-related by directory name or prefix."""
+    """Check if a path is test-related by directory name pattern.
+
+    Catches: test, tests, testing, test_utils, testutil, jtest, cstest,
+    rstest, ktest, jstest, unittest, mock_*, fake_*, etc.
+    """
     for part in p.parts:
-        part_lower = part.lower()
-        # Exact match on known test dirs
-        if part_lower in SKIP_TEST_DIRS:
+        if part.lower() in SKIP_TEST_DIRS:
             return True
-        # Prefix match: testutil, test_helpers, tests_integration, etc.
-        if any(part_lower.startswith(pfx) for pfx in _TEST_DIR_PREFIXES):
-            # Avoid matching "testament", "testimony" — require _ or digit or
-            # end-of-string after the prefix
-            for pfx in _TEST_DIR_PREFIXES:
-                if part_lower.startswith(pfx):
-                    rest = part_lower[len(pfx):]
-                    if not rest or rest[0] in ("_", "-", "s") or rest[0].isdigit():
-                        return True
+        if _TEST_DIR_RE.search(part):
+            return True
     return False
 
 
@@ -146,14 +165,10 @@ def _is_test_dir_path(dp: str) -> bool:
     """Check if a directory path looks test-related."""
     parts = dp.strip("/").split("/")
     for part in parts:
-        part_lower = part.lower()
-        if part_lower in SKIP_TEST_DIRS:
+        if part.lower() in SKIP_TEST_DIRS:
             return True
-        for pfx in _TEST_DIR_PREFIXES:
-            if part_lower.startswith(pfx):
-                rest = part_lower[len(pfx):]
-                if not rest or rest[0] in ("_", "-", "s") or rest[0].isdigit():
-                    return True
+        if _TEST_DIR_RE.search(part):
+            return True
     return False
 
 
