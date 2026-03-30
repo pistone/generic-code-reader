@@ -385,7 +385,8 @@ def filter_changed_files(codebase: Path, files: list[Path],
 
 def build_directory_tree(codebase: Path, files: list[Path],
                          max_depth: int = 3,
-                         expand_dirs: Optional[set[str]] = None) -> str:
+                         expand_dirs: Optional[set[str]] = None,
+                         codebases: Optional[list[Path]] = None) -> str:
     """Build a depth-limited annotated directory tree from file list.
 
     Shows directories up to max_depth. Unexpanded nodes get annotations like
@@ -393,10 +394,26 @@ def build_directory_tree(codebase: Path, files: list[Path],
     Use expand_dirs to selectively expand specific directories deeper.
 
     For small codebases (≤200 files), shows every file (original behaviour).
+
+    When codebases is provided (multiple codebase paths), files are matched
+    to their respective codebase for relative path computation.
     """
+    # Helper to compute relative path when multiple codebases are possible
+    all_codebases = codebases if codebases else [codebase]
+
+    def _relative_to_any(f: Path) -> Path:
+        """Compute relative path from whichever codebase contains this file."""
+        for cb in all_codebases:
+            try:
+                return f.relative_to(cb)
+            except ValueError:
+                continue
+        # Fallback: use filename only
+        return Path(f.name)
+
     if len(files) <= 200:
         lines = [str(codebase.name) + "/"]
-        for rp in sorted(f.relative_to(codebase) for f in files):
+        for rp in sorted(_relative_to_any(f) for f in files):
             indent = "  " * (len(rp.parts) - 1)
             lines.append(f"{indent}  {rp.name}")
         return "\n".join(lines)
@@ -409,7 +426,7 @@ def build_directory_tree(codebase: Path, files: list[Path],
     all_dirs: set[str] = set()
 
     for f in files:
-        rel = f.relative_to(codebase)
+        rel = _relative_to_any(f)
         parts = rel.parts[:-1]  # directory components
         # Count file in its immediate directory
         dir_path = "/".join(parts) if parts else "."
@@ -1587,11 +1604,21 @@ MAX_FILES_PER_READ = 8   # max files per read_files call
 
 
 def _group_files_by_dir(codebase: Path, files: list[Path],
-                         dir_path: str) -> list[Path]:
+                         dir_path: str, codebases: Optional[list[Path]] = None) -> list[Path]:
     """Return files that live under a specific directory path."""
+    all_codebases = codebases if codebases else [codebase]
+
+    def _relative_to_any(f: Path) -> str:
+        for cb in all_codebases:
+            try:
+                return str(f.relative_to(cb))
+            except ValueError:
+                continue
+        return f.name
+
     result = []
     for f in files:
-        rel = str(f.relative_to(codebase))
+        rel = _relative_to_any(f)
         if dir_path == ".":
             if "/" not in rel:
                 result.append(f)
@@ -1745,25 +1772,36 @@ PASS1_TOOLS = [
 ]
 
 
-def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str):
+def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
+                          codebases: Optional[list[Path]] = None):
     """Create a closure that dispatches Pass 1 tool calls."""
     # Accumulate all expanded dirs across rounds so the tree keeps growing
     _all_expanded: set[str] = set()
     # Use same depth as initial tree
     _base_depth = 3 if len(files) < 500 else 4 if len(files) < 5000 else 5
+    all_codebases = codebases if codebases else [codebase]
+
+    def _relative_to_any(f: Path) -> Path:
+        """Compute relative path from whichever codebase contains this file."""
+        for cb in all_codebases:
+            try:
+                return f.relative_to(cb)
+            except ValueError:
+                continue
+        return Path(f.name)
 
     def dispatch(name: str, args: dict) -> str:
         if name == "expand_dirs":
             dirs = args.get("dirs", [])
             _all_expanded.update(str(d) for d in dirs)
             tree = build_directory_tree(codebase, files, max_depth=_base_depth,
-                                         expand_dirs=_all_expanded)
+                                         expand_dirs=_all_expanded, codebases=all_codebases)
             return tree
 
         elif name == "list_files":
             dir_path = args.get("dir_path", ".")
-            matches = _group_files_by_dir(codebase, files, dir_path)
-            lines = [str(f.relative_to(codebase)) for f in matches[:80]]
+            matches = _group_files_by_dir(codebase, files, dir_path, codebases=all_codebases)
+            lines = [str(_relative_to_any(f)) for f in matches[:80]]
             if len(matches) > 80:
                 lines.append(f"... and {len(matches) - 80} more files")
             return "\n".join(lines) if lines else f"(no source files found in {dir_path})"
@@ -1772,17 +1810,27 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str):
             paths = args.get("paths", [])
             parts = []
             for rf in paths[:MAX_FILES_PER_READ]:
-                rf_path = codebase / str(rf)
-                if rf_path.exists() and rf_path.is_file():
+                # Try each codebase to find the file
+                rf_path = None
+                for cb in all_codebases:
+                    candidate = cb / str(rf)
+                    if candidate.exists() and candidate.is_file():
+                        rf_path = candidate
+                        break
+                if rf_path:
                     content = read_file_sample(rf_path, max_lines=SAMPLE_LINES)
                     parts.append(f"=== {rf} ===\n{content}")
                 else:
-                    # Try cached file index fallback
-                    match = _find_file(codebase, Path(rf).name)
-                    candidates = [match] if match else []
-                    if candidates:
-                        content = read_file_sample(candidates[0], max_lines=SAMPLE_LINES)
-                        actual = str(candidates[0].relative_to(codebase))
+                    # Try cached file index fallback across all codebases
+                    found = None
+                    for cb in all_codebases:
+                        match = _find_file(cb, Path(rf).name)
+                        if match:
+                            found = match
+                            break
+                    if found:
+                        content = read_file_sample(found, max_lines=SAMPLE_LINES)
+                        actual = str(_relative_to_any(found))
                         parts.append(f"=== {actual} (matched from {rf}) ===\n{content}")
                     else:
                         parts.append(f"=== {rf} ===\n(file not found)")
@@ -1802,7 +1850,8 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str):
 
 def run_pass1(model: str, codebase: Path, files: list[Path],
               language: str, docs_context: Optional[str] = None,
-              tracker: Optional[TokenTracker] = None) -> ModuleMap:
+              tracker: Optional[TokenTracker] = None,
+              codebases: Optional[list[Path]] = None) -> ModuleMap:
     """Agent-based module discovery using tool calling.
 
     The LLM explores the codebase interactively using tools:
@@ -1814,11 +1863,22 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
 
     Bounded to MAX_EXPLORE_ROUNDS to cap cost.
     """
+    all_codebases = codebases if codebases else [codebase]
+
+    def _relative_to_any(f: Path) -> Path:
+        """Compute relative path from whichever codebase contains this file."""
+        for cb in all_codebases:
+            try:
+                return f.relative_to(cb)
+            except ValueError:
+                continue
+        return Path(f.name)
+
     print(f"\n[Pass 1] {len(files)} source files found.")
 
     # Build initial tree — deeper for larger codebases
     initial_depth = 3 if len(files) < 500 else 4 if len(files) < 5000 else 5
-    tree = build_directory_tree(codebase, files, max_depth=initial_depth)
+    tree = build_directory_tree(codebase, files, max_depth=initial_depth, codebases=all_codebases)
     tree_lines = len(tree.split("\n"))
     print(f"[Pass 1] Directory tree: {tree_lines} lines, {len(tree)} chars")
 
@@ -1830,7 +1890,7 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     # Count top-level dirs to set expectations
     top_dirs = set()
     for f in files:
-        rel = f.relative_to(codebase)
+        rel = _relative_to_any(f)
         if len(rel.parts) > 1:
             top_dirs.add(rel.parts[0])
 
@@ -1848,7 +1908,7 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     )
 
     # Create dispatcher
-    dispatch = _make_pass1_dispatch(codebase, files, language)
+    dispatch = _make_pass1_dispatch(codebase, files, language, codebases=all_codebases)
 
     # Logging callback — user-friendly progress
     _explored_dirs: list[str] = []
@@ -1944,14 +2004,14 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
             test_modules_skipped += 1
             # Still count the files as assigned so they don't become orphans
             for dp in dir_paths:
-                for f in _group_files_by_dir(codebase, files, str(dp)):
-                    assigned_files.add(str(f.relative_to(codebase)))
+                for f in _group_files_by_dir(codebase, files, str(dp), codebases=all_codebases):
+                    assigned_files.add(str(_relative_to_any(f)))
             continue
 
         mod_files: list[str] = []
         for dp in dir_paths:
-            for f in _group_files_by_dir(codebase, files, str(dp)):
-                rel = str(f.relative_to(codebase))
+            for f in _group_files_by_dir(codebase, files, str(dp), codebases=all_codebases):
+                rel = str(_relative_to_any(f))
                 if rel not in assigned_files:
                     mod_files.append(rel)
                     assigned_files.add(rel)
@@ -1974,8 +2034,8 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
         print(f"[Pass 1] Skipped {test_modules_skipped} test module(s)")
 
     # Catch orphans
-    orphaned = [str(f.relative_to(codebase)) for f in files
-                if str(f.relative_to(codebase)) not in assigned_files]
+    orphaned = [str(_relative_to_any(f)) for f in files
+                if str(_relative_to_any(f)) not in assigned_files]
     if orphaned:
         print(f"[Pass 1] {len(orphaned)} orphaned files → 'other' module")
         modules.append(ModuleDefinition(
@@ -3473,7 +3533,7 @@ def main():
             docs_context = "\n\n".join(parts) if parts else None
 
         module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
-                              tracker=tracker)
+                              tracker=tracker, codebases=codebases)
         module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
         print(f"\n[Pass 1] Written to {module_map_path}")
     else:

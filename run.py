@@ -191,7 +191,9 @@ def main():
     print(f"{green('='*60)}")
     print(f"\n  Open Claude Code in: {bold(str(project_dir))}")
     print(f"  The search_codebase tool is available.")
-    print(f"\n  Try: {dim('\"How does X work?\"')} or {dim('\"Where is Y implemented?\"')}")
+    example1 = dim('"How does X work?"')
+    example2 = dim('"Where is Y implemented?"')
+    print(f"\n  Try: {example1} or {example2}")
     print()
 
 
