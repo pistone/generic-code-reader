@@ -410,6 +410,72 @@ python run.py \
     --rpm 100
 ```
 
+With no special flags, this runs the full pipeline:
+doc_agent (if --docs) → Pass 1 (module discovery) → Pass 2
+(summarization) → Index to R2R → ticket_agent (if --tickets).
+
+Multiple codebases can be analyzed together:
+```bash
+python run.py --codebase /path/to/src/core /path/to/src/plugins
+```
+
+### Starting from a clean slate
+
+To re-run the full pipeline from scratch (e.g., after changing the
+model, adjusting prompts, or wanting a fresh KB):
+
+```bash
+# 1. Delete all study agent artifacts
+rm -f indexer/module_map.json indexer/summaries.json
+rm -f indexer/context_cache.json indexer/call_graph.json
+rm -f indexer/file_hashes.json
+
+# 2. Delete doc agent artifacts (if using --docs)
+rm -f doc_agent/doc_hashes.json
+
+# 3. Delete ticket agent artifacts (if using --tickets)
+rm -f ticket_agent/ticket_hashes.json ticket_agent/ticket_summaries.json
+
+# 4. Clear R2R (drop all indexed data)
+cd r2r && docker compose down -v && docker compose up -d && cd ..
+
+# 5. Re-run
+python run.py --codebase /path/to/src ...
+```
+
+If you only want to re-run a specific phase (e.g., Pass 1 gave bad
+results but Pass 2 was fine), delete only that phase's artifact:
+- Bad module map? Delete `module_map.json`, re-run with `--pass1-only`
+- Bad summaries? Delete `summaries.json` and `context_cache.json`,
+  re-run with `--pass2-only`
+- Just want to re-index? `--index-only` (no deletion needed)
+
+### Running each phase separately (debugging)
+
+For large codebases, it helps to run each phase independently so
+you can inspect output before proceeding:
+
+```bash
+# Phase 1: Module discovery only
+python indexer/study_agent.py --codebase /path/to/src --pass1-only
+# → Inspect indexer/module_map.json. Happy? Continue:
+
+# Phase 2: Summarization only (reads module_map.json)
+python indexer/study_agent.py --codebase /path/to/src --pass2-only
+# → Inspect indexer/summaries.json. Want to improve vague ones:
+
+# Phase 3 (optional): Targeted refine — only re-summarizes chunks
+# with vague references ("delegates to", "defined elsewhere", etc.)
+python indexer/study_agent.py --codebase /path/to/src --refine
+# → Much cheaper than full review: touches ~5% of summaries
+
+# Phase 4 (optional): Full review — re-reads every summary
+python indexer/study_agent.py --codebase /path/to/src --review-only
+
+# Phase 5: Index into R2R
+python indexer/study_agent.py --codebase /path/to/src --index-only
+```
+
 ### Tuning for your environment
 
 **`--max-concurrent`**: How many parallel LLM calls.
@@ -543,6 +609,20 @@ If the LLM hits max rounds without calling `define_modules`, there's a
 fallback that forces the tool call, and then a directory-based fallback
 if that also fails.
 
+**Test module filtering**: The `define_modules` schema includes an
+`is_test` field. The LLM flags test modules (unit tests, fixtures,
+mocks, benchmarks). A fallback detector also catches test modules by
+name keywords ("test", "mock", "fake", "fixture", "harness") and
+directory path prefixes ("test*", "mock*"). Test modules are excluded
+from Pass 2 — their files are marked as assigned (so they don't become
+orphans in an "other" module) but not summarized or indexed.
+
+**Test file filtering**: `collect_source_files()` excludes test dirs
+by exact match (SKIP_TEST_DIRS: "test", "tests", "testing", etc.) AND
+prefix match ("test_*", "testutil", "tests_*"). Also excludes test
+files by name pattern (test_*.py, *_test.cpp, *_spec.ts, etc.).
+Use `--include-tests` to override.
+
 ### How Pass 2 (summarization) works
 
 Pass 2 is **async concurrent** — all chunks are summarized in parallel
@@ -564,6 +644,27 @@ verified — if the file was edited, stale summaries are discarded.
 
 **Deduplication**: Chunks are deduped by exact content hash + length +
 line count. Duplicates are logged and skipped.
+
+**Chunk classification**: Each chunk summary includes a classification
+tag `[category:X search_value:Y]` that the LLM generates alongside
+the summary. Categories:
+- `algorithm` — core logic, state machines → "how does X work?"
+- `contract` — interfaces, APIs, protocols → "how do I use X?"
+- `glue` — wiring, delegation, config → "how are X and Y connected?"
+- `error_handling` — error paths, recovery → "what happens when X fails?"
+- `data_model` — types, schemas, structures → "what does X look like?"
+- `boilerplate` — getters, imports, logging → rarely searched
+
+Search values: `high`, `medium`, `low`. Chunks classified as
+`boilerplate` + `low` are saved in summaries.json but skip R2R
+indexing (reducing noise and embedding cost). Classification is stored
+as R2R metadata (`chunk_category`, `search_value`) for filtered search.
+Pass 2 prints a classification breakdown at the end.
+
+**Targeted refine** (`--refine`): Instead of reviewing all summaries
+(expensive), scans for vague markers ("delegates to", "defined
+elsewhere", etc.) and only re-runs LLM on those chunks. Typically
+touches ~5% of summaries at ~5% of the cost of a full review pass.
 
 ### How the doc agent works
 
@@ -595,6 +696,13 @@ exceeded", "spending limit", "credits exhausted", etc.
 
 Transient 429 rate limits are NOT treated as quota errors — they trigger
 retry with backoff. Only hard budget/billing errors trigger halt.
+
+### max_tokens vs max_completion_tokens
+
+Newer models (OpenAI o1, o3) only accept `max_completion_tokens` instead
+of `max_tokens`. All LLM call functions use `_apply_max_tokens()` which
+detects the model name and sets the right parameter. This is transparent
+to callers — they all pass `max_tokens` and the helper translates.
 
 ### File structure conventions
 
