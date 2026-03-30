@@ -94,6 +94,68 @@ SKIP_DIRS    = {"__pycache__", ".git", ".hg", ".svn", "node_modules",
                 ".build", "_build"}
 SKIP_TEST_DIRS = {"test", "tests", "testing", "test_data", "testdata",
                   "testcases", "test_fixtures", "fixtures"}
+# Prefixes for test directory names — matches "testutil", "test_helpers", etc.
+_TEST_DIR_PREFIXES = ("test", "mock", "fake", "stub")
+# Keywords that identify a module as test-related (case-insensitive match)
+_TEST_MODULE_KEYWORDS = {"test", "testing", "mock", "fake", "stub",
+                         "fixture", "harness", "benchmark"}
+
+
+def _is_test_path(p: Path) -> bool:
+    """Check if a path is test-related by directory name or prefix."""
+    for part in p.parts:
+        part_lower = part.lower()
+        # Exact match on known test dirs
+        if part_lower in SKIP_TEST_DIRS:
+            return True
+        # Prefix match: testutil, test_helpers, tests_integration, etc.
+        if any(part_lower.startswith(pfx) for pfx in _TEST_DIR_PREFIXES):
+            # Avoid matching "testament", "testimony" — require _ or digit or
+            # end-of-string after the prefix
+            for pfx in _TEST_DIR_PREFIXES:
+                if part_lower.startswith(pfx):
+                    rest = part_lower[len(pfx):]
+                    if not rest or rest[0] in ("_", "-", "s") or rest[0].isdigit():
+                        return True
+    return False
+
+
+def _is_test_module(name: str, description: str, dir_paths: list) -> bool:
+    """Detect test modules by name, description, or directory paths.
+
+    Catches cases where the LLM didn't set is_test but the module is
+    clearly test-related.
+    """
+    name_lower = name.lower()
+    desc_lower = description.lower()
+    # Name-based: "TestFramework", "UnitTests", "MockServices"
+    if any(kw in name_lower for kw in _TEST_MODULE_KEYWORDS):
+        return True
+    # Description-based: "contains unit tests for..."
+    if any(kw in desc_lower for kw in ("unit test", "integration test",
+                                        "test suite", "test harness",
+                                        "test fixture", "mock")):
+        return True
+    # All dir_paths are test-related
+    if dir_paths and all(_is_test_dir_path(dp) for dp in dir_paths):
+        return True
+    return False
+
+
+def _is_test_dir_path(dp: str) -> bool:
+    """Check if a directory path looks test-related."""
+    parts = dp.strip("/").split("/")
+    for part in parts:
+        part_lower = part.lower()
+        if part_lower in SKIP_TEST_DIRS:
+            return True
+        for pfx in _TEST_DIR_PREFIXES:
+            if part_lower.startswith(pfx):
+                rest = part_lower[len(pfx):]
+                if not rest or rest[0] in ("_", "-", "s") or rest[0].isdigit():
+                    return True
+    return False
+
 
 _search_kb_failures = 0
 _quota_exhausted = False  # module-level flag, set when any phase hits quota
@@ -244,7 +306,7 @@ def collect_source_files(codebase: Path, language: str = "python",
             continue
         if any(part in SKIP_DIRS for part in p.parts):
             continue
-        if not include_tests and any(part in SKIP_TEST_DIRS for part in p.parts):
+        if not include_tests and _is_test_path(p):
             continue
         if p.suffix in SKIP_SUFFIXES:
             continue
@@ -1241,14 +1303,29 @@ def _index_one_entry(client, entry: dict) -> tuple[str, Optional[str], Optional[
     elif chunk_type in ("file_overview", "class_overview"):
         source_kind = "overview"
 
+    # Map chunk_category to source_kind for better search scoping
+    category = entry.get("chunk_category", "")
+    if category == "contract":
+        source_kind = "specification"
+    elif category == "error_handling":
+        source_kind = "operational"
+
     try:
-        doc_id = _create_or_replace(client, entry["summary"], {
+        metadata = {
             "source_file": src_file,
             "module": module,
             "chunk_type": chunk_type,
             "source_type": "code",
             "source_kind": source_kind,
-        })
+        }
+        # Add classification metadata if present
+        if category and category != "unknown":
+            metadata["chunk_category"] = category
+        search_val = entry.get("search_value", "")
+        if search_val:
+            metadata["search_value"] = search_val
+
+        doc_id = _create_or_replace(client, entry["summary"], metadata)
     except Exception as e:
         print(f"  [warn] {src_file}: summary index failed: {e}")
 
@@ -1485,7 +1562,9 @@ PASS1_SYSTEM = (
     "- Each module should map to a directory or group of related directories\n"
     "- Every source file should belong to exactly one module\n"
     "- Write 3-6 domain-specific questions per module (use the project's vocabulary)\n"
-    "- Focus questions on HOW things work internally, not just WHAT they are"
+    "- Focus questions on HOW things work internally, not just WHAT they are\n"
+    "- Mark test modules with is_test: true (unit tests, test frameworks, mocks, "
+    "benchmarks, fixtures). These will be excluded from the knowledge base."
 )
 
 MAX_EXPLORE_ROUNDS = 20  # cap on interactive exploration rounds
@@ -1629,6 +1708,16 @@ PASS1_TOOLS = [
                                     "items": {"type": "string"},
                                     "description": "3-6 domain-specific questions about this module",
                                 },
+                                "is_test": {
+                                    "type": "boolean",
+                                    "description": (
+                                        "True if this module is primarily test code: "
+                                        "unit tests, integration tests, test fixtures, "
+                                        "test harnesses, mocks, fakes, benchmarks. "
+                                        "False for production code."
+                                    ),
+                                    "default": False,
+                                },
                             },
                             "required": ["name", "description", "dir_paths", "questions"],
                         },
@@ -1643,13 +1732,17 @@ PASS1_TOOLS = [
 
 def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str):
     """Create a closure that dispatches Pass 1 tool calls."""
+    # Accumulate all expanded dirs across rounds so the tree keeps growing
+    _all_expanded: set[str] = set()
+    # Use same depth as initial tree
+    _base_depth = 3 if len(files) < 500 else 4 if len(files) < 5000 else 5
 
     def dispatch(name: str, args: dict) -> str:
         if name == "expand_dirs":
             dirs = args.get("dirs", [])
-            expanded_set = set(str(d) for d in dirs)
-            tree = build_directory_tree(codebase, files, max_depth=3,
-                                         expand_dirs=expanded_set)
+            _all_expanded.update(str(d) for d in dirs)
+            tree = build_directory_tree(codebase, files, max_depth=_base_depth,
+                                         expand_dirs=_all_expanded)
             return tree
 
         elif name == "list_files":
@@ -1823,11 +1916,22 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     assigned_files: set[str] = set()
     modules: list[ModuleDefinition] = []
 
+    test_modules_skipped = 0
     for mod_raw in raw_modules:
         name = mod_raw.get("name", "unknown")
         desc = mod_raw.get("description", "")
         dir_paths = mod_raw.get("dir_paths", [])
         questions = mod_raw.get("questions", [])
+        is_test = mod_raw.get("is_test", False)
+
+        # Skip test modules — flagged by LLM or detected by name/keywords
+        if is_test or _is_test_module(name, desc, dir_paths):
+            test_modules_skipped += 1
+            # Still count the files as assigned so they don't become orphans
+            for dp in dir_paths:
+                for f in _group_files_by_dir(codebase, files, str(dp)):
+                    assigned_files.add(str(f.relative_to(codebase)))
+            continue
 
         mod_files: list[str] = []
         for dp in dir_paths:
@@ -1850,6 +1954,9 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
             files=mod_files,
             questions=questions if isinstance(questions, list) else [str(questions)],
         ))
+
+    if test_modules_skipped:
+        print(f"[Pass 1] Skipped {test_modules_skipped} test module(s)")
 
     # Catch orphans
     orphaned = [str(f.relative_to(codebase)) for f in files
@@ -1984,10 +2091,27 @@ Requirements:
 - Mention which of the domain questions above this chunk addresses (if any)
 - Note what other functions/methods this code calls (if any)
 - If trivial (imports-only, constants, empty stub), one sentence is enough
-- Plain prose only — no markdown, no bullets
-- Start with SKIP: if this chunk has near-zero search value (pure imports/includes,
-  trivial getters/setters, boilerplate logging, empty stubs). The summary will still
-  be saved but won't be indexed into the search database.{focus_section}
+- Plain prose only — no markdown, no bullets{focus_section}
+
+After the summary, on a new line, write a classification tag in this exact format:
+[category:CATEGORY search_value:VALUE]
+
+CATEGORY — what kind of question this chunk answers:
+- algorithm: Core logic, state machines, decision trees — "how does X work internally?"
+- contract: Interface definition, API, protocol — "how do I use X?" / "what does X expect?"
+- glue: Wiring, delegation, configuration, initialization — "how are X and Y connected?"
+- error_handling: Error paths, recovery, validation — "what happens when X fails?"
+- data_model: Type definitions, schemas, data structures — "what does X look like?"
+- boilerplate: Getters/setters, imports, forward declarations, logging — rarely searched for
+
+VALUE — would a developer search for this?
+- high: Core business logic, complex algorithms, important APIs
+- medium: Supporting logic, internal helpers, secondary interfaces
+- low: Trivial code, boilerplate, generated code
+
+Example output:
+This function validates incoming TxnRequest objects by checking account balance, applying fraud rules, and verifying spending limits. It calls FraudChecker::evaluate() for ML-based fraud scoring and throws TxnValidationError if any check fails.
+[category:algorithm search_value:high]
 
 Summary:"""
 
@@ -2481,11 +2605,24 @@ async def _async_summarize_one_chunk(
     if summary_text.lower().startswith("summary:"):
         summary_text = summary_text[len("summary:"):].strip()
 
+    # Parse classification tag: [category:X search_value:Y]
+    chunk_category = "unknown"
+    search_value = "medium"
+    tag_match = _re.search(
+        r'\[category:(\w+)\s+search_value:(\w+)\]', summary_text)
+    if tag_match:
+        chunk_category = tag_match.group(1)
+        search_value = tag_match.group(2)
+        # Remove the tag from the summary text
+        summary_text = summary_text[:tag_match.start()].rstrip()
+
     # Check if the LLM tagged this as low-value
     skip_index = False
     if summary_text.upper().startswith("SKIP:"):
         skip_index = True
         summary_text = summary_text[5:].strip()
+    elif chunk_category == "boilerplate" and search_value == "low":
+        skip_index = True
 
     refined = False
     if not skip_index and _needs_reference_resolution(summary_text):
@@ -2501,15 +2638,17 @@ async def _async_summarize_one_chunk(
     summary_text = _prefix_summary(summary_text, chunk_type, symbol_name)
 
     return {
-        "summary":     summary_text,
-        "raw_code":    chunk,
-        "source_file": rel_path,
-        "module":      mod_name,
-        "chunk_type":  chunk_type,
-        "chunk_index": chunk_index,
-        "refined":     refined,
-        "skip_index":  skip_index,
-        "content_hash": _chunk_content_hash(chunk),
+        "summary":        summary_text,
+        "raw_code":       chunk,
+        "source_file":    rel_path,
+        "module":         mod_name,
+        "chunk_type":     chunk_type,
+        "chunk_index":    chunk_index,
+        "refined":        refined,
+        "skip_index":     skip_index,
+        "chunk_category": chunk_category,
+        "search_value":   search_value,
+        "content_hash":   _chunk_content_hash(chunk),
     }
 
 
@@ -2961,10 +3100,32 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     if summaries_path:
         summaries_path.write_text(json.dumps(summaries, indent=2))
 
+    # Classification breakdown
+    cat_counts: dict[str, int] = {}
+    val_counts: dict[str, int] = {}
+    skip_count = 0
+    for e in summaries:
+        cat = e.get("chunk_category", "")
+        val = e.get("search_value", "")
+        if cat:
+            cat_counts[cat] = cat_counts.get(cat, 0) + 1
+        if val:
+            val_counts[val] = val_counts.get(val, 0) + 1
+        if e.get("skip_index"):
+            skip_count += 1
+
     print(f"\n[Pass 2] Done: {len(summaries)} summaries total "
           f"({completed_count} new, {total_cached} cached, "
           f"{error_count} errors, {refined_count} refined, "
           f"{overview_count} overviews, {func_card_count} function cards)")
+    if cat_counts:
+        cat_str = ", ".join(f"{k}={v}" for k, v in sorted(cat_counts.items(), key=lambda x: -x[1]))
+        print(f"[Pass 2] Categories: {cat_str}")
+    if val_counts:
+        val_str = ", ".join(f"{k}={v}" for k, v in sorted(val_counts.items(), key=lambda x: -x[1]))
+        print(f"[Pass 2] Search value: {val_str}")
+    if skip_count:
+        print(f"[Pass 2] {skip_count} chunks marked low-value (will skip indexing)")
     if _search_kb_failures > 0:
         print(f"  [warn] {_search_kb_failures} RAG queries failed — "
               f"is R2R running? (summaries were generated without KB context)")

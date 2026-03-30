@@ -121,6 +121,24 @@ def _extract_content(response) -> str:
 # LLM call
 # ---------------------------------------------------------------------------
 
+# Models that require max_completion_tokens instead of max_tokens.
+# litellm handles this for known models, but custom proxy endpoints may not.
+_MAX_COMPLETION_TOKEN_MODELS = {"o1", "o1-mini", "o1-preview", "o3", "o3-mini"}
+
+
+def _apply_max_tokens(kwargs: dict, model: str, max_tokens: int) -> None:
+    """Set the right max tokens parameter for the model.
+
+    Some newer models (o1, o3) only accept max_completion_tokens.
+    Most models accept max_tokens. We check the model name and set
+    the appropriate parameter.
+    """
+    model_lower = model.lower().split("/")[-1]  # strip provider prefix
+    if any(model_lower.startswith(m) for m in _MAX_COMPLETION_TOKEN_MODELS):
+        kwargs["max_completion_tokens"] = max_tokens
+    else:
+        kwargs["max_tokens"] = max_tokens
+
 def llm_call_multi(model: str, system: str, messages: list[dict],
                     max_tokens: int = 4096,
                     json_mode: bool = False,
@@ -137,7 +155,8 @@ def llm_call_multi(model: str, system: str, messages: list[dict],
 
     full_messages = [{"role": "system", "content": system}] + messages
 
-    kwargs = dict(model=model, messages=full_messages, max_tokens=max_tokens)
+    kwargs = dict(model=model, messages=full_messages)
+    _apply_max_tokens(kwargs, model, max_tokens)
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
@@ -167,8 +186,8 @@ def llm_call(model: str, system: str, user: str,
         {"role": "user",   "content": user},
     ]
 
-    kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
-                  stream=stream)
+    kwargs = dict(model=model, messages=messages, stream=stream)
+    _apply_max_tokens(kwargs, model, max_tokens)
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
     if stream:
@@ -211,7 +230,8 @@ async def allm_call(model: str, system: str, user: str,
         {"role": "user",   "content": user},
     ]
 
-    kwargs = dict(model=model, messages=messages, max_tokens=max_tokens)
+    kwargs = dict(model=model, messages=messages)
+    _apply_max_tokens(kwargs, model, max_tokens)
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
@@ -237,7 +257,8 @@ async def allm_call_multi(model: str, system: str, messages: list[dict],
 
     full_messages = [{"role": "system", "content": system}] + messages
 
-    kwargs = dict(model=model, messages=full_messages, max_tokens=max_tokens)
+    kwargs = dict(model=model, messages=full_messages)
+    _apply_max_tokens(kwargs, model, max_tokens)
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
@@ -282,8 +303,9 @@ def llm_tool_loop(
     messages = [{"role": "system", "content": system}] + list(initial_messages)
 
     for round_num in range(1, max_rounds + 1):
-        kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
+        kwargs = dict(model=model, messages=messages,
                       tools=tools, tool_choice="auto")
+        _apply_max_tokens(kwargs, model, max_tokens)
         response = completion(**kwargs)
 
         if tracker and phase:
