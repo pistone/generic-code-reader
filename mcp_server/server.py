@@ -177,11 +177,10 @@ def search_codebase(query: str, module: str = "",
     knowledge for the given query. Use this before reading files directly
     — it may already contain the answer with much less token cost.
 
-    MULTI-HOP SEARCH: A single search may return results that reference
-    names, IDs, or identifiers you don't yet understand. When this
-    happens, do a FOLLOW-UP search for that unresolved name to find what
-    it maps to. Two searches are almost always enough to resolve indirect
-    references. Combine the results in your final answer.
+    This tool may not fully answer the question in one call. If the
+    results are incomplete or raise new questions, investigate further
+    using any means available — additional searches, reading source
+    files, grep, or other tools — until you can give a complete answer.
 
     Args:
         query:  Natural language description of what you're looking for.
