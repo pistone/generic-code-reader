@@ -188,6 +188,139 @@ _CALL_PATTERNS = [
     _re_mod.compile(r'(?:uses)\s+(?:`)?(\w[\w:]*(?:::\w+)?)\s*\(\)(?:`)?', _re_mod.IGNORECASE),
 ]
 
+# ── Caller frequency map ──────────────────────────────────────────────────
+# Single-pass scan of all source files to count how often each function/method
+# is called. Used to inject "widely used" hints into Pass 2 prompts.
+
+# Regex to extract function/method call sites from raw source code.
+# Matches: foo(, Foo::bar(, obj.method(, obj->method(, namespace::func(
+_SOURCE_CALL_RE = _re_mod.compile(
+    r'(?:(\w+)(?:::|\.|->))?(\w+)\s*\(',
+)
+
+# Names too generic to be useful — skip these in the frequency map
+_CALL_NOISE = frozenset({
+    # C/C++ stdlib & common
+    "if", "for", "while", "switch", "return", "sizeof", "typeof", "decltype",
+    "static_cast", "dynamic_cast", "reinterpret_cast", "const_cast",
+    "new", "delete", "throw", "catch", "try",
+    "get", "set", "put", "add", "end", "begin", "size", "push", "pop",
+    "find", "erase", "clear", "empty", "front", "back", "insert", "remove",
+    "open", "close", "read", "write", "lock", "unlock",
+    "printf", "sprintf", "fprintf", "snprintf", "scanf", "sscanf",
+    "malloc", "calloc", "realloc", "free",
+    "memcpy", "memset", "memmove", "memcmp",
+    "strlen", "strcmp", "strncmp", "strcpy", "strncpy", "strcat",
+    "assert", "abort", "exit",
+    "make_shared", "make_unique", "make_pair", "make_tuple",
+    "move", "forward", "swap",
+    # Python common
+    "len", "str", "int", "float", "bool", "list", "dict", "tuple",
+    "range", "enumerate", "zip", "map", "filter", "sorted", "reversed",
+    "print", "type", "isinstance", "issubclass", "hasattr", "getattr", "setattr",
+    "super", "property", "classmethod", "staticmethod",
+    "append", "extend", "update", "items", "keys", "values", "join", "split",
+    "strip", "replace", "format", "encode", "decode",
+    # JS/TS common
+    "log", "error", "warn", "info", "debug",
+    "then", "catch", "finally", "resolve", "reject",
+    "push", "splice", "slice", "concat", "forEach", "map", "filter", "reduce",
+    "toString", "valueOf", "constructor",
+    # Macros / preprocessor
+    "define", "undef", "include", "ifdef", "ifndef", "endif", "elif",
+    "LOG", "ASSERT", "CHECK", "DCHECK", "VLOG", "TRACE",
+})
+
+# Minimum name length and minimum call count to qualify as "frequently called"
+_MIN_CALL_NAME_LEN = 4
+_FREQUENT_CALL_THRESHOLD = 5  # called from at least this many distinct files
+
+
+def build_caller_frequency_map(files: list[Path],
+                                codebases: Optional[list[Path]] = None,
+                                codebase: Optional[Path] = None,
+                                ) -> dict[str, int]:
+    """Scan all source files once and count how many distinct files call each function.
+
+    Returns a dict mapping "Class::method" or "function" → number of distinct
+    files that contain a call to it. Only includes names that appear in
+    >= _FREQUENT_CALL_THRESHOLD distinct files and aren't noise.
+    """
+    # symbol → set of files that call it
+    call_sites: dict[str, set[str]] = {}
+    all_cb = codebases if codebases else ([codebase] if codebase else [])
+
+    for f in files:
+        try:
+            text = f.read_text(encoding="utf-8", errors="replace")
+        except (OSError, PermissionError):
+            continue
+
+        # Compute a short file key for dedup
+        if all_cb:
+            fkey = _relative_to_any(f, all_cb)
+        else:
+            fkey = f.name
+
+        seen_in_file: set[str] = set()
+        for match in _SOURCE_CALL_RE.finditer(text):
+            qualifier = match.group(1)  # Class/namespace or None
+            name = match.group(2)
+
+            if len(name) < _MIN_CALL_NAME_LEN:
+                continue
+            if name in _CALL_NOISE or name.upper() == name:
+                # Skip all-caps (likely macros)
+                continue
+
+            # Build the symbol key
+            if qualifier and len(qualifier) >= 2:
+                symbol = f"{qualifier}::{name}"
+            else:
+                symbol = name
+
+            if symbol not in seen_in_file:
+                seen_in_file.add(symbol)
+                call_sites.setdefault(symbol, set()).add(fkey)
+
+    # Filter to frequently called only
+    return {sym: len(callers) for sym, callers in call_sites.items()
+            if len(callers) >= _FREQUENT_CALL_THRESHOLD}
+
+
+def _get_chunk_functions(raw_code: str) -> list[str]:
+    """Extract function/method names defined in a code chunk.
+
+    Returns a list of names like "ClassName::methodName" or "functionName".
+    Handles C/C++, Python, JS/TS, Java, Go, Rust.
+    """
+    names: list[str] = []
+    for line in raw_code.split("\n"):
+        stripped = line.strip()
+        # C/C++: ReturnType ClassName::methodName(
+        m = _re_mod.match(r'(?:\w[\w:<>*&\s]*?\s+)?(\w+)::(\w+)\s*\(', stripped)
+        if m:
+            names.append(f"{m.group(1)}::{m.group(2)}")
+            continue
+        # C/C++ free function: ReturnType functionName(
+        m = _re_mod.match(r'(?:\w[\w:<>*&\s]*?\s+)(\w{4,})\s*\([^)]*\)\s*(?:\{|const|override|=)',
+                          stripped)
+        if m and not m.group(1) in ("if", "for", "while", "switch", "return", "class", "struct"):
+            names.append(m.group(1))
+            continue
+        # Python: def functionName(
+        m = _re_mod.match(r'def\s+(\w{4,})\s*\(', stripped)
+        if m:
+            names.append(m.group(1))
+            continue
+        # JS/TS: function name( or name( {  or name = function/arrow
+        m = _re_mod.match(r'(?:export\s+)?(?:async\s+)?function\s+(\w{4,})\s*\(', stripped)
+        if m:
+            names.append(m.group(1))
+            continue
+    return names
+
+
 # Cache for file lookups to avoid repeated rglob walks
 _file_index_cache: dict[Path, dict[str, list[Path]]] = {}
 
@@ -2261,7 +2394,8 @@ def build_pass2_prompt(project_desc: str, module_name: str,
                        module_desc: str, questions: list[str],
                        source_file: str, raw_code: str,
                        kb_context: str = "",
-                       file_summary: str = "") -> str:
+                       file_summary: str = "",
+                       usage_hints: Optional[list[str]] = None) -> str:
     questions_text = "\n".join(f"- {q}" for q in questions)
     kb_section = (
         f"\nRelevant context from the knowledge base (use this vocabulary):\n{kb_context}\n"
@@ -2291,6 +2425,15 @@ def build_pass2_prompt(project_desc: str, module_name: str,
                 + "\n".join(f"- {q}" for q in focus_lines)
             )
 
+    usage_section = ""
+    if usage_hints:
+        usage_section = (
+            "\n\nUsage note — these functions defined in this chunk are widely "
+            "called across the codebase:\n"
+            + "\n".join(f"- {h}" for h in usage_hints)
+            + "\n"
+        )
+
     return f"""Project: {project_desc}
 Module: {module_name} — {module_desc}
 
@@ -2302,13 +2445,14 @@ Code chunk:
 ```
 {raw_code}
 ```
-
+{usage_section}
 Write a 2–4 sentence domain-aware summary of this code chunk.
 Requirements:
 - Use the project's own vocabulary (class names, function names, domain concepts)
 - State what this code DOES, not just what it IS
 - Mention which of the domain questions above this chunk addresses (if any)
 - Note what other functions/methods this code calls (if any)
+- If a function is widely called (see usage note above), include a sentence about WHEN and WHY a developer would call it — frame it as a recommendation
 - If trivial (imports-only, constants, empty stub), one sentence is enough
 - Plain prose only — no markdown, no bullets{focus_section}
 
@@ -2806,8 +2950,26 @@ async def _async_summarize_one_chunk(
         mod_name: str, mod_desc: str, questions: list[str],
         rel_path: str, chunk: str, chunk_index: int,
         rag: bool = False, file_summary: str = "",
-        tracker: Optional[TokenTracker] = None) -> dict:
+        tracker: Optional[TokenTracker] = None,
+        caller_freq: Optional[dict[str, int]] = None) -> dict:
     """Async version: summarize a single code chunk."""
+    # Build usage hints for frequently-called functions in this chunk
+    usage_hints: Optional[list[str]] = None
+    if caller_freq:
+        func_names = _get_chunk_functions(chunk)
+        hints = []
+        for fn in func_names:
+            count = caller_freq.get(fn)
+            if not count:
+                # Try bare name (without class qualifier)
+                bare = fn.split("::")[-1] if "::" in fn else None
+                if bare:
+                    count = caller_freq.get(bare)
+            if count:
+                hints.append(f"{fn} is called from {count} different files")
+        if hints:
+            usage_hints = hints
+
     kb_context = (await asyncio.to_thread(search_kb, f"{mod_name} {chunk[:200]}", 3)
                   if rag else "")
     prompt = build_pass2_prompt(
@@ -2819,6 +2981,7 @@ async def _async_summarize_one_chunk(
         raw_code=chunk,
         kb_context=kb_context,
         file_summary=file_summary,
+        usage_hints=usage_hints,
     )
 
     summary_text = await allm_call(model, PASS2_SYSTEM, prompt, max_tokens=512,
@@ -2938,6 +3101,29 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             max_concurrent=max_concurrent, rpm=rpm, tracker=tracker, quiet=quiet,
             codebases=all_codebases,
         )
+
+    # ── Build caller frequency map (single pass, no LLM) ─────────────────
+    all_files_for_freq: list[Path] = []
+    for mod in module_map.modules:
+        for fname in mod.files:
+            fpath = _resolve_file(fname, codebase, all_codebases)
+            if fpath:
+                all_files_for_freq.append(fpath)
+
+    import time as _time_freq
+    t0 = _time_freq.monotonic()
+    caller_freq = build_caller_frequency_map(
+        all_files_for_freq, codebases=all_codebases, codebase=codebase)
+    elapsed = _time_freq.monotonic() - t0
+    if caller_freq:
+        print(f"\n[Caller frequency] {len(caller_freq)} frequently-called functions "
+              f"detected ({elapsed:.1f}s)")
+        # Show top 5 for visibility
+        top5 = sorted(caller_freq.items(), key=lambda x: -x[1])[:5]
+        for sym, count in top5:
+            print(f"  {sym}: called from {count} files")
+    else:
+        print(f"\n[Caller frequency] No frequently-called functions detected ({elapsed:.1f}s)")
 
     # ── Collect chunks and detect multi-chunk functions ──────────────────
     work_items: list[dict] = []
@@ -3229,6 +3415,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             it["rel_path"], it["chunk"], it["chunk_index"],
             rag=rag, file_summary=it.get("file_summary", ""),
             tracker=tracker,
+            caller_freq=caller_freq,
         ))
         for item in work_items
     ]
