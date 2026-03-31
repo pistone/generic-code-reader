@@ -174,13 +174,8 @@ def search_codebase(query: str, module: str = "",
     Search the domain knowledge base semantically.
 
     Returns the most relevant code summaries, documentation, and ticket
-    knowledge for the given query. Use this before reading files directly
-    — it may already contain the answer with much less token cost.
-
-    This tool may not fully answer the question in one call. If the
-    results are incomplete or raise new questions, investigate further
-    using any means available — additional searches, reading source
-    files, grep, or other tools — until you can give a complete answer.
+    knowledge for the given query. Treat results as a starting point,
+    not a final answer — investigate further if needed.
 
     Args:
         query:  Natural language description of what you're looking for.
