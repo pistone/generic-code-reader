@@ -1593,10 +1593,14 @@ PASS1_SYSTEM = (
     "you haven't explored enough. Keep exploring.\n"
     "- Each module should map to a directory or group of related directories\n"
     "- Every source file should belong to exactly one module\n"
+    "- NO catch-all modules. Do NOT create a single 'other' or 'libs' module that "
+    "contains most of the codebase. Every major directory should be its own module "
+    "or grouped with closely related directories only.\n"
     "- Write 3-6 domain-specific questions per module (use the project's vocabulary)\n"
     "- Focus questions on HOW things work internally, not just WHAT they are\n"
     "- Mark test modules with is_test: true (unit tests, test frameworks, mocks, "
-    "benchmarks, fixtures). These will be excluded from the knowledge base."
+    "benchmarks, fixtures). These will be excluded from the knowledge base.\n"
+    "- If define_modules is rejected, read the feedback and fix the issues."
 )
 
 MAX_EXPLORE_ROUNDS = 20  # cap on interactive exploration rounds
@@ -1772,9 +1776,52 @@ PASS1_TOOLS = [
 ]
 
 
+def _validate_modules(modules: list[dict], total_files: int,
+                      top_dir_count: int) -> Optional[str]:
+    """Validate a define_modules result. Returns error message or None if OK."""
+    if not modules:
+        return "You defined 0 modules. Every codebase has at least a few modules."
+
+    # Expected minimum: rough heuristic based on codebase size
+    min_modules = max(3, min(top_dir_count // 2, 8))
+    non_test = [m for m in modules if not m.get("is_test", False)]
+
+    if len(non_test) < min_modules and total_files > 500:
+        return (
+            f"You only defined {len(non_test)} non-test modules, but this "
+            f"codebase has {total_files} files across {top_dir_count} top-level "
+            f"directories. A project this size should have at least {min_modules} "
+            f"modules. Explore more directories and break it down further."
+        )
+
+    # Reject catch-all: any single module covering >40% of files
+    for m in non_test:
+        dir_paths = m.get("dir_paths", [])
+        # Count how many top-level dirs this module claims
+        claimed_top = set()
+        for dp in dir_paths:
+            top = dp.split("/")[0] if "/" in dp else dp
+            claimed_top.add(top)
+        if len(claimed_top) > top_dir_count * 0.4 and top_dir_count > 4:
+            return (
+                f"Module '{m.get('name')}' spans {len(claimed_top)} of "
+                f"{top_dir_count} top-level directories — that's a catch-all, "
+                f"not a real module. Break it into separate modules by functional "
+                f"area. Each module should cover one cohesive subsystem."
+            )
+
+    return None  # OK
+
+
 def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
-                          codebases: Optional[list[Path]] = None):
-    """Create a closure that dispatches Pass 1 tool calls."""
+                         top_dir_count: int,
+                         codebases: Optional[list[Path]] = None):
+    """Create a closure that dispatches Pass 1 tool calls.
+
+    define_modules is validated here. If validation fails, an error message
+    is returned to the LLM so it can fix and retry. If validation passes,
+    the accepted result is stored in `dispatch.accepted_modules`.
+    """
     # Accumulate all expanded dirs across rounds so the tree keeps growing
     _all_expanded: set[str] = set()
     # Use same depth as initial tree
@@ -1842,9 +1889,31 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
             result = search_kb(query, limit=limit)
             return result if result else "(no results found in knowledge base)"
 
+        elif name == "define_modules":
+            modules = args.get("modules", [])
+            error = _validate_modules(modules, len(files), top_dir_count)
+            if error:
+                print(f"  [Pass 1] Module map REJECTED: {error[:120]}")
+                dispatch.rejected_count = getattr(dispatch, "rejected_count", 0) + 1
+                # After 2 rejections, accept whatever we get
+                if dispatch.rejected_count >= 2:
+                    print(f"  [Pass 1] Accepting after {dispatch.rejected_count} rejections")
+                    dispatch.accepted_modules = args
+                    return "__ACCEPTED__"
+                return (
+                    f"REJECTED: {error}\n\n"
+                    "Use expand_dirs and list_files to explore the directories "
+                    "you haven't looked at yet, then call define_modules again "
+                    "with a more granular module breakdown."
+                )
+            dispatch.accepted_modules = args
+            return "__ACCEPTED__"
+
         else:
             return f"Unknown tool: {name}"
 
+    dispatch.accepted_modules = None
+    dispatch.rejected_count = 0
     return dispatch
 
 
@@ -1887,28 +1956,45 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     if docs_context:
         docs_section = f"\n\nDesign documentation (excerpts):\n{docs_context}"
 
-    # Count top-level dirs to set expectations
-    top_dirs = set()
+    # Count top-level dirs and file counts per dir for expectations
+    top_dirs: dict[str, int] = {}  # dir_name → file_count
     for f in files:
         rel = _relative_to_any(f)
         if len(rel.parts) > 1:
-            top_dirs.add(rel.parts[0])
+            top = rel.parts[0]
+            top_dirs[top] = top_dirs.get(top, 0) + 1
 
+    # Build a compact summary of top-level directories for the LLM
+    dir_summary_lines = []
+    for d, count in sorted(top_dirs.items(), key=lambda x: -x[1]):
+        dir_summary_lines.append(f"  {d}/ — {count} files")
+    dir_summary = "\n".join(dir_summary_lines)
+
+    min_modules = max(3, min(len(top_dirs) // 2, 8))
     initial_prompt = (
         f"Explore this {language} codebase and define its modules.\n\n"
+        f"Top-level directories (by file count):\n{dir_summary}\n\n"
         f"Directory tree (depth-limited, counts on truncated nodes):\n"
         f"```\n{tree}\n```"
         f"{docs_section}\n\n"
         f"This codebase has {len(files)} files across {len(top_dirs)} "
-        f"top-level directories. Explore broadly first — expand the major "
-        f"directories, read a few key files in each area, then define modules. "
-        f"A project this size likely has 5-20+ distinct modules.\n\n"
-        f"You have {MAX_EXPLORE_ROUNDS} exploration rounds — use at least "
-        f"half of them exploring before calling define_modules."
+        f"top-level directories. Each major directory above is likely its own "
+        f"module or contains multiple sub-modules.\n\n"
+        f"IMPORTANT RULES:\n"
+        f"- Explore broadly first — expand every major directory, read key "
+        f"files in each area. You have {MAX_EXPLORE_ROUNDS} rounds.\n"
+        f"- Define at least {min_modules} modules. A project this size likely "
+        f"has {min_modules}-{min_modules * 3}+ distinct modules.\n"
+        f"- Do NOT create catch-all modules. A module named 'libs' or 'other' "
+        f"that contains most of the codebase will be REJECTED.\n"
+        f"- Each module should cover ONE cohesive subsystem.\n"
+        f"- If define_modules is rejected, explore more and try again."
     )
 
-    # Create dispatcher
-    dispatch = _make_pass1_dispatch(codebase, files, language, codebases=all_codebases)
+    # Create dispatcher — define_modules is validated inside dispatch
+    n_top_dirs = len(top_dirs)
+    dispatch = _make_pass1_dispatch(codebase, files, language, n_top_dirs,
+                                    codebases=all_codebases)
 
     # Logging callback — user-friendly progress
     _explored_dirs: list[str] = []
@@ -1937,17 +2023,20 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
         elif tool_name == "define_modules":
             n = len(args.get("modules", []))
             _modules_so_far = n
-            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Defining {n} modules")
+            status = "validating" if dispatch.accepted_modules is None else "accepted"
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Defining {n} modules ({status})")
 
     print(f"[Pass 1] Exploring codebase structure with {model}...")
 
-    conversation, terminal_args = llm_tool_loop(
+    # define_modules is NOT a terminal tool — it's validated inside dispatch.
+    # The loop runs until dispatch.accepted_modules is set or rounds exhausted.
+    conversation, _ = llm_tool_loop(
         model=model,
         system=PASS1_SYSTEM,
         initial_messages=[{"role": "user", "content": initial_prompt}],
         tools=PASS1_TOOLS,
         dispatch=dispatch,
-        terminal_tools={"define_modules"},
+        terminal_tools=set(),  # no terminal tools — validation is in dispatch
         max_rounds=MAX_EXPLORE_ROUNDS,
         max_tokens=4096,
         tracker=tracker,
@@ -1955,15 +2044,22 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
         on_round=on_round,
     )
 
-    # If agent didn't call define_modules, force it
+    terminal_args = dispatch.accepted_modules
+
+    # If agent never called define_modules successfully, force it
     if terminal_args is None:
         print(f"  [Pass 1] Max rounds reached — forcing module definition...")
         from litellm import completion
         conversation.append({
             "role": "user",
-            "content": ("You have used all exploration rounds. "
-                        "Call define_modules now to define the final module map. "
-                        "Assign ALL directories to modules."),
+            "content": (
+                "You have used all exploration rounds. "
+                "Call define_modules now to define the final module map. "
+                f"This codebase has {n_top_dirs} top-level directories — "
+                f"define at least {min_modules} modules. "
+                "Assign ALL directories to modules. "
+                "Do NOT put everything in one module."
+            ),
         })
         response = completion(
             model=model, messages=conversation, max_tokens=4096,

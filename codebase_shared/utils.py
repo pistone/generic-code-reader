@@ -343,6 +343,10 @@ def llm_tool_loop(
                 "content": str(result),
             })
 
+            # Dispatch can signal loop termination by returning __ACCEPTED__
+            if result == "__ACCEPTED__":
+                return messages, args
+
     # Max rounds exhausted
     return messages, None
 

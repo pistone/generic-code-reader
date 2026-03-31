@@ -9,8 +9,19 @@ Pass 1 is an **LLM tool-calling loop**, not a static analysis. The LLM
 gets a depth-limited directory tree and 5 tools: `expand_dirs`,
 `list_files`, `read_files`, `search_kb`, and `define_modules`.
 
-It explores iteratively for up to 20 rounds, then calls `define_modules`
-as the terminal tool. If it doesn't call it in time, it's forced.
+It explores iteratively for up to 20 rounds. When `define_modules` is
+called, the result is **validated before acceptance**:
+
+1. **Minimum module count**: `max(3, top_dirs // 2)` non-test modules
+   required for codebases with 500+ files.
+2. **No catch-all modules**: Any single module claiming >40% of
+   top-level directories is rejected.
+3. **Retry with feedback**: On rejection, the LLM gets an error message
+   explaining what's wrong and is told to explore more. After 2
+   rejections, the result is accepted as-is to avoid infinite loops.
+
+If the LLM never calls `define_modules` or hits max rounds, it's forced
+with `tool_choice`, then falls back to one-module-per-top-level-dir.
 
 **The initial tree depth scales with codebase size**:
 - <500 files: depth 3
@@ -21,15 +32,9 @@ as the terminal tool. If it doesn't call it in time, it's forced.
 directories. The tree is rebuilt with all previously expanded dirs +
 new ones, so the LLM sees a progressively richer view.
 
-**Known behavior**: The LLM may rush to conclude with too few modules.
-The system prompt explicitly tells it to explore broadly first and that
-a large codebase typically has 5-20+ modules. If the model still
-produces too few modules, it likely needs a better model (GPT-4o or
-Claude Sonnet, not Haiku/Mini).
-
-If the LLM hits max rounds without calling `define_modules`, there's a
-fallback that forces the tool call, and then a directory-based fallback
-if that also fails.
+**Top-level directory summary**: The initial prompt includes a compact
+list of all top-level directories with file counts, so the LLM knows
+what areas exist before it starts exploring.
 
 ### Test module filtering
 
