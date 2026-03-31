@@ -321,6 +321,66 @@ def _get_chunk_functions(raw_code: str) -> list[str]:
     return names
 
 
+def _lookup_doc_mentions(symbols: list[str]) -> dict[str, str]:
+    """Query R2R for documentation that mentions frequently-called functions.
+
+    For each symbol, searches R2R for doc-type chunks containing that name.
+    Returns a dict mapping symbol → doc snippet (first match, truncated).
+    Degrades gracefully if R2R is unavailable.
+    """
+    if not symbols:
+        return {}
+    try:
+        client = _r2r_client()
+    except Exception:
+        return {}
+
+    doc_mentions: dict[str, str] = {}
+    for sym in symbols:
+        # Search for the bare function name (most likely to match docs)
+        bare_name = sym.split("::")[-1] if "::" in sym else sym
+        try:
+            results = client.retrieval.search(
+                query=bare_name,
+                search_settings={
+                    "limit": 2,
+                    "filters": {"chunk_type": {"$in": ["doc_summary", "doc_section"]}},
+                },
+            )
+            hits = results.results.chunk_search_results
+            if not hits:
+                continue
+            # Check that the hit actually mentions the function name
+            for hit in hits:
+                text = (hit.text or "").strip()
+                if bare_name.lower() in text.lower():
+                    src = (hit.metadata or {}).get("source_file", "docs")
+                    # Extract the sentence containing the function name
+                    snippet = _extract_mention_sentence(text, bare_name)
+                    doc_mentions[sym] = f'[{src}] {snippet}'
+                    break
+        except Exception:
+            continue
+    return doc_mentions
+
+
+def _extract_mention_sentence(text: str, name: str) -> str:
+    """Extract the sentence(s) from text that mention the given name."""
+    # Split into sentences (rough)
+    import re as _re_sent
+    sentences = _re_sent.split(r'(?<=[.!?])\s+', text)
+    name_lower = name.lower()
+    matching = [s for s in sentences if name_lower in s.lower()]
+    if matching:
+        # Return first matching sentence, truncated
+        result = matching[0].strip()
+        if len(result) > 200:
+            result = result[:200] + "..."
+        return result
+    # Fallback: return first 150 chars
+    return text[:150] + ("..." if len(text) > 150 else "")
+
+
 # Cache for file lookups to avoid repeated rglob walks
 _file_index_cache: dict[Path, dict[str, list[Path]]] = {}
 
@@ -2951,7 +3011,8 @@ async def _async_summarize_one_chunk(
         rel_path: str, chunk: str, chunk_index: int,
         rag: bool = False, file_summary: str = "",
         tracker: Optional[TokenTracker] = None,
-        caller_freq: Optional[dict[str, int]] = None) -> dict:
+        caller_freq: Optional[dict[str, int]] = None,
+        doc_mentions: Optional[dict[str, str]] = None) -> dict:
     """Async version: summarize a single code chunk."""
     # Build usage hints for frequently-called functions in this chunk
     usage_hints: Optional[list[str]] = None
@@ -2960,13 +3021,22 @@ async def _async_summarize_one_chunk(
         hints = []
         for fn in func_names:
             count = caller_freq.get(fn)
+            matched_sym = fn
             if not count:
                 # Try bare name (without class qualifier)
                 bare = fn.split("::")[-1] if "::" in fn else None
                 if bare:
                     count = caller_freq.get(bare)
+                    if count:
+                        matched_sym = bare
             if count:
-                hints.append(f"{fn} is called from {count} different files")
+                hint = f"{fn} is called from {count} different files"
+                # Append doc mention if available
+                doc_snip = (doc_mentions or {}).get(matched_sym) or \
+                           (doc_mentions or {}).get(fn)
+                if doc_snip:
+                    hint += f". Documentation says: {doc_snip}"
+                hints.append(hint)
         if hints:
             usage_hints = hints
 
@@ -3115,6 +3185,8 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     caller_freq = build_caller_frequency_map(
         all_files_for_freq, codebases=all_codebases, codebase=codebase)
     elapsed = _time_freq.monotonic() - t0
+    # Look up doc mentions for frequently-called functions
+    doc_mentions: dict[str, str] = {}
     if caller_freq:
         print(f"\n[Caller frequency] {len(caller_freq)} frequently-called functions "
               f"detected ({elapsed:.1f}s)")
@@ -3122,6 +3194,13 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         top5 = sorted(caller_freq.items(), key=lambda x: -x[1])[:5]
         for sym, count in top5:
             print(f"  {sym}: called from {count} files")
+
+        # Query R2R for doc mentions (only if RAG is available)
+        if rag:
+            doc_mentions = _lookup_doc_mentions(list(caller_freq.keys()))
+            if doc_mentions:
+                print(f"[Caller frequency] Found doc mentions for "
+                      f"{len(doc_mentions)} functions")
     else:
         print(f"\n[Caller frequency] No frequently-called functions detected ({elapsed:.1f}s)")
 
@@ -3416,6 +3495,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             rag=rag, file_summary=it.get("file_summary", ""),
             tracker=tracker,
             caller_freq=caller_freq,
+            doc_mentions=doc_mentions,
         ))
         for item in work_items
     ]
