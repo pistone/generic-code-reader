@@ -215,6 +215,39 @@ def _find_file(codebase: Path, filename: str) -> Optional[Path]:
     matches = _file_index_cache.get(codebase, {}).get(filename, [])
     return matches[0] if matches else None
 
+
+def _resolve_file(fname: str, codebase: Path,
+                  codebases: Optional[list[Path]] = None) -> Optional[Path]:
+    """Resolve a relative filename across one or more codebase roots.
+
+    Tries direct join with each codebase, then falls back to _find_file.
+    Returns the absolute path or None.
+    """
+    roots = codebases if codebases else [codebase]
+    # Direct path match
+    for cb in roots:
+        candidate = cb / fname
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    # Filename-only fallback via cached index
+    basename = Path(fname).name
+    for cb in roots:
+        match = _find_file(cb, basename)
+        if match:
+            return match
+    return None
+
+
+def _relative_to_any(f: Path, codebases: list[Path]) -> str:
+    """Compute relative path from whichever codebase contains this file."""
+    for cb in codebases:
+        try:
+            return str(f.relative_to(cb))
+        except ValueError:
+            continue
+    return f.name
+
+
 # TokenTracker and llm_call imported from codebase_shared.utils
 
 # ── Pydantic models (used to validate Pass 1 JSON output) ─────────────────────
@@ -259,11 +292,12 @@ _INDEXABLE_SUFFIXES.update({".h", ".hpp", ".hxx", ".hh", ".inl",
                             ".md", ".rst", ".txt"})
 
 
-def detect_language(codebase: Path) -> Optional[str]:
+def detect_language(codebase: Path,
+                    codebases: Optional[list[Path]] = None) -> Optional[str]:
     """Auto-detect the dominant language by counting file extensions.
 
-    Scans the top 3 directory levels (fast) and returns the language
-    with the most files, or None if no known language found.
+    Scans the top 3 directory levels of each codebase (fast) and returns
+    the language with the most files, or None if no known language found.
     """
     counts: dict[str, int] = {}
     max_depth = 3
@@ -283,7 +317,9 @@ def detect_language(codebase: Path) -> Optional[str]:
             elif p.is_dir() and p.name not in SKIP_DIRS:
                 _walk(p, depth + 1)
 
-    _walk(codebase, 0)
+    roots = codebases if codebases else [codebase]
+    for root in roots:
+        _walk(root, 0)
     if not counts:
         return None
     winner = max(counts, key=counts.get)  # type: ignore[arg-type]
@@ -363,18 +399,21 @@ def save_hash_manifest(path: Path, manifest: dict[str, str]) -> None:
 
 
 def filter_changed_files(codebase: Path, files: list[Path],
-                         manifest_path: Path) -> tuple[list[Path], dict[str, str]]:
+                         manifest_path: Path,
+                         codebases: Optional[list[Path]] = None,
+                         ) -> tuple[list[Path], dict[str, str]]:
     """
     Compare current file hashes against a saved manifest.
     Returns (changed_files, new_manifest).
     Only returns files whose content has changed since the last run.
     """
+    all_cb = codebases if codebases else [codebase]
     old_manifest = load_hash_manifest(manifest_path)
     new_manifest: dict[str, str] = {}
     changed: list[Path] = []
 
     for f in files:
-        rel = str(f.relative_to(codebase))
+        rel = _relative_to_any(f, all_cb)
         h = file_hash(f)
         new_manifest[rel] = h
         if h != old_manifest.get(rel, ""):
@@ -411,8 +450,13 @@ def build_directory_tree(codebase: Path, files: list[Path],
         # Fallback: use filename only
         return Path(f.name)
 
+    if len(all_codebases) > 1:
+        root_label = " + ".join(cb.name for cb in all_codebases)
+    else:
+        root_label = codebase.name
+
     if len(files) <= 200:
-        lines = [str(codebase.name) + "/"]
+        lines = [f"{root_label}/"]
         for rp in sorted(_relative_to_any(f) for f in files):
             indent = "  " * (len(rp.parts) - 1)
             lines.append(f"{indent}  {rp.name}")
@@ -501,7 +545,7 @@ def build_directory_tree(codebase: Path, files: list[Path],
         return lines
 
     # Build from top-level directories
-    result = [f"{codebase.name}/  ({len(files)} files total)"]
+    result = [f"{root_label}/  ({len(files)} files total)"]
 
     # Root files
     root_files = dir_files.get(".", 0)
@@ -2077,7 +2121,8 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
 
     if terminal_args is None:
         print("  [ERROR] Agent failed to define modules — falling back to directory-based")
-        terminal_args = _fallback_module_map(codebase, files, language)
+        terminal_args = _fallback_module_map(codebase, files, language,
+                                                codebases=all_codebases)
 
     # ── Resolve dir_paths → actual file lists ─────────────────────────────
     project_desc = terminal_args.get("description", "")
@@ -2156,13 +2201,16 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
 
 
 def _fallback_module_map(codebase: Path, files: list[Path],
-                          language: str) -> dict:
+                          language: str,
+                          codebases: Optional[list[Path]] = None) -> dict:
     """Emergency fallback: one module per top-level directory."""
+    all_cb = codebases if codebases else [codebase]
     groups: dict[str, list[str]] = {}
     for f in files:
-        rel = f.relative_to(codebase)
+        rel_str = _relative_to_any(f, all_cb)
+        rel = Path(rel_str)
         bucket = rel.parts[0] if len(rel.parts) > 1 else "."
-        groups.setdefault(bucket, []).append(str(rel))
+        groups.setdefault(bucket, []).append(rel_str)
 
     modules = []
     for dir_name, dir_files in sorted(groups.items()):
@@ -2328,24 +2376,23 @@ async def _generate_file_summaries(
     max_concurrent: int = 50, rpm: int = 60,
     tracker: Optional[TokenTracker] = None,
     quiet: bool = False,
+    codebases: Optional[list[Path]] = None,
 ) -> dict[str, str]:
     """Generate 1-sentence summaries for each file before chunk-level Pass 2.
 
     Uses async concurrency for high throughput.
     Returns a dict mapping rel_path → file summary.
     """
+    all_codebases = codebases if codebases else [codebase]
+
     # Collect unique files with their module context
     file_info: dict[str, tuple[str, str, str]] = {}  # rel_path → (fpath, mod_name, mod_desc)
     for mod in module_map.modules:
         for fname in mod.files:
-            fpath = codebase / fname
-            if not fpath.exists():
-                match = _find_file(codebase, Path(fname).name)
-                if match:
-                    fpath = match
-                else:
-                    continue
-            rel = str(fpath.relative_to(codebase))
+            fpath = _resolve_file(fname, codebase, all_codebases)
+            if not fpath:
+                continue
+            rel = _relative_to_any(fpath, all_codebases)
             if rel not in file_info:
                 file_info[rel] = (str(fpath), mod.name, mod.description)
 
@@ -2706,7 +2753,11 @@ def _collect_ref_context(raw_code: str, codebase: Path,
         if ref_path and ref_path.is_file():
             content = read_file_sample(ref_path, max_lines=40)
             if len(content.strip()) > 20:
-                parts.append(f"[{ref_path.relative_to(codebase)}]\n{content}")
+                try:
+                    ref_rel = ref_path.relative_to(codebase)
+                except ValueError:
+                    ref_rel = ref_path.name
+                parts.append(f"[{ref_rel}]\n{content}")
                 if len(parts) >= max_refs:
                     break
     return "\n\n".join(parts)
@@ -2830,7 +2881,8 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     tracker: Optional[TokenTracker] = None,
                     workers: int = 4, rpm: int = 60,
                     max_concurrent: int = 50,
-                    quiet: bool = False, verbose: bool = False) -> list[dict]:
+                    quiet: bool = False, verbose: bool = False,
+                    codebases: Optional[list[Path]] = None) -> list[dict]:
     """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
 
     Uses async concurrency with rate limiting for high throughput.
@@ -2884,6 +2936,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         file_summaries = await _generate_file_summaries(
             model, codebase, module_map,
             max_concurrent=max_concurrent, rpm=rpm, tracker=tracker, quiet=quiet,
+            codebases=all_codebases,
         )
 
     # ── Collect chunks and detect multi-chunk functions ──────────────────
@@ -2895,23 +2948,21 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     rag_label = " (RAG-augmented)" if rag else ""
     print(f"\n[Pass 2] Collecting chunks from {len(module_map.modules)} modules{rag_label}...")
 
+    all_codebases = codebases if codebases else [codebase]
+
     for mod in module_map.modules:
         for fname in mod.files:
-            fpath = codebase / fname
-            if not fpath.exists():
-                match = _find_file(codebase, Path(fname).name)
-                candidates = [match] if match else []
-                if not candidates:
-                    skipped += 1
-                    continue
-                fpath = candidates[0]
+            fpath = _resolve_file(fname, codebase, all_codebases)
+            if not fpath:
+                skipped += 1
+                continue
 
             chunks = chunk_file(fpath, language=language)
             if not chunks:
                 skipped += 1
                 continue
 
-            rel_path = str(fpath.relative_to(codebase))
+            rel_path = _relative_to_any(fpath, all_codebases)
             per_file_chunks.append((rel_path, chunks, mod))
 
     # ── Generate or load function summaries for multi-chunk functions ───
@@ -3408,7 +3459,7 @@ def main():
 
     # ── Auto-detect language if not specified ────────────────────────────────
     if args.language is None:
-        detected = detect_language(codebase)
+        detected = detect_language(codebase, codebases=codebases)
         if detected:
             args.language = detected
         else:
@@ -3538,7 +3589,8 @@ def main():
     hash_manifest_path = output_dir / "file_hashes.json"
     new_manifest: Optional[dict] = None
     if args.incremental:
-        changed_files, new_manifest = filter_changed_files(codebase, files, hash_manifest_path)
+        changed_files, new_manifest = filter_changed_files(
+            codebase, files, hash_manifest_path, codebases=codebases)
         if not changed_files:
             print("[Incremental] No files changed since last run. Nothing to do.")
             return
@@ -3548,7 +3600,8 @@ def main():
         if summaries_path.exists():
             try:
                 existing = json.loads(summaries_path.read_text())
-                changed_rels = {str(f.relative_to(codebase)) for f in changed_files}
+                changed_rels = {_relative_to_any(f, codebases or [codebase])
+                                for f in changed_files}
                 kept = [e for e in existing if e.get("source_file") not in changed_rels]
                 summaries_path.write_text(json.dumps(kept, indent=2))
                 print(f"[Incremental] Purged {len(existing) - len(kept)} stale summaries, "
@@ -3676,6 +3729,7 @@ def main():
                 max_concurrent=args.max_concurrent,
                 quiet=args.quiet,
                 verbose=args.verbose,
+                codebases=codebases,
             ))
 
         if args.passes > 1:
