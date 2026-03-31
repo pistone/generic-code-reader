@@ -177,17 +177,11 @@ def search_codebase(query: str, module: str = "",
     knowledge for the given query. Use this before reading files directly
     — it may already contain the answer with much less token cost.
 
-    MULTI-HOP SEARCH: Results often contain indirect references —
-    registration IDs, string keys, config names, or interface names that
-    map to a different class/file. When you see an unresolved name or ID
-    in the results (e.g. "depends on 'xxxx'" but xxxx isn't a class name
-    you recognize), do a FOLLOW-UP search for that name to resolve it.
-    Typical patterns that need follow-up:
-    - Dependency IDs: "depends on 'nullDeref'" → search "nullDeref register"
-    - Interface → implementation: "uses IFooAnalysis" → search "IFooAnalysis implementation"
-    - Config keys: "enabled by 'feature.xxx'" → search "feature.xxx"
-    - Factory IDs: "creates checker via 'abc'" → search "abc checker factory"
-    Two searches are almost always enough. Combine the results in your answer.
+    MULTI-HOP SEARCH: A single search may return results that reference
+    names, IDs, or identifiers you don't yet understand. When this
+    happens, do a FOLLOW-UP search for that unresolved name to find what
+    it maps to. Two searches are almost always enough to resolve indirect
+    references. Combine the results in your final answer.
 
     Args:
         query:  Natural language description of what you're looking for.
