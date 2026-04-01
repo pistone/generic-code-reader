@@ -357,6 +357,12 @@ def main():
     parser.add_argument("--no-summarize", action="store_true",
                         help="Index raw text without LLM summarization "
                              "(faster, cheaper, but lower search quality)")
+    parser.add_argument("--no-index", action="store_true",
+                        help="Parse and summarize only — write doc_summaries.json "
+                             "but do NOT index into R2R. Use the indexer separately.")
+    parser.add_argument("--index-only", action="store_true",
+                        help="Skip parsing/summarizing — read doc_summaries.json "
+                             "and index into R2R.")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process docs changed since last run")
     parser.add_argument("--verbose", action="store_true",
@@ -372,8 +378,33 @@ def main():
     output_dir = Path(__file__).resolve().parent
     manifest_path = output_dir / "doc_hashes.json"
     cost_log_path = output_dir / "cost_log.jsonl"
+    summaries_path = output_dir / "doc_summaries.json"
     manifest = load_manifest(manifest_path)
     tracker = TokenTracker()
+
+    # ── Index-only mode: read doc_summaries.json and push to R2R ────────
+    if args.index_only:
+        if not summaries_path.exists():
+            print(f"Error: {summaries_path} not found. Run without --index-only first.")
+            sys.exit(1)
+        all_chunks = json.loads(summaries_path.read_text())
+        print(f"[Index-only] Indexing {len(all_chunks)} doc chunks from {summaries_path}")
+        # Group by source_file for purge + manifest update
+        by_file: dict[str, list[dict]] = {}
+        for chunk in all_chunks:
+            by_file.setdefault(chunk["source_file"], []).append(chunk)
+        for source_file, chunks in by_file.items():
+            purge_old_docs(source_file, manifest)
+            last_mod = chunks[0].get("last_modified", "")
+            doc_ids = index_chunks(chunks, last_mod)
+            print(f"  {source_file}: {len(chunks)} chunk(s) indexed")
+            manifest[source_file] = {
+                "hash": manifest.get(source_file, {}).get("hash", ""),
+                "doc_ids": doc_ids,
+            }
+            save_manifest(manifest_path, manifest)
+        print(f"[Index-only] Done — {len(all_chunks)} chunks indexed into R2R")
+        return
 
     # 1. Collect raw documents from all doc paths
     raw_docs = []
@@ -466,35 +497,55 @@ def main():
                 )
             )
 
-        # 5. Index all files — fill in missing summaries with raw text
+        # 5. Fill in missing summaries with raw text fallback
         for raw, current_hash, chunks, last_mod in file_work:
             missing = sum(1 for c in chunks if not c.get("summary"))
             if missing:
                 if quota_hit:
-                    # Quota exhausted: don't index partial work, leave for next run
                     print(f"  [skip] {raw.path}: {missing}/{len(chunks)} chunks "
                           f"unsummarized (quota), will retry next run")
                     continue
-                # Transient failures: fill in raw text so the file still gets indexed
                 for c in chunks:
                     if not c.get("summary"):
                         c["summary"] = c["text"][:300].strip()
                         c["source_kind"] = c.get("source_kind", "overview")
                 print(f"  [warn] {raw.path}: {missing}/{len(chunks)} chunks "
                       f"used raw text fallback")
+            # Stamp last_modified into each chunk for later indexing
+            for c in chunks:
+                c["last_modified"] = last_mod
 
-            purge_old_docs(raw.path, manifest)
-            doc_ids = index_chunks(chunks, last_mod)
-            total_chunks += len(chunks)
-            print(f"  {raw.path}: {len(chunks)} chunk(s) indexed")
+        # 5b. Save doc_summaries.json (always — this is the intermediate artifact)
+        all_output_chunks = []
+        for raw, current_hash, chunks, last_mod in file_work:
+            for c in chunks:
+                if c.get("summary"):
+                    all_output_chunks.append(c)
+        if all_output_chunks:
+            summaries_path.write_text(json.dumps(all_output_chunks, indent=2))
+            print(f"\n  Wrote {len(all_output_chunks)} chunks to {summaries_path}")
 
-            manifest[raw.path] = {
-                "hash": current_hash,
-                "doc_ids": doc_ids,
-            }
-            save_manifest(manifest_path, manifest)
+        # 6. Index into R2R (unless --no-index)
+        if args.no_index:
+            print(f"\n[No-index] Skipping R2R indexing. "
+                  f"Run with --index-only to index later.")
+        else:
+            for raw, current_hash, chunks, last_mod in file_work:
+                if not any(c.get("summary") for c in chunks):
+                    continue  # skip files with no summaries (quota hit)
 
-    # Final manifest save (redundant but explicit)
+                purge_old_docs(raw.path, manifest)
+                doc_ids = index_chunks(chunks, last_mod)
+                total_chunks += len(chunks)
+                print(f"  {raw.path}: {len(chunks)} chunk(s) indexed")
+
+                manifest[raw.path] = {
+                    "hash": current_hash,
+                    "doc_ids": doc_ids,
+                }
+                save_manifest(manifest_path, manifest)
+
+    # Final manifest save
     save_manifest(manifest_path, manifest)
 
     # Token tracking
@@ -504,7 +555,10 @@ def main():
         with cost_log_path.open("a") as f:
             f.write(json.dumps(entry) + "\n")
 
-    if file_work and quota_hit:
+    if args.no_index:
+        print(f"\n[Done] {len(all_output_chunks) if file_work else 0} chunks "
+              f"from {len(raw_docs)} doc(s) written to {summaries_path}")
+    elif file_work and quota_hit:
         indexed = sum(1 for r, h, c, l in file_work
                       if manifest.get(r.path, {}).get("doc_ids"))
         print(f"\n[Paused] {total_chunks} chunks from {indexed} doc(s) "
