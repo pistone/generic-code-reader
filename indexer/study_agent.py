@@ -3160,6 +3160,8 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         except Exception:
             cached_context = {}
 
+    all_codebases = codebases if codebases else [codebase]
+
     project_desc = f"{module_map.project}: {module_map.description}"
 
     if cached_context.get("file_summaries"):
@@ -3212,8 +3214,6 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
 
     rag_label = " (RAG-augmented)" if rag else ""
     print(f"\n[Pass 2] Collecting chunks from {len(module_map.modules)} modules{rag_label}...")
-
-    all_codebases = codebases if codebases else [codebase]
 
     for mod in module_map.modules:
         for fname in mod.files:
