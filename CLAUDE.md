@@ -136,7 +136,9 @@ generic-code-reader/
 ├── auditor/
 │   └── auditor.py         ← doc↔code conflict detection
 ├── ticket_agent/
-│   ├── ticket_agent.py    ← Jira/PR knowledge extraction + MR diff fetching
+│   ├── fetch_tickets.py   ← fetch from Jira API → tickets/*.json
+│   ├── ticket_agent.py    ← knowledge extraction + MR diff fetching
+│   ├── tickets/           ← persistent ticket store (gitignored, one file per ticket)
 │   └── lessons/           ← generated lesson .md files (committed, indexable by doc_agent)
 ├── eval/
 │   └── eval_kb.py         ← KB effectiveness evaluation

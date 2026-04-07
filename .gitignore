@@ -37,6 +37,8 @@ auditor/cost_log.jsonl
 ticket_agent/ticket_hashes.json
 ticket_agent/ticket_summaries.json
 ticket_agent/cost_log.jsonl
+ticket_agent/last_fetch.json
+ticket_agent/tickets/          # raw Jira exports — can be large; opt-in to commit
 # lessons/ is intentionally NOT gitignored — commit them so the team benefits
 
 # Proposal / internal docs
