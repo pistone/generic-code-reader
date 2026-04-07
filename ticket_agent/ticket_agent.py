@@ -51,7 +51,7 @@ DEDUP_THRESHOLD   = 0.85
 MAX_DIFF_CHARS    = 4000   # cap on diff text fed to LLM
 MAX_LESSON_CHARS  = 1200   # cap on generated lesson text
 
-RESOLVED_STATUSES  = {"done", "closed", "resolved", "fixed", "complete"}
+RESOLVED_STATUSES  = {"done", "closed", "resolved", "fixed", "complete", "verified"}
 REJECT_RESOLUTIONS = {"won't fix", "wontfix", "duplicate", "cannot reproduce",
                       "incomplete", "not a bug"}
 

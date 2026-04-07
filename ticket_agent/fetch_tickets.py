@@ -308,7 +308,7 @@ def fetch_tickets(client: JiraClient, jql: str,
 # ---------------------------------------------------------------------------
 
 DEFAULT_SINCE = "-365d"   # fetch tickets updated within the past year by default
-DEFAULT_STATUS_FILTER = 'status in (Done, Closed, Resolved, Fixed)'
+DEFAULT_STATUS_FILTER = 'status in (Done, Closed, Resolved, Fixed, Verified)'
 
 
 def _build_default_jql(projects: list[str], since: str) -> str:
