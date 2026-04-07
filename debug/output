@@ -1,9 +1,37 @@
-[Default JQL] project = SAT AND status in (Done, Closed, Resolved, Fixed, Verified) AND updated >= "-365d"
+(.venv) songtao@d-ubuntu-43:generic-code-reader$ python -m ticket_agent.fetch_tickets --project SAT --debug
+[DEBUG] Probe A — search/jql, bare JQL: 'project = SAT'
+[DEBUG] GET https://blackduck.atlassian.net/rest/api/3/search/jql?jql=project+%3D+SAT&maxResults=100&fields=summary%2Cdescription%2Cstatus%2Cresolution%2Cassignee%2Creporter%2Clabels%2Cpriority%2Ccreated%2Cupdated%2Cresolutiondate%2Ccomment%2Cissuelinks%2CfixVersions%2Ccomponents%2Cissuetype%2Cparent
+[DEBUG] response keys: ['issues', 'isLast']
+[DEBUG] total=<absent>  issues=0  nextPageToken='<absent>'
+[DEBUG] full response (no issues):
+{
+  "issues": [],
+  "isLast": true
+}
+[DEBUG] Probe A result: 0 issue(s), total=<absent>
+
+[DEBUG] Probe B — classic /search endpoint, bare JQL: 'project = SAT'
+[DEBUG] GET https://blackduck.atlassian.net/rest/api/3/search?jql=project+%3D+SAT&maxResults=5
+[DEBUG] Probe B error: Jira API 410 for https://blackduck.atlassian.net/rest/api/3/search?jql=project+%3D+SAT&maxResults=5: {"errorMessages":["The requested API has been removed. Please migrate to the /rest/api/3/search/jql API. A full migration guideline is available at https://developer.atlassian.com/changelog/#CHANGE-2046"],"errors":{}}
+
+[DEBUG] Probe C — search/jql, no status/date filter, no fields param
+[DEBUG] GET https://blackduck.atlassian.net/rest/api/3/search/jql?jql=project+%3D+SAT&maxResults=5
+[DEBUG] response keys: ['issues', 'isLast']
+[DEBUG] total=<absent>  issues=0  nextPageToken='<absent>'
+[DEBUG] full response (no issues):
+{
+  "issues": [],
+  "isLast": true
+}
+[DEBUG] Probe C result: 0 issue(s), total=<absent>
+
+[Default JQL] project = SAT AND status in (Done, Closed, Resolved, Fixed, Verified) AND updated >= -365d
 Fetching from https://blackduck.atlassian.net
-JQL: project = SAT AND status in (Done, Closed, Resolved, Fixed, Verified) AND updated >= "-365d"
+JQL: project = SAT AND status in (Done, Closed, Resolved, Fixed, Verified) AND updated >= -365d
+[DEBUG] JQL repr (shows exact quoting): 'project = SAT AND status in (Done, Closed, Resolved, Fixed, Verified) AND updated >= -365d'
 Output: /data00/songtao/prevent/generic-code-reader/ticket_agent/tickets
 
-[DEBUG] GET https://blackduck.atlassian.net/rest/api/3/search/jql?jql=project+%3D+SAT+AND+status+in+%28Done%2C+Closed%2C+Resolved%2C+Fixed%2C+Verified%29+AND+updated+%3E%3D+%22-365d%22&maxResults=100&fields=summary%2Cdescription%2Cstatus%2Cresolution%2Cassignee%2Creporter%2Clabels%2Cpriority%2Ccreated%2Cupdated%2Cresolutiondate%2Ccomment%2Cissuelinks%2CfixVersions%2Ccomponents%2Cissuetype%2Cparent
+[DEBUG] GET https://blackduck.atlassian.net/rest/api/3/search/jql?jql=project+%3D+SAT+AND+status+in+%28Done%2C+Closed%2C+Resolved%2C+Fixed%2C+Verified%29+AND+updated+%3E%3D+-365d&maxResults=100&fields=summary%2Cdescription%2Cstatus%2Cresolution%2Cassignee%2Creporter%2Clabels%2Cpriority%2Ccreated%2Cupdated%2Cresolutiondate%2Ccomment%2Cissuelinks%2CfixVersions%2Ccomponents%2Cissuetype%2Cparent
 [DEBUG] response keys: ['issues', 'isLast']
 [DEBUG] total=<absent>  issues=0  nextPageToken='<absent>'
 [DEBUG] full response (no issues):
@@ -12,3 +40,7 @@ Output: /data00/songtao/prevent/generic-code-reader/ticket_agent/tickets
   "isLast": true
 }
   Fetching tickets (total unknown until last page)...
+
+[Done] 0 ticket(s) fetched, 0 written/updated
+  Tickets saved to: /data00/songtao/prevent/generic-code-reader/ticket_agent/tickets/
+  Next step: python -m ticket_agent.ticket_agent --tickets /data00/songtao/prevent/generic-code-reader/ticket_agent/tickets
