@@ -101,22 +101,6 @@ class JiraClient:
             params["nextPageToken"] = next_page_token
         return self._get("search/jql", params, debug=debug)
 
-    def search(self, jql: str, next_page_token: Optional[str] = None,
-               max_results: int = PAGE_SIZE) -> dict:
-        params: dict = {
-            "jql":        jql,
-            "maxResults": max_results,
-            "fields":     ",".join([
-                "summary", "description", "status", "resolution",
-                "assignee", "reporter", "labels", "priority",
-                "created", "updated", "resolutiondate",
-                "comment", "issuelinks", "fixVersions",
-                "components", "issuetype", "parent",
-            ]),
-        }
-        if next_page_token:
-            params["nextPageToken"] = next_page_token
-        return self._get("search/jql", params)
 
     def get_issue(self, key: str) -> dict:
         return self._get(f"issue/{key}")
