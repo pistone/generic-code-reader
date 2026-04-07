@@ -71,7 +71,7 @@ class JiraClient:
 
     def search(self, jql: str, start_at: int = 0,
                max_results: int = PAGE_SIZE) -> dict:
-        return self._get("search", {
+        return self._get("search/jql", {
             "jql":        jql,
             "startAt":    start_at,
             "maxResults": max_results,
