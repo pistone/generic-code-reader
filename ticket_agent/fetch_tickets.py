@@ -57,17 +57,49 @@ class JiraClient:
             "Content-Type":  "application/json",
         }
 
-    def _get(self, path: str, params: Optional[dict] = None) -> dict:
+    def _get(self, path: str, params: Optional[dict] = None,
+             debug: bool = False) -> dict:
         url = f"{self.base_url}/rest/api/3/{path}"
         if params:
             url += "?" + urllib.parse.urlencode(params)
+        if debug:
+            print(f"[DEBUG] GET {url}")
         req = urllib.request.Request(url, headers=self.headers)
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
-                return json.loads(resp.read().decode())
+                data = json.loads(resp.read().decode())
+                if debug:
+                    keys = list(data.keys()) if isinstance(data, dict) else type(data).__name__
+                    total = data.get("total", "<absent>") if isinstance(data, dict) else "n/a"
+                    issues = len(data.get("issues", [])) if isinstance(data, dict) else "n/a"
+                    next_tok = repr(data.get("nextPageToken", "<absent>")) if isinstance(data, dict) else "n/a"
+                    print(f"[DEBUG] response keys: {keys}")
+                    print(f"[DEBUG] total={total}  issues={issues}  nextPageToken={next_tok}")
+                    if isinstance(data, dict) and not data.get("issues"):
+                        # Print first 800 chars of raw response to catch unexpected shapes
+                        raw = json.dumps(data, indent=2)
+                        print(f"[DEBUG] full response (no issues):\n{raw[:800]}")
+                return data
         except urllib.error.HTTPError as e:
             body = e.read().decode(errors="replace")[:500]
             raise RuntimeError(f"Jira API {e.code} for {url}: {body}") from e
+
+    def search(self, jql: str, next_page_token: Optional[str] = None,
+               max_results: int = PAGE_SIZE, debug: bool = False) -> dict:
+        params: dict = {
+            "jql":        jql,
+            "maxResults": max_results,
+            "fields":     ",".join([
+                "summary", "description", "status", "resolution",
+                "assignee", "reporter", "labels", "priority",
+                "created", "updated", "resolutiondate",
+                "comment", "issuelinks", "fixVersions",
+                "components", "issuetype", "parent",
+            ]),
+        }
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
+        return self._get("search/jql", params, debug=debug)
 
     def search(self, jql: str, next_page_token: Optional[str] = None,
                max_results: int = PAGE_SIZE) -> dict:
@@ -222,7 +254,8 @@ def save_watermark(timestamp: str) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch_tickets(client: JiraClient, jql: str,
-                  quiet: bool = False) -> tuple[int, int, Optional[str]]:
+                  quiet: bool = False,
+                  debug: bool = False) -> tuple[int, int, Optional[str]]:
     """Fetch all tickets matching jql, write each to TICKETS_DIR/<KEY>.json.
 
     Uses the search/jql cursor-based pagination API (nextPageToken).
@@ -239,7 +272,7 @@ def fetch_tickets(client: JiraClient, jql: str,
 
     while True:
         try:
-            page = client.search(jql, next_page_token=next_page_token)
+            page = client.search(jql, next_page_token=next_page_token, debug=debug)
         except RuntimeError as e:
             print(f"  [error] {e}")
             break
@@ -350,6 +383,8 @@ def main():
                              "(appends 'AND updated >= <watermark>' to JQL)")
     parser.add_argument("--quiet", action="store_true",
                         help="Only print the summary, not per-ticket status")
+    parser.add_argument("--debug", action="store_true",
+                        help="Print raw API response structure to diagnose empty results")
     args = parser.parse_args()
 
     # Validate env vars
@@ -394,7 +429,8 @@ def main():
     print(f"JQL: {jql}")
     print(f"Output: {TICKETS_DIR}\n")
 
-    fetched, updated, newest_updated = fetch_tickets(client, jql, quiet=args.quiet)
+    fetched, updated, newest_updated = fetch_tickets(client, jql, quiet=args.quiet,
+                                                     debug=args.debug)
 
     print(f"\n[Done] {fetched} ticket(s) fetched, {updated} written/updated")
     print(f"  Tickets saved to: {TICKETS_DIR}/")
