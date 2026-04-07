@@ -11,7 +11,7 @@ new entries — a reviewer agent verifies and promotes them automatically.
 The system is generic: given any codebase and optional design docs, it
 produces a knowledge base tailored to that domain's vocabulary.
 
-**See also**: `DEPLOY.md` for setup/operations, `INTERNALS.md` for
+**See also**: `README.md` for setup/operations, `INTERNALS.md` for
 implementation details.
 
 ---
@@ -42,7 +42,7 @@ implementation details.
 │  RUNTIME (always on, per developer machine)             │
 │                                                         │
 │  MCP Server (FastMCP)                                   │
-│    search_codebase(query, module, source_type, scope)   │
+│    search_codebase(query)                               │
 │    suggest_index_item(topic, summary, ...)              │
 │    kb_status() / list_modules()                         │
 │                                                         │
@@ -87,9 +87,9 @@ rationale, tutorial, operational, reference, overview.
 ### 4. MCP server
 
 Two main tools + two introspection tools:
-- `search_codebase(query, module, source_type, scope)` — hybrid search
-  with scope-based prioritization (implementation/rationale/howto/
-  troubleshooting/architecture)
+- `search_codebase(query)` — hybrid semantic search across all sources
+  (code, docs, tickets). Cross-source linking hints when related
+  knowledge exists in other source types.
 - `suggest_index_item(...)` — queues new entries for reviewer
 - `kb_status()` — R2R health + KB statistics
 - `list_modules()` — indexed module names and descriptions
@@ -114,7 +114,7 @@ token savings from KB vs raw file reads.
 ```
 generic-code-reader/
 ├── CLAUDE.md              ← this file (architecture)
-├── DEPLOY.md              ← setup, operations, troubleshooting
+├── README.md              ← setup, operations, troubleshooting
 ├── INTERNALS.md           ← implementation details
 ├── run.py                 ← one-command orchestrator
 ├── status.py              ← KB health dashboard
@@ -122,8 +122,7 @@ generic-code-reader/
 ├── preflight.py           ← prerequisite checker
 ├── .mcp.json              ← MCP server registration
 ├── indexer/
-│   ├── study_agent.py     ← multi-pass codebase analysis
-│   └── indexer.py         ← feeds summaries to R2R
+│   └── study_agent.py     ← multi-pass codebase analysis
 ├── doc_agent/
 │   ├── doc_agent.py       ← document ingestion pipeline
 │   ├── sources.py         ← pluggable source adapters
@@ -137,11 +136,13 @@ generic-code-reader/
 ├── auditor/
 │   └── auditor.py         ← doc↔code conflict detection
 ├── ticket_agent/
-│   └── ticket_agent.py    ← Jira/PR knowledge extraction
+│   ├── ticket_agent.py    ← Jira/PR knowledge extraction + MR diff fetching
+│   └── lessons/           ← generated lesson .md files (committed, indexable by doc_agent)
 ├── eval/
 │   └── eval_kb.py         ← KB effectiveness evaluation
 ├── codebase_shared/
 │   ├── utils.py           ← shared LLM calls, rate limiter, token tracker
+│   ├── r2r_indexer.py     ← standalone concurrent R2R indexer
 │   └── colors.py          ← terminal color helpers
 └── r2r/
     ├── r2r.toml           ← R2R config (embedding, FTS)
@@ -156,6 +157,8 @@ Runtime artifacts (gitignored):
 - `indexer/file_hashes.json` — incremental change manifest
 - `*/cost_log.jsonl` — token usage logs
 - `mcp_server/query_log.jsonl` — search query + answer log
+- `ticket_agent/ticket_hashes.json` — incremental manifest
+- `ticket_agent/ticket_summaries.json` — saved extraction results
 
 ---
 

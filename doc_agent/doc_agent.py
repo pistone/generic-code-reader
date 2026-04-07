@@ -22,8 +22,6 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from r2r import R2RClient
-
 from doc_agent.parsers import ParsedDocument, get_parser
 from doc_agent.sources import LocalFileSource, RawDocument
 
@@ -34,7 +32,6 @@ from codebase_shared.utils import (  # noqa: E402
     _is_quota_error, AsyncRateLimiter,
 )
 
-R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
 MAX_SECTION_CHARS = 4000
 
@@ -131,64 +128,43 @@ async def _summarize_chunks_async(
     max_concurrent: int = 20,
     rpm: int = 500,
     quiet: bool = False,
-) -> tuple[list[tuple[str, str, list[dict]]], bool]:
+) -> bool:
     """Summarize all chunks across all files concurrently.
 
-    Args:
-        all_file_chunks: list of (source_path, content_hash, chunks) tuples
-        Returns: (completed file chunks, quota_hit flag)
+    Mutates each chunk dict in-place (adds 'summary' and 'source_kind').
+    Returns quota_hit flag.
     """
     limiter = AsyncRateLimiter(max_concurrent=max_concurrent,
                                calls_per_minute=rpm)
 
-    total_chunks = sum(len(fc[2]) for fc in all_file_chunks)
+    flat_chunks = [
+        chunk
+        for _, _, chunks in all_file_chunks
+        for chunk in chunks
+    ]
+    total_chunks = len(flat_chunks)
     done = 0
-
-    # Print every N chunks, scaling with total (at least every 5)
     print_interval = max(1, min(10, total_chunks // 10))
 
-    async def _do_one(chunk: dict) -> dict:
+    def on_result(idx, _result):
         nonlocal done
-        result = await _async_summarize_chunk(model, chunk, tracker=tracker)
         done += 1
         if not quiet and (done % print_interval == 0 or done == total_chunks):
             print(f"  [summarize] {done}/{total_chunks} chunks done")
-        return result
 
-    # Build tasks: (coroutine_factory, callback) pairs for run_many
-    tasks = []
-    chunk_to_file: dict[int, int] = {}  # chunk index → file index
-    flat_chunks = []
-    for file_idx, (path, chash, chunks) in enumerate(all_file_chunks):
-        for chunk in chunks:
-            chunk_idx = len(flat_chunks)
-            flat_chunks.append(chunk)
-            chunk_to_file[chunk_idx] = file_idx
-            tasks.append(chunk)
+    def on_error(idx, err):
+        print(f"  [warn] chunk {idx}: {err}")
 
-    # Use gather with rate limiting
-    async def _run_one(chunk: dict):
-        if limiter._halted:
-            return
-        try:
-            await limiter._wait_for_slot()
-            async with limiter._semaphore:
-                await _do_one(chunk)
-        except Exception as e:
-            err_str = str(e).lower()
-            if _is_quota_error(err_str):
-                limiter.halt("Quota exhausted")
-                limiter.quota_exhausted = True
-            else:
-                print(f"  [warn] LLM error: {e}")
-
-    await asyncio.gather(*[_run_one(c) for c in flat_chunks],
-                         return_exceptions=True)
+    factories = [
+        (lambda c=chunk: _async_summarize_chunk(model, c, tracker=tracker))
+        for chunk in flat_chunks
+    ]
+    await limiter.run_many(factories, on_result=on_result, on_error=on_error)
 
     if not quiet:
         print(f"  [summarize] {done}/{total_chunks} chunks done")
 
-    return all_file_chunks, limiter.quota_exhausted
+    return limiter.quota_exhausted
 
 
 # ---------------------------------------------------------------------------
@@ -270,61 +246,19 @@ def _split_by_paragraphs(text: str, max_chars: int) -> list[str]:
 # R2R indexing
 # ---------------------------------------------------------------------------
 
-def _index_one_chunk(client, chunk: dict, last_modified: str) -> Optional[str]:
-    """Index a single chunk into R2R. Returns doc_id or None."""
-    # If LLM summary available, index that; otherwise fall back to raw text
-    index_text = chunk.get("summary") or chunk["text"]
-    source_kind = chunk.get("source_kind", "")
-
-    resp = client.documents.create(
-        raw_text=index_text,
-        metadata={
-            "source_file":   chunk["source_file"],
-            "module":        "documentation",
-            "chunk_type":    "doc_summary",
-            "doc_title":     chunk["doc_title"],
-            "source_type":   "doc",
-            "source_kind":   source_kind,
-            "last_modified": last_modified,
-        },
-    )
-    return str(resp.results.document_id)
-
-
 def index_chunks(chunks: list[dict], last_modified: str,
                  index_workers: int = 8) -> list[str]:
-    """Index all chunks into R2R using parallel workers.  Returns list of document IDs."""
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    client = R2RClient(R2R_URL)
-    doc_ids: list[Optional[str]] = [None] * len(chunks)
-
-    with ThreadPoolExecutor(max_workers=index_workers) as pool:
-        future_to_idx = {
-            pool.submit(_index_one_chunk, client, chunk, last_modified): i
-            for i, chunk in enumerate(chunks)
-        }
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                doc_ids[idx] = future.result()
-            except Exception as e:
-                print(f"  [warn] chunk {idx}: index failed: {e}")
-
-    return [d for d in doc_ids if d is not None]
+    """Index doc chunks into R2R. Delegates to codebase_shared.r2r_indexer."""
+    from codebase_shared.r2r_indexer import index_doc_chunks
+    return index_doc_chunks(chunks, last_modified=last_modified,
+                            index_workers=index_workers)
 
 
 def purge_old_docs(source_file: str, manifest: dict) -> None:
     """Delete previously indexed docs for a source file."""
+    from codebase_shared.r2r_indexer import purge_docs
     old_ids = manifest.get(source_file, {}).get("doc_ids", [])
-    if not old_ids:
-        return
-    client = R2RClient(R2R_URL)
-    for doc_id in old_ids:
-        try:
-            client.documents.delete(doc_id)
-        except Exception:
-            pass
+    purge_docs(old_ids)
 
 
 # ---------------------------------------------------------------------------
@@ -365,14 +299,8 @@ def main():
                              "and index into R2R.")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process docs changed since last run")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print detailed progress (each chunk, LLM responses)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-chunk progress")
-    parser.add_argument("--max-concurrent", type=int, default=20,
-                        help="Max concurrent LLM calls (default: 20)")
-    parser.add_argument("--rpm", type=int, default=500,
-                        help="Rate limit: requests per minute (default: 500)")
     args = parser.parse_args()
 
     output_dir = Path(__file__).resolve().parent
@@ -446,6 +374,7 @@ def main():
     total_chunks = 0
     total_files = len(raw_docs)
     file_work: list[tuple[RawDocument, str, list[dict], str]] = []  # (raw, hash, chunks, last_mod)
+    manifest_skipped = 0
 
     for file_idx, raw in enumerate(raw_docs, 1):
         current_hash = file_hash(raw.content_bytes)
@@ -453,9 +382,7 @@ def main():
         if (existing.get("hash") == current_hash
                 and existing.get("doc_ids")
                 and not args.incremental):
-            if not args.quiet:
-                print(f"  [{file_idx}/{total_files}] {raw.path}: "
-                      f"already done, skipping")
+            manifest_skipped += 1
             continue
 
         suffix = Path(raw.path).suffix.lower()
@@ -472,9 +399,9 @@ def main():
                     if raw.last_modified else "")
         file_work.append((raw, current_hash, chunks, last_mod))
 
-    skipped = total_files - len(file_work)
-    if skipped > 0:
-        print(f"  ({skipped} file(s) already done, skipped)")
+    if manifest_skipped > 0:
+        print(f"  ({manifest_skipped}/{total_files} file(s) already indexed, skipped — "
+              f"delete {manifest_path.name} to force re-indexing)")
 
     quota_hit = False
     if not file_work:
@@ -491,8 +418,8 @@ def main():
                 _summarize_chunks_async(
                     args.model, all_file_chunks,
                     tracker=tracker,
-                    max_concurrent=args.max_concurrent,
-                    rpm=args.rpm,
+                    max_concurrent=20,
+                    rpm=500,
                     quiet=args.quiet,
                 )
             )
@@ -504,6 +431,10 @@ def main():
                 if quota_hit:
                     print(f"  [skip] {raw.path}: {missing}/{len(chunks)} chunks "
                           f"unsummarized (quota), will retry next run")
+                    # Don't index this file but still stamp last_modified so
+                    # --index-only can use it if the file is retried later
+                    for c in chunks:
+                        c["last_modified"] = last_mod
                     continue
                 for c in chunks:
                     if not c.get("summary"):

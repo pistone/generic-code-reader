@@ -39,7 +39,7 @@ The Quick Start block is good — 9 lines, copy-paste ready. But:
 
 - **F3: Docker startup takes time.** `docker compose up -d` returns immediately but R2R takes 15-30 seconds to be healthy. If the user runs `preflight.py` too fast, R2R check fails. No mention of this.
 
-- **F4: Step 6 in README says "Index summaries into R2R" manually for `--passes 1`.** This is a footgun — most users will run the default (1 pass) and forget this step, then wonder why Claude Code returns nothing.
+- **F4: ~~Step 6 in README says "Index summaries into R2R" manually for `--passes 1`.~~** Fixed — summaries are auto-indexed at the end of every run.
 
 ### Step 2: Configuration
 
@@ -49,7 +49,7 @@ The Quick Start block is good — 9 lines, copy-paste ready. But:
 
 ### Step 3: First Run (study_agent)
 
-- **F7: Too many flags.** The study_agent has 20 CLI flags. A first-time user has to decide: `--language`, `--passes`, `--rag`, `--rpm`, `--max-concurrent`, `--model`, `--model-fast`, `--workers`. Most of these should have smart defaults.
+- **F7: ~~Too many flags.~~** Reduced — removed `--passes`, `--workers`, `--max-chunks`, `--include-tests`, `--bootstrap-docs`. Language is auto-detected. A first-time user only needs `--codebase`.
 
 - **F8: `--language` is required knowledge.** If the user forgets it, it defaults to `python` and finds 0 files in a C++ codebase. The error is just "No source files found" with no hint about `--language`.
 
@@ -80,8 +80,7 @@ The Quick Start block is good — 9 lines, copy-paste ready. But:
 **S1: Auto-detect language from file extensions.**
 Scan the codebase for file types and pick the dominant one. Fall back to `--language` if ambiguous. Print "Detected: C++ (8,234 .cpp/.h files)".
 
-**S2: Auto-index after `--passes 1`.**
-The current behavior where `--passes 1` requires a manual `indexer.py --index` step is a trap. Just auto-index at the end of any run. The separate `indexer.py` command is a power-user tool, not a required step.
+**S2: ~~Auto-index after `--passes 1`.~~** Done — summaries are always auto-indexed. `--index-only` available for manual re-indexing.
 
 **S3: Check `source .env` on startup.**
 At the top of every agent's `main()`, check if `LLM_MODEL` or at least one API key env var is set. If not, print: "No LLM configuration found. Did you run `source .env`?"

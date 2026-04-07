@@ -32,35 +32,6 @@ BASE_DIR      = Path(__file__).parent
 STAGING_FILE  = BASE_DIR / "staging_queue.json"
 LOG_FILE      = BASE_DIR / "query_log.jsonl"
 
-# Scope → source_kind mapping.  Each scope boosts certain source_kinds
-# and optionally filters source_type.
-SCOPE_PROFILES = {
-    "implementation": {
-        "description": "How is X implemented? Find code details.",
-        "boost_source_types": ["code"],
-        "boost_source_kinds": ["reference"],
-    },
-    "rationale": {
-        "description": "Why was X designed this way? Find design decisions.",
-        "boost_source_types": ["doc", "ticket"],
-        "boost_source_kinds": ["rationale"],
-    },
-    "howto": {
-        "description": "How do I accomplish X? Find tutorials and examples.",
-        "boost_source_kinds": ["tutorial", "operational"],
-    },
-    "troubleshooting": {
-        "description": "How to fix/debug X? Find workarounds and root causes.",
-        "boost_source_types": ["ticket"],
-        "boost_source_kinds": ["operational", "rationale"],
-    },
-    "architecture": {
-        "description": "What is the high-level design of X?",
-        "boost_source_kinds": ["overview", "specification"],
-        "boost_chunk_types": ["file_overview", "class_overview"],
-    },
-}
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def get_client() -> R2RClient:
@@ -68,8 +39,7 @@ def get_client() -> R2RClient:
 
 
 def _log_query(query: str, num_results: int, approx_tokens: int,
-               answer: str = "", scope: str = "", module: str = "",
-               source_type: str = "",
+               answer: str = "",
                result_files: list[str] | None = None) -> None:
     """Append one line to the query log for experiment measurement.
 
@@ -80,9 +50,6 @@ def _log_query(query: str, num_results: int, approx_tokens: int,
         entry = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "query": query,
-            "scope": scope,
-            "module": module,
-            "source_type": source_type,
             "num_results": num_results,
             "approx_tokens": approx_tokens,
             "result_files": result_files or [],
@@ -167,9 +134,7 @@ mcp = FastMCP("domain-kb")
 
 
 @mcp.tool()
-def search_codebase(query: str, module: str = "",
-                    source_type: str = "",
-                    scope: str = "") -> str:
+def search_codebase(query: str) -> str:
     """
     Search the domain knowledge base semantically.
 
@@ -180,59 +145,13 @@ def search_codebase(query: str, module: str = "",
     Args:
         query:  Natural language description of what you're looking for.
                 E.g. "how does the null dereference checker handle pointer arithmetic"
-        module: Optional module name to restrict the search scope.
-                E.g. "checkers", "dataflow". Leave empty to search everything.
-        source_type: Optional filter by knowledge source type.
-                     "code" = code summaries, "doc" = design docs/wiki,
-                     "ticket" = Jira/PR knowledge. Leave empty for all.
-        scope:  Optional intent-based scope that adjusts which kinds of
-                results are prioritized. Options:
-                  "implementation" — how is X implemented? (boosts code)
-                  "rationale" — why was X designed this way? (boosts docs/tickets)
-                  "howto" — how do I accomplish X? (boosts tutorials)
-                  "troubleshooting" — how to fix/debug X? (boosts tickets)
-                  "architecture" — what is the high-level design? (boosts overviews)
-                Leave empty to search everything equally.
     """
     client = get_client()
-    profile = SCOPE_PROFILES.get(scope, {}) if scope else {}
 
-    # --- Primary search ---
     search_settings: dict = {
         "limit": SEARCH_LIMIT,
         "use_hybrid_search": True,
     }
-    filters: dict = {}
-    if module:
-        filters["module"] = {"$eq": module}
-
-    # source_type explicitly set by user takes precedence over scope
-    if source_type:
-        filters["source_type"] = {"$eq": source_type}
-    elif profile.get("boost_source_types"):
-        # Scope suggests source types — filter to them
-        types = profile["boost_source_types"]
-        if len(types) == 1:
-            filters["source_type"] = {"$eq": types[0]}
-        else:
-            filters["source_type"] = {"$in": types}
-
-    if profile.get("boost_source_kinds"):
-        kinds = profile["boost_source_kinds"]
-        if len(kinds) == 1:
-            filters["source_kind"] = {"$eq": kinds[0]}
-        else:
-            filters["source_kind"] = {"$in": kinds}
-
-    if profile.get("boost_chunk_types"):
-        ctypes = profile["boost_chunk_types"]
-        if len(ctypes) == 1:
-            filters["chunk_type"] = {"$eq": ctypes[0]}
-        else:
-            filters["chunk_type"] = {"$in": ctypes}
-
-    if filters:
-        search_settings["filters"] = filters
 
     try:
         results = client.retrieval.search(
@@ -249,23 +168,20 @@ def search_codebase(query: str, module: str = "",
     # If we got results from only one source type, check if other sources
     # have related knowledge and add a brief note
     cross_note = ""
-    if hits and scope != "implementation":
+    if hits:
         source_types_seen = {
             (getattr(h, "metadata", None) or {}).get("source_type", "")
             for h in hits
         }
-        # Look for related results in other source types
         other_types = {"code", "doc", "ticket"} - source_types_seen
         if other_types and len(source_types_seen) == 1:
             cross_note = _cross_source_check(client, query, other_types)
 
-    # Approximate token count for logging (rough: 1 token ≈ 4 chars)
     full_output = formatted
     if cross_note:
         full_output += "\n\n" + cross_note
     approx_tokens = len(full_output) // 4
 
-    # Extract result file list for evaluation
     result_files = []
     for h in hits:
         meta = h.metadata or {}
@@ -274,8 +190,7 @@ def search_codebase(query: str, module: str = "",
             result_files.append(src)
 
     _log_query(query, len(hits), approx_tokens,
-               answer=full_output, scope=scope, module=module,
-               source_type=source_type, result_files=result_files)
+               answer=full_output, result_files=result_files)
 
     return full_output
 
@@ -320,7 +235,6 @@ def suggest_index_item(
     source_files: list[str],
     reasoning: str,
     raw_code: str = "",
-    module: str = "",
 ) -> str:
     """
     Suggest a new entry for the domain knowledge base.
@@ -338,8 +252,6 @@ def suggest_index_item(
         raw_code:     The key source code snippet that answers the question.
                       This gets stored alongside the summary so future searches
                       return ground truth, not just the summary.
-        module:       Module this entry belongs to (e.g. "checkers", "dataflow").
-                      Used for module-scoped search filtering.
     """
     queue = _load_staging()
     entry = {
@@ -347,7 +259,6 @@ def suggest_index_item(
         "summary":      summary,
         "source_files": source_files,
         "raw_code":     raw_code,
-        "module":       module,
         "reasoning":    reasoning,
         "status":       "pending",
         "timestamp":    datetime.now(timezone.utc).isoformat(),

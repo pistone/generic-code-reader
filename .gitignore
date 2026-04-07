@@ -37,6 +37,7 @@ auditor/cost_log.jsonl
 ticket_agent/ticket_hashes.json
 ticket_agent/ticket_summaries.json
 ticket_agent/cost_log.jsonl
+# lessons/ is intentionally NOT gitignored — commit them so the team benefits
 
 # Proposal / internal docs
 proposal/

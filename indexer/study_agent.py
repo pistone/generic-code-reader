@@ -17,8 +17,8 @@ Pass 2 — Summarization
   - Loads module_map.json
   - Chunks each file with CodeSplitter (tree-sitter AST boundaries)
   - Calls the LLM with the module's questions to generate domain-aware summaries
-  - With --rag: queries the vector DB before each chunk for richer context
-  - Output: summaries.json  →  fed to indexer.py (or auto-indexed with --passes)
+  - LLM can call search_kb during summarization to look up unfamiliar types/concepts
+  - Output: summaries.json  →  auto-indexed to R2R after Pass 2
 
 Pass 3 — Review  (runs automatically when --passes > 1)
   - LLM reviews each summary for accuracy and domain vocabulary
@@ -26,16 +26,8 @@ Pass 3 — Review  (runs automatically when --passes > 1)
   - Stops early when edit rate drops below 5% (convergence)
 
 Usage:
-  # Standard two-pass run (same as before)
+  # Standard run
   OPENAI_API_KEY=sk-... python study_agent.py --codebase /path/to/src
-
-  # Bootstrap design docs into the vector DB, then run with RAG augmentation
-  python study_agent.py --codebase /path/to/src \\
-      --docs /path/to/docs --bootstrap-docs --rag
-
-  # Three iterative passes (summarize → review → improve) until convergence
-  python study_agent.py --codebase /path/to/src \\
-      --docs /path/to/docs --bootstrap-docs --rag --passes 3
 
   # Skip Pass 1 if module_map.json already exists
   python study_agent.py --codebase /path/to/src --pass2-only
@@ -70,7 +62,6 @@ except ImportError:
 
 DEFAULT_MODEL        = os.getenv("LLM_MODEL", "openai/gpt-4o")
 R2R_URL              = os.getenv("R2R_URL", "http://localhost:7272")
-CONVERGENCE_THRESHOLD = 0.05   # stop iterating when < 5% of summaries are edited
 
 # Max lines to sample from each file for Pass 1
 SAMPLE_LINES = 80
@@ -450,11 +441,13 @@ class ModuleDefinition(BaseModel):
     description: str
     files:       list[str]
     questions:   list[str]
+    dir_paths:   list[str] = []   # original dir_paths from define_modules (for focused refinement)
 
 class ModuleMap(BaseModel):
-    project:     str
-    description: str
-    modules:     list[ModuleDefinition]
+    project:      str
+    description:  str
+    modules:      list[ModuleDefinition]
+    review_issues: list[dict] = []  # populated by review_module_map(); persisted in module_map.json
 
 # llm_call imported from codebase_shared.utils
 
@@ -1443,69 +1436,6 @@ def _r2r_client():
     return R2RClient(R2R_URL)
 
 
-def _chunk_doc(content: str, max_chars: int = 1500) -> list[str]:
-    """Split a doc at markdown headings; fall back to fixed-size chunks."""
-    import re
-    sections = re.split(r'\n(?=#{1,3} )', content)
-    chunks = []
-    for section in sections:
-        if len(section) <= max_chars:
-            if section.strip():
-                chunks.append(section.strip())
-        else:
-            for i in range(0, len(section), max_chars):
-                part = section[i : i + max_chars].strip()
-                if part:
-                    chunks.append(part)
-    return chunks or [content[:max_chars]]
-
-
-def bootstrap_docs(docs_path: Path) -> int:
-    """
-    DEPRECATED: Use doc_agent for proper document ingestion instead.
-    Run: python -m doc_agent.doc_agent --docs /path/to/docs
-
-    doc_agent provides section-aware chunking, heading extraction, HTML parsing,
-    incremental mode, and proper metadata (doc_title, source_type, last_modified).
-    This function remains for backward compatibility.
-
-    Index .md/.rst/.txt files from docs_path into R2R as doc_summary chunks.
-    Call this before Pass 2 so the RAG search has domain vocabulary to work with.
-    Returns the number of chunks indexed.
-    """
-    doc_files: list[Path] = []
-    if docs_path.is_file():
-        doc_files = [docs_path]
-    else:
-        for ext in (".md", ".rst", ".txt"):
-            doc_files.extend(sorted(docs_path.rglob(f"*{ext}")))
-
-    print(f"\n[Bootstrap] Indexing {len(doc_files)} doc file(s) into R2R...")
-    client = _r2r_client()
-    count = 0
-    for doc_file in doc_files:
-        try:
-            content = doc_file.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            print(f"  [warn] {doc_file.name}: {e}")
-            continue
-        for chunk in _chunk_doc(content):
-            try:
-                client.documents.create(
-                    raw_text=chunk,
-                    metadata={
-                        "source_file": doc_file.name,
-                        "module":      "documentation",
-                        "chunk_type":  "doc_summary",
-                    },
-                )
-                count += 1
-            except Exception as e:
-                print(f"  [warn] {doc_file.name} chunk: {e}")
-    print(f"[Bootstrap] Indexed {count} doc chunk(s)")
-    return count
-
-
 def search_kb(query: str, limit: int = 3) -> str:
     """
     Query R2R and return a formatted context string for prompt injection.
@@ -1528,138 +1458,10 @@ def search_kb(query: str, limit: int = 3) -> str:
         return ""
 
 
-def _create_or_replace(client, raw_text: str, metadata: dict) -> str:
-    """Create a document in R2R; if it already exists, delete and retry."""
-    import re as _re
-    try:
-        resp = client.documents.create(raw_text=raw_text, metadata=metadata)
-        return str(resp.results.document_id)
-    except Exception as e:
-        err = str(e)
-        if "already exists" not in err.lower():
-            raise
-        match = _re.search(r"document\s+([0-9a-f-]{36})", err, _re.IGNORECASE)
-        if match:
-            try:
-                client.documents.delete(match.group(1))
-            except Exception:
-                pass
-            resp = client.documents.create(raw_text=raw_text, metadata=metadata)
-            return str(resp.results.document_id)
-        raise
-
-
-def _index_one_entry(client, entry: dict) -> tuple[str, Optional[str], Optional[str]]:
-    """Index one summary + raw_code into R2R. Returns (src_file, doc_id, code_doc_id).
-
-    Entries with skip_index=True are not indexed (summary is kept in
-    summaries.json for completeness but doesn't go into the vector DB).
-    """
-    src_file = entry.get("source_file", "")
-    module = entry.get("module", "")
-    doc_id = None
-    code_doc_id = None
-
-    # Low-value chunks flagged by the LLM — skip indexing
-    if entry.get("skip_index"):
-        return (src_file, None, None)
-
-    chunk_type = entry.get("chunk_type", "function_summary")
-    # Function cards get a dedicated source_kind for better search scoping
-    source_kind = "reference"
-    if chunk_type == "function_card":
-        source_kind = "specification"
-    elif chunk_type in ("file_overview", "class_overview"):
-        source_kind = "overview"
-
-    # Map chunk_category to source_kind for better search scoping
-    category = entry.get("chunk_category", "")
-    if category == "contract":
-        source_kind = "specification"
-    elif category == "error_handling":
-        source_kind = "operational"
-
-    try:
-        metadata = {
-            "source_file": src_file,
-            "module": module,
-            "chunk_type": chunk_type,
-            "source_type": "code",
-            "source_kind": source_kind,
-        }
-        # Add classification metadata if present
-        if category and category != "unknown":
-            metadata["chunk_category"] = category
-        search_val = entry.get("search_value", "")
-        if search_val:
-            metadata["search_value"] = search_val
-
-        doc_id = _create_or_replace(client, entry["summary"], metadata)
-    except Exception as e:
-        print(f"  [warn] {src_file}: summary index failed: {e}")
-
-    raw_code = entry.get("raw_code", "").strip()
-    if raw_code and len(raw_code) > 30:
-        try:
-            code_doc_id = _create_or_replace(client, raw_code, {
-                "source_file": src_file,
-                "module": module,
-                "chunk_type": "raw_code",
-                "source_type": "code",
-            })
-        except Exception as e:
-            print(f"  [warn] {src_file}: code index failed: {e}")
-
-    return (src_file, doc_id, code_doc_id)
-
-
 def index_summaries_to_r2r(summaries: list[dict], index_workers: int = 8) -> None:
-    """
-    Index all summaries into R2R with upsert semantics, using parallel workers.
-    If a document already exists (same content hash), it is replaced.
-    The new doc_id is stored back into the entry dict.
-
-    Also indexes raw code as a separate chunk (chunk_type: "raw_code") so that
-    searches for exact identifiers can match the source code directly.
-    """
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-
-    client = _r2r_client()
-    skip_count = sum(1 for e in summaries if e.get("skip_index"))
-    n = len(summaries)
-    if skip_count:
-        print(f"\n[Index] Indexing {n - skip_count} summaries into R2R "
-              f"({skip_count} low-value skipped, {index_workers} workers)...")
-    else:
-        print(f"\n[Index] Indexing {n} summaries + raw code into R2R ({index_workers} workers)...")
-
-    # Map future → index so we can write back doc_ids
-    with ThreadPoolExecutor(max_workers=index_workers) as pool:
-        future_to_idx = {
-            pool.submit(_index_one_entry, client, entry): i
-            for i, entry in enumerate(summaries)
-        }
-        done = 0
-        for future in as_completed(future_to_idx):
-            idx = future_to_idx[future]
-            try:
-                src_file, doc_id, code_doc_id = future.result()
-                if doc_id:
-                    summaries[idx]["doc_id"] = doc_id
-                if code_doc_id:
-                    summaries[idx]["code_doc_id"] = code_doc_id
-            except Exception as e:
-                print(f"  [warn] index failed for entry {idx}: {e}")
-            done += 1
-            if done % 100 == 0:
-                print(f"  [{done}/{n}] indexed...")
-
-    succeeded = sum(1 for e in summaries if e.get("doc_id"))
-    failed = n - succeeded
-    if failed > 0:
-        print(f"[Index] Done: {succeeded}/{n} indexed ({failed} failed)")
-    else:
-        print(f"[Index] Done: {succeeded}/{n} indexed")
+    """Index all summaries into R2R. Delegates to codebase_shared.r2r_indexer."""
+    from codebase_shared.r2r_indexer import index_entries
+    index_entries(summaries, index_workers=index_workers)
 
 
 # ── Pass 3: Review ─────────────────────────────────────────────────────────────
@@ -1823,9 +1625,11 @@ PASS1_SYSTEM = (
     "structure and read key files. When you have thoroughly explored the "
     "codebase, call define_modules to define the module map.\n\n"
     "Guidelines:\n"
-    "- IMPORTANT: Explore broadly BEFORE defining modules. Use expand_dirs on "
-    "every major directory. Read at least one key file per area. Do NOT rush "
-    "to call define_modules after only 2-3 exploration rounds.\n"
+    "- MANDATORY: You must explore EVERY major directory (those with many files) "
+    "using expand_dirs or list_files before calling define_modules. The system "
+    "tracks which directories you've visited and will REJECT define_modules if "
+    "major directories are unexplored.\n"
+    "- Read at least one key file per major area to understand its purpose.\n"
     "- A large codebase typically has 5-20+ modules — if you only see 2-3, "
     "you haven't explored enough. Keep exploring.\n"
     "- Each module should map to a directory or group of related directories\n"
@@ -1837,10 +1641,11 @@ PASS1_SYSTEM = (
     "- Focus questions on HOW things work internally, not just WHAT they are\n"
     "- Mark test modules with is_test: true (unit tests, test frameworks, mocks, "
     "benchmarks, fixtures). These will be excluded from the knowledge base.\n"
-    "- If define_modules is rejected, read the feedback and fix the issues."
+    "- If define_modules is rejected, read the feedback carefully and fix every "
+    "issue mentioned before trying again."
 )
 
-MAX_EXPLORE_ROUNDS = 20  # cap on interactive exploration rounds
+MAX_EXPLORE_ROUNDS = 30  # cap on interactive exploration rounds
 MAX_FILES_PER_READ = 8   # max files per read_files call
 
 
@@ -2052,15 +1857,35 @@ def _validate_modules(modules: list[dict], total_files: int,
 
 def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
                          top_dir_count: int,
-                         codebases: Optional[list[Path]] = None):
+                         codebases: Optional[list[Path]] = None,
+                         top_dirs: Optional[dict[str, int]] = None,
+                         required_dirs: Optional[set[str]] = None):
     """Create a closure that dispatches Pass 1 tool calls.
 
     define_modules is validated here. If validation fails, an error message
     is returned to the LLM so it can fix and retry. If validation passes,
     the accepted result is stored in `dispatch.accepted_modules`.
+
+    Coverage gate: before validation, checks that all required directories have
+    been touched via expand_dirs, list_files, or read_files. If not, returns a
+    specific list of unexplored directories. The coverage gate fires at most once.
+
+    required_dirs: explicit set of top-level dirs that must be explored. When
+    provided (e.g. for focused refinement rounds), overrides the default threshold
+    (>= 30 files). Pass an empty set to disable the coverage gate entirely.
     """
     # Accumulate all expanded dirs across rounds so the tree keeps growing
     _all_expanded: set[str] = set()
+    # Track which top-level dirs have been touched by any exploration tool
+    _explored_top_dirs: set[str] = set()
+    # Dirs that must be explored before define_modules is accepted.
+    # required_dirs overrides the threshold-based computation when provided.
+    if required_dirs is not None:
+        _major_top_dirs: set[str] = required_dirs
+    else:
+        _major_top_dirs = {
+            d for d, count in (top_dirs or {}).items() if count >= 30
+        }
     # Use same depth as initial tree
     _base_depth = 3 if len(files) < 500 else 4 if len(files) < 5000 else 5
     all_codebases = codebases if codebases else [codebase]
@@ -2074,16 +1899,25 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
                 continue
         return Path(f.name)
 
+    def _mark_explored(path: str):
+        """Mark a path's top-level directory as touched."""
+        top = path.split("/")[0] if "/" in path else path
+        if top and top != ".":
+            _explored_top_dirs.add(top)
+
     def dispatch(name: str, args: dict) -> str:
         if name == "expand_dirs":
             dirs = args.get("dirs", [])
             _all_expanded.update(str(d) for d in dirs)
+            for d in dirs:
+                _mark_explored(str(d))
             tree = build_directory_tree(codebase, files, max_depth=_base_depth,
                                          expand_dirs=_all_expanded, codebases=all_codebases)
             return tree
 
         elif name == "list_files":
             dir_path = args.get("dir_path", ".")
+            _mark_explored(dir_path)
             matches = _group_files_by_dir(codebase, files, dir_path, codebases=all_codebases)
             lines = [str(_relative_to_any(f)) for f in matches[:80]]
             if len(matches) > 80:
@@ -2092,6 +1926,8 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
 
         elif name == "read_files":
             paths = args.get("paths", [])
+            for p in paths:
+                _mark_explored(str(p))
             parts = []
             for rf in paths[:MAX_FILES_PER_READ]:
                 # Try each codebase to find the file
@@ -2128,6 +1964,27 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
 
         elif name == "define_modules":
             modules = args.get("modules", [])
+
+            # Coverage gate: enforce exploration of major directories.
+            # Fires at most once — after that, we skip it to avoid infinite loops.
+            if not dispatch.coverage_gate_fired and _major_top_dirs:
+                unexplored = _major_top_dirs - _explored_top_dirs
+                if unexplored:
+                    dispatch.coverage_gate_fired = True
+                    unexplored_list = sorted(unexplored)
+                    explored_count = len(_major_top_dirs - unexplored)
+                    print(f"  [Pass 1] Coverage gate: {explored_count}/{len(_major_top_dirs)} "
+                          f"major dirs explored, {len(unexplored)} missing")
+                    return (
+                        f"REJECTED: You have not explored these major directories yet:\n"
+                        f"  {chr(10).join('  - ' + d for d in unexplored_list)}\n\n"
+                        f"Use expand_dirs or list_files on each of them before calling "
+                        f"define_modules. You have explored "
+                        f"{explored_count}/{len(_major_top_dirs)} major directories so far.\n\n"
+                        f"Major directories are those with 30+ source files. Each one likely "
+                        f"contains a distinct module or sub-system."
+                    )
+
             error = _validate_modules(modules, len(files), top_dir_count)
             if error:
                 print(f"  [Pass 1] Module map REJECTED: {error[:120]}")
@@ -2151,6 +2008,7 @@ def _make_pass1_dispatch(codebase: Path, files: list[Path], language: str,
 
     dispatch.accepted_modules = None
     dispatch.rejected_count = 0
+    dispatch.coverage_gate_fired = False
     return dispatch
 
 
@@ -2208,12 +2066,22 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     dir_summary = "\n".join(dir_summary_lines)
 
     min_modules = max(3, min(len(top_dirs) // 2, 8))
+    # List the major dirs so the LLM knows exactly what it must explore
+    major_dirs = sorted(d for d, count in top_dirs.items() if count >= 30)
+    major_dirs_str = "\n".join(f"  - {d}/ ({top_dirs[d]} files)" for d in major_dirs)
+    major_section = (
+        f"\nYou MUST explore all of these major directories before calling "
+        f"define_modules (the system will reject define_modules otherwise):\n"
+        f"{major_dirs_str}\n"
+    ) if major_dirs else ""
+
     initial_prompt = (
         f"Explore this {language} codebase and define its modules.\n\n"
         f"Top-level directories (by file count):\n{dir_summary}\n\n"
         f"Directory tree (depth-limited, counts on truncated nodes):\n"
         f"```\n{tree}\n```"
-        f"{docs_section}\n\n"
+        f"{docs_section}\n"
+        f"{major_section}\n"
         f"This codebase has {len(files)} files across {len(top_dirs)} "
         f"top-level directories. Each major directory above is likely its own "
         f"module or contains multiple sub-modules.\n\n"
@@ -2225,13 +2093,13 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
         f"- Do NOT create catch-all modules. A module named 'libs' or 'other' "
         f"that contains most of the codebase will be REJECTED.\n"
         f"- Each module should cover ONE cohesive subsystem.\n"
-        f"- If define_modules is rejected, explore more and try again."
+        f"- If define_modules is rejected, read the feedback and fix every issue."
     )
 
     # Create dispatcher — define_modules is validated inside dispatch
     n_top_dirs = len(top_dirs)
     dispatch = _make_pass1_dispatch(codebase, files, language, n_top_dirs,
-                                    codebases=all_codebases)
+                                    codebases=all_codebases, top_dirs=top_dirs)
 
     # Logging callback — user-friendly progress
     _explored_dirs: list[str] = []
@@ -2362,6 +2230,7 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
             description=desc,
             files=mod_files,
             questions=questions if isinstance(questions, list) else [str(questions)],
+            dir_paths=[str(dp) for dp in dir_paths],
         ))
 
     if test_modules_skipped:
@@ -2390,7 +2259,375 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
 
     total_assigned = sum(len(m.files) for m in modules)
     print(f"\n[Pass 1] {len(modules)} modules, {total_assigned}/{len(files)} files assigned.")
+
+    # ── Review: advisory quality check ────────────────────────────────────────
+    print(f"\n[Pass 1 review] Checking module map quality...")
+    issues, overall = review_module_map(model, module_map, len(files), tracker=tracker)
+    print(f"[Pass 1 review] {overall}")
+    errors = [i for i in issues if i.get("severity") == "error"]
+    warns  = [i for i in issues if i.get("severity") == "warn"]
+    for i in warns:
+        print(f"  {yellow('[warn]')} {i['module']}: {i['description']}")
+    for i in errors:
+        print(f"  {red('[error]')} {i['module']}: {i['description']}")
+    if errors:
+        print(f"\n  {bold(str(len(errors)))} issue(s) saved to module_map.json. "
+              f"Re-run with --pass1-only to fix them.")
+    module_map.review_issues = issues
+
     return module_map
+
+
+# ── Pass 1: Review & Focused Refinement ───────────────────────────────────────
+
+PASS1_REVIEW_SYSTEM = (
+    "You are reviewing a codebase module map for quality. "
+    "Output ONLY valid JSON — no markdown, no text outside the JSON."
+)
+
+PASS1_FOCUSED_SYSTEM = (
+    "You are a senior software architect refining a codebase module map. "
+    "A reviewer identified problems with specific modules. The current module map "
+    "is shown below. Use the exploration tools to investigate the problematic "
+    "areas, then call define_modules with the complete revised map.\n\n"
+    "Rules:\n"
+    "- Keep well-structured modules exactly as they are.\n"
+    "- Focus your exploration on the directories of the flagged modules.\n"
+    "- Fix each flagged issue: split too-large modules, improve generic questions, "
+    "or separate unrelated directories.\n"
+    "- The output must include ALL modules (revised + unchanged).\n"
+    "- If define_modules is rejected, read the feedback and fix every issue."
+)
+
+
+def review_module_map(
+    model: str,
+    module_map: "ModuleMap",
+    total_files: int,
+    tracker: Optional[TokenTracker] = None,
+) -> tuple[list[dict], str]:
+    """Single LLM call to review the module map quality.
+
+    Returns (issues, overall_comment).
+    issues: list of {"module", "issue_type", "description", "severity"}
+      severity: "error" → re-run with --pass1-only to fix
+                "warn"  → advisory, noted but not blocking
+
+    issue_type values:
+      too_large      — module covers >35% of files and contains separable subsystems
+      poor_questions — questions are generic instead of domain-specific
+      bad_split      — module combines unrelated concerns
+    """
+    lines = []
+    for m in module_map.modules:
+        pct = len(m.files) / total_files * 100 if total_files else 0
+        sample = ", ".join(m.files[:8])
+        lines.append(
+            f"Module: {m.name} ({len(m.files)} files, {pct:.0f}% of codebase)\n"
+            f"  Dirs: {', '.join(m.dir_paths) or '(unknown)'}\n"
+            f"  Sample files: {sample}\n"
+            f"  Questions: {'; '.join(m.questions[:4])}"
+        )
+
+    prompt = (
+        f"Review this module map ({total_files} source files total).\n\n"
+        + "\n\n".join(lines)
+        + f"""
+
+Identify quality problems. Output JSON:
+{{
+  "issues": [
+    {{
+      "module": "name",
+      "issue_type": "too_large|poor_questions|bad_split",
+      "description": "specific problem and concrete suggestion (name dirs to split, example good questions)",
+      "severity": "error|warn"
+    }}
+  ],
+  "overall": "1-2 sentence overall assessment"
+}}
+
+Flag as error (re-run needed):
+- too_large: module covers >35% of all files AND file samples show clearly separable subsystems
+- bad_split: module mixes dirs with unrelated purposes visible from sample files
+
+Flag as warn:
+- poor_questions: questions use generic phrasing ("What does X do?") instead of domain vocabulary
+
+Only flag real problems. Return empty issues list if the map is reasonable."""
+    )
+
+    try:
+        raw = llm_call(model, PASS1_REVIEW_SYSTEM, prompt,
+                       max_tokens=800, json_mode=True,
+                       tracker=tracker, phase="Pass 1 review")
+        data = json.loads(raw)
+        return data.get("issues", []), data.get("overall", "")
+    except Exception as e:
+        print(f"  [Pass 1 review] Error: {e}")
+        return [], "Review failed — skipping."
+
+
+def run_pass1_focused(
+    model: str,
+    module_map: "ModuleMap",
+    codebase: Path,
+    files: list[Path],
+    language: str,
+    tracker: Optional[TokenTracker] = None,
+    codebases: Optional[list[Path]] = None,
+) -> "ModuleMap":
+    """Targeted Pass 1 re-run that fixes modules flagged in module_map.review_issues.
+
+    The LLM sees the full current module map plus the reviewer's feedback.
+    It explores the problematic directories, then calls define_modules with
+    a complete revised map (keeping good modules unchanged, fixing bad ones).
+    The coverage gate is narrowed to only the flagged modules' directories.
+    """
+    all_codebases = codebases if codebases else [codebase]
+    issues = module_map.review_issues
+    error_issues = [i for i in issues if i.get("severity") == "error"]
+
+    if not error_issues:
+        print("[Pass 1 focused] No error-level issues to fix.")
+        return module_map
+
+    # Identify the flagged module names and their directories
+    flagged_names = {i["module"] for i in error_issues}
+    flagged_mods = {m.name: m for m in module_map.modules if m.name in flagged_names}
+
+    # Compute required_dirs: top-level dirs of flagged modules that need exploration
+    required_dirs: set[str] = set()
+    for m in flagged_mods.values():
+        for dp in m.dir_paths:
+            top = dp.split("/")[0] if "/" in dp else dp
+            if top:
+                required_dirs.add(top)
+
+    print(f"\n[Pass 1 focused] Fixing {len(error_issues)} flagged module(s): "
+          f"{', '.join(sorted(flagged_names))}")
+    print(f"[Pass 1 focused] Must explore: {', '.join(sorted(required_dirs))}")
+
+    # Build the current module map summary for the prompt
+    def _relative_to_any(f: Path) -> Path:
+        for cb in all_codebases:
+            try:
+                return f.relative_to(cb)
+            except ValueError:
+                continue
+        return Path(f.name)
+
+    total_files = len(files)
+    mod_lines = []
+    for m in module_map.modules:
+        pct = len(m.files) / total_files * 100 if total_files else 0
+        flag = " ← FLAGGED" if m.name in flagged_names else ""
+        mod_lines.append(
+            f"  {m.name} ({len(m.files)} files, {pct:.0f}%){flag}\n"
+            f"    Dirs: {', '.join(m.dir_paths) or '(unknown)'}\n"
+            f"    Description: {m.description}"
+        )
+
+    issues_lines = []
+    for i in error_issues:
+        issues_lines.append(
+            f"  [{i['issue_type']}] {i['module']}: {i['description']}"
+        )
+
+    # Build initial tree
+    initial_depth = 3 if total_files < 500 else 4 if total_files < 5000 else 5
+    tree = build_directory_tree(codebase, files, max_depth=initial_depth,
+                                codebases=all_codebases)
+
+    # Top-level dir counts (for validation)
+    top_dirs: dict[str, int] = {}
+    for f in files:
+        rel = _relative_to_any(f)
+        if len(rel.parts) > 1:
+            top = rel.parts[0]
+            top_dirs[top] = top_dirs.get(top, 0) + 1
+    n_top_dirs = len(top_dirs)
+
+    initial_prompt = (
+        f"Refine this {language} codebase module map. "
+        f"A reviewer flagged {len(error_issues)} module(s) as problematic.\n\n"
+        f"CURRENT MODULE MAP:\n" + "\n".join(mod_lines) + "\n\n"
+        f"REVIEWER ISSUES TO FIX:\n" + "\n".join(issues_lines) + "\n\n"
+        f"Directory tree:\n```\n{tree}\n```\n\n"
+        f"REQUIRED DIRECTORIES TO EXPLORE FIRST: {', '.join(sorted(required_dirs))}\n"
+        f"(The system will reject define_modules until you explore these.)\n\n"
+        f"After exploring, call define_modules with the COMPLETE revised map — "
+        f"include all {len(module_map.modules)} modules (unchanged ones + fixed ones). "
+        f"Keep good modules exactly as they are. Fix every flagged issue."
+    )
+
+    dispatch = _make_pass1_dispatch(
+        codebase, files, language, n_top_dirs,
+        codebases=all_codebases,
+        top_dirs=top_dirs,
+        required_dirs=required_dirs,
+    )
+
+    _explored_dirs: list[str] = []
+    _files_read = 0
+
+    def on_round(round_num: int, tool_name: str, args: dict):
+        nonlocal _files_read
+        if tool_name == "expand_dirs":
+            dirs = args.get("dirs", [])
+            _explored_dirs.extend(dirs)
+            area = dirs[0] if dirs else "..."
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Exploring {area}/ "
+                  f"({len(_explored_dirs)} dirs explored)")
+        elif tool_name == "list_files":
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Listing {args.get('dir_path', '?')}/")
+        elif tool_name == "read_files":
+            paths = args.get("paths", [])
+            _files_read += len(paths)
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Reading {len(paths)} files "
+                  f"({_files_read} total)")
+        elif tool_name == "define_modules":
+            n = len(args.get("modules", []))
+            status = "validating" if dispatch.accepted_modules is None else "accepted"
+            print(f"  [{round_num}/{MAX_EXPLORE_ROUNDS}] Defining {n} modules ({status})")
+
+    print(f"[Pass 1 focused] Exploring with {model}...")
+    conversation, _ = llm_tool_loop(
+        model=model,
+        system=PASS1_FOCUSED_SYSTEM,
+        initial_messages=[{"role": "user", "content": initial_prompt}],
+        tools=PASS1_TOOLS,
+        dispatch=dispatch,
+        terminal_tools=set(),
+        max_rounds=MAX_EXPLORE_ROUNDS,
+        max_tokens=4096,
+        tracker=tracker,
+        phase="Pass 1 focused",
+        on_round=on_round,
+    )
+
+    terminal_args = dispatch.accepted_modules
+
+    if terminal_args is None:
+        # Force define_modules if rounds exhausted
+        print(f"  [Pass 1 focused] Max rounds reached — forcing module definition...")
+        from litellm import completion
+        conversation.append({
+            "role": "user",
+            "content": (
+                "You have used all exploration rounds. Call define_modules now "
+                "with the complete revised map. Include all modules."
+            ),
+        })
+        response = completion(
+            model=model, messages=conversation, max_tokens=4096,
+            tools=PASS1_TOOLS,
+            tool_choice={"type": "function", "function": {"name": "define_modules"}},
+        )
+        if tracker:
+            tracker.record("Pass 1 focused (forced)", response)
+        msg = response.choices[0].message
+        if msg.tool_calls:
+            try:
+                terminal_args = json.loads(msg.tool_calls[0].function.arguments)
+            except (json.JSONDecodeError, TypeError):
+                terminal_args = None
+
+    if terminal_args is None:
+        print("  [Pass 1 focused] Failed — keeping original module map.")
+        return module_map
+
+    # Resolve the revised map using the same post-processing as run_pass1
+    raw_modules = terminal_args.get("modules", [])
+    print(f"\n[Pass 1 focused] Resolving {len(raw_modules)} modules to file lists...")
+
+    assigned_files: set[str] = set()
+    new_modules: list[ModuleDefinition] = []
+    test_modules_skipped = 0
+
+    for mod_raw in raw_modules:
+        name = mod_raw.get("name", "unknown")
+        desc = mod_raw.get("description", "")
+        dir_paths = mod_raw.get("dir_paths", [])
+        questions = mod_raw.get("questions", [])
+        is_test = mod_raw.get("is_test", False)
+
+        if is_test or _is_test_module(name, desc, dir_paths):
+            test_modules_skipped += 1
+            for dp in dir_paths:
+                for f in _group_files_by_dir(codebase, files, str(dp),
+                                              codebases=all_codebases):
+                    assigned_files.add(str(_relative_to_any(f)))
+            continue
+
+        mod_files: list[str] = []
+        for dp in dir_paths:
+            for f in _group_files_by_dir(codebase, files, str(dp),
+                                          codebases=all_codebases):
+                rel = str(_relative_to_any(f))
+                if rel not in assigned_files:
+                    mod_files.append(rel)
+                    assigned_files.add(rel)
+
+        if not mod_files:
+            continue
+
+        if not questions:
+            questions = [f"What does the {name} module do?",
+                         f"How is {name} structured internally?"]
+
+        new_modules.append(ModuleDefinition(
+            name=name,
+            description=desc,
+            files=mod_files,
+            questions=questions if isinstance(questions, list) else [str(questions)],
+            dir_paths=[str(dp) for dp in dir_paths],
+        ))
+
+    if test_modules_skipped:
+        print(f"[Pass 1 focused] Skipped {test_modules_skipped} test module(s)")
+
+    # Orphaned files → other
+    orphaned = [str(_relative_to_any(f)) for f in files
+                if str(_relative_to_any(f)) not in assigned_files]
+    if orphaned:
+        print(f"[Pass 1 focused] {len(orphaned)} orphaned files → 'other'")
+        new_modules.append(ModuleDefinition(
+            name="other",
+            description="Files not assigned to a specific module",
+            files=orphaned,
+            questions=["What do these miscellaneous files do?"],
+        ))
+
+    for m in new_modules:
+        flag = " ← revised" if m.name in flagged_names else ""
+        print(f"  - {m.name}: {len(m.files)} files{flag}")
+
+    # Re-run advisory review on the refined map (issues cleared on success)
+    refined_map = ModuleMap(
+        project=module_map.project,
+        description=terminal_args.get("description", module_map.description),
+        modules=new_modules,
+    )
+    total_assigned = sum(len(m.files) for m in new_modules)
+    print(f"\n[Pass 1 focused] {len(new_modules)} modules, "
+          f"{total_assigned}/{len(files)} files assigned.")
+
+    print(f"\n[Pass 1 review] Re-checking refined map...")
+    issues, overall = review_module_map(model, refined_map, len(files), tracker=tracker)
+    print(f"[Pass 1 review] {overall}")
+    remaining_errors = [i for i in issues if i.get("severity") == "error"]
+    for i in [x for x in issues if x.get("severity") == "warn"]:
+        print(f"  {yellow('[warn]')} {i['module']}: {i['description']}")
+    for i in remaining_errors:
+        print(f"  {red('[error]')} {i['module']}: {i['description']}")
+    if remaining_errors:
+        print(f"  {len(remaining_errors)} issue(s) remain. Re-run --pass1-only to continue refining.")
+    else:
+        print(f"  {green('Module map looks good.')} No more errors.")
+
+    refined_map.review_issues = issues
+    return refined_map
 
 
 def _fallback_module_map(codebase: Path, files: list[Path],
@@ -2426,8 +2663,68 @@ def _fallback_module_map(codebase: Path, files: list[Path],
 PASS2_SYSTEM = (
     "You are building a semantic knowledge base for a software codebase. "
     "Generate concise, domain-aware summaries suitable for embedding and semantic search. "
-    "Write plain prose — no markdown, no bullet points."
+    "Write plain prose — no markdown, no bullet points.\n\n"
+    "You have access to a search_kb tool to query the knowledge base when you need "
+    "to understand a concept, type, or module referenced in the code. Use it when "
+    "you encounter unfamiliar types, function calls into other modules, or domain "
+    "concepts that would make the summary richer if understood. For simple or "
+    "self-contained chunks, go directly to write_summary."
 )
+
+PASS2_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_kb",
+            "description": (
+                "Search the knowledge base for context about a concept, type, "
+                "module, or function referenced in the code chunk. Use this when "
+                "you need to understand what an unfamiliar symbol does before "
+                "writing the summary."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language query, e.g. 'DeviceManager initialization contract' or 'what is TxnRequest'",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "write_summary",
+            "description": "Commit the final summary for this code chunk. Call this when you are ready to write the summary.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "summary": {
+                        "type": "string",
+                        "description": "2-4 sentence domain-aware summary of the chunk",
+                    },
+                    "category": {
+                        "type": "string",
+                        "enum": ["algorithm", "contract", "glue", "error_handling",
+                                 "data_model", "boilerplate"],
+                        "description": "What kind of question this chunk answers",
+                    },
+                    "search_value": {
+                        "type": "string",
+                        "enum": ["high", "medium", "low"],
+                        "description": "Would a developer search for this?",
+                    },
+                },
+                "required": ["summary", "category", "search_value"],
+            },
+        },
+    },
+]
+
+MAX_PASS2_SEARCH_ROUNDS = 3  # max search_kb calls per chunk before forcing write_summary
 
 # Phrases that indicate the summary has unresolved references
 _VAGUE_MARKERS = [
@@ -2453,14 +2750,10 @@ def _needs_reference_resolution(summary: str) -> Optional[str]:
 def build_pass2_prompt(project_desc: str, module_name: str,
                        module_desc: str, questions: list[str],
                        source_file: str, raw_code: str,
-                       kb_context: str = "",
                        file_summary: str = "",
                        usage_hints: Optional[list[str]] = None) -> str:
     questions_text = "\n".join(f"- {q}" for q in questions)
-    kb_section = (
-        f"\nRelevant context from the knowledge base (use this vocabulary):\n{kb_context}\n"
-        if kb_context else ""
-    )
+
     # The file_summary field may contain:
     # - A plain file summary ("This file implements X")
     # - Function pre-pass context ("[Function: foo] ... Focus on: ...")
@@ -2468,7 +2761,6 @@ def build_pass2_prompt(project_desc: str, module_name: str,
     context_section = ""
     focus_section = ""
     if file_summary:
-        # Split out "Focus on:" directives for special handling
         lines = file_summary.split("\n")
         context_lines = []
         focus_lines = []
@@ -2499,44 +2791,32 @@ Module: {module_name} — {module_desc}
 
 Domain questions this module answers:
 {questions_text}
-{kb_section}{context_section}
+{context_section}
 Source file: {source_file}
 Code chunk:
 ```
 {raw_code}
 ```
 {usage_section}
-Write a 2–4 sentence domain-aware summary of this code chunk.
-Requirements:
-- Use the project's own vocabulary (class names, function names, domain concepts)
-- State what this code DOES, not just what it IS
-- Mention which of the domain questions above this chunk addresses (if any)
-- Note what other functions/methods this code calls (if any)
-- If a function is widely called (see usage note above), include a sentence about WHEN and WHY a developer would call it — frame it as a recommendation
-- If trivial (imports-only, constants, empty stub), one sentence is enough
-- Plain prose only — no markdown, no bullets{focus_section}
+If you encounter unfamiliar types, modules, or domain concepts referenced in this \
+code, call search_kb to look them up before writing the summary.
 
-After the summary, on a new line, write a classification tag in this exact format:
-[category:CATEGORY search_value:VALUE]
-
-CATEGORY — what kind of question this chunk answers:
-- algorithm: Core logic, state machines, decision trees — "how does X work internally?"
-- contract: Interface definition, API, protocol — "how do I use X?" / "what does X expect?"
-- glue: Wiring, delegation, configuration, initialization — "how are X and Y connected?"
-- error_handling: Error paths, recovery, validation — "what happens when X fails?"
-- data_model: Type definitions, schemas, data structures — "what does X look like?"
-- boilerplate: Getters/setters, imports, forward declarations, logging — rarely searched for
-
-VALUE — would a developer search for this?
-- high: Core business logic, complex algorithms, important APIs
-- medium: Supporting logic, internal helpers, secondary interfaces
-- low: Trivial code, boilerplate, generated code
-
-Example output:
-This function validates incoming TxnRequest objects by checking account balance, applying fraud rules, and verifying spending limits. It calls FraudChecker::evaluate() for ML-based fraud scoring and throws TxnValidationError if any check fails.
-[category:algorithm search_value:high]
-
-Summary:"""
+When ready, call write_summary with:
+- summary: 2-4 sentence domain-aware description
+  - Use the project's own vocabulary (class names, function names, domain concepts)
+  - State what this code DOES, not just what it IS
+  - Mention which domain questions above this chunk addresses (if any)
+  - Note what other functions/methods this code calls (if any)
+  - If a function is widely called (see usage note above), include WHEN and WHY a developer would call it
+  - If trivial (imports-only, constants, empty stub), one sentence is enough{focus_section}
+- category: what kind of question this chunk answers
+  - algorithm: core logic, state machines — "how does X work internally?"
+  - contract: interface, API, protocol — "how do I use X?"
+  - glue: wiring, delegation, config — "how are X and Y connected?"
+  - error_handling: error paths, recovery — "what happens when X fails?"
+  - data_model: type definitions, schemas — "what does X look like?"
+  - boilerplate: getters, imports, logging — rarely searched for
+- search_value: high (core logic/APIs), medium (supporting code), low (trivial/boilerplate)"""
 
 
 def _make_chunk_key(source_file: str, chunk_index: int) -> str:
@@ -3005,15 +3285,48 @@ code does. Plain prose only."""
     return summary
 
 
+def _make_pass2_dispatch() -> tuple[dict, callable]:
+    """Create a dispatch closure for the Pass 2 tool loop.
+
+    Returns (state_dict, dispatch_fn).
+    state_dict holds the terminal result once write_summary is called.
+    """
+    state: dict = {"result": None, "kb_hits": 0}
+
+    def dispatch(name: str, args: dict) -> str:
+        if name == "search_kb":
+            query = args.get("query", "")
+            state["kb_hits"] += 1
+            result = search_kb(query, limit=3)
+            return result if result else "(no results found)"
+
+        elif name == "write_summary":
+            state["result"] = {
+                "summary":        args.get("summary", "").strip(),
+                "chunk_category": args.get("category", "unknown"),
+                "search_value":   args.get("search_value", "medium"),
+            }
+            return "__ACCEPTED__"
+
+        return f"Unknown tool: {name}"
+
+    return state, dispatch
+
+
 async def _async_summarize_one_chunk(
         model: str, codebase: Path, project_desc: str,
         mod_name: str, mod_desc: str, questions: list[str],
         rel_path: str, chunk: str, chunk_index: int,
-        rag: bool = False, file_summary: str = "",
+        file_summary: str = "",
         tracker: Optional[TokenTracker] = None,
         caller_freq: Optional[dict[str, int]] = None,
         doc_mentions: Optional[dict[str, str]] = None) -> dict:
-    """Async version: summarize a single code chunk."""
+    """Summarize a single code chunk using a tool loop.
+
+    The LLM can call search_kb as many times as needed to look up unfamiliar
+    types, modules, or domain concepts before committing the summary via
+    write_summary. Simple chunks typically go straight to write_summary.
+    """
     # Build usage hints for frequently-called functions in this chunk
     usage_hints: Optional[list[str]] = None
     if caller_freq:
@@ -3023,7 +3336,6 @@ async def _async_summarize_one_chunk(
             count = caller_freq.get(fn)
             matched_sym = fn
             if not count:
-                # Try bare name (without class qualifier)
                 bare = fn.split("::")[-1] if "::" in fn else None
                 if bare:
                     count = caller_freq.get(bare)
@@ -3031,7 +3343,6 @@ async def _async_summarize_one_chunk(
                         matched_sym = bare
             if count:
                 hint = f"{fn} is called from {count} different files"
-                # Append doc mention if available
                 doc_snip = (doc_mentions or {}).get(matched_sym) or \
                            (doc_mentions or {}).get(fn)
                 if doc_snip:
@@ -3040,8 +3351,6 @@ async def _async_summarize_one_chunk(
         if hints:
             usage_hints = hints
 
-    kb_context = (await asyncio.to_thread(search_kb, f"{mod_name} {chunk[:200]}", 3)
-                  if rag else "")
     prompt = build_pass2_prompt(
         project_desc=project_desc,
         module_name=mod_name,
@@ -3049,36 +3358,74 @@ async def _async_summarize_one_chunk(
         questions=questions,
         source_file=rel_path,
         raw_code=chunk,
-        kb_context=kb_context,
         file_summary=file_summary,
         usage_hints=usage_hints,
     )
 
-    summary_text = await allm_call(model, PASS2_SYSTEM, prompt, max_tokens=512,
-                                   tracker=tracker, phase="Pass 2")
-    summary_text = summary_text.strip()
-    if summary_text.lower().startswith("summary:"):
-        summary_text = summary_text[len("summary:"):].strip()
+    state, dispatch = _make_pass2_dispatch()
 
-    # Parse classification tag: [category:X search_value:Y]
-    chunk_category = "unknown"
-    search_value = "medium"
-    tag_match = _re.search(
-        r'\[category:(\w+)\s+search_value:(\w+)\]', summary_text)
-    if tag_match:
-        chunk_category = tag_match.group(1)
-        search_value = tag_match.group(2)
-        # Remove the tag from the summary text
-        summary_text = summary_text[:tag_match.start()].rstrip()
+    # Run tool loop in a thread (llm_tool_loop is synchronous)
+    def _run_tool_loop():
+        return llm_tool_loop(
+            model=model,
+            system=PASS2_SYSTEM,
+            initial_messages=[{"role": "user", "content": prompt}],
+            tools=PASS2_TOOLS,
+            dispatch=dispatch,
+            terminal_tools={"write_summary"},
+            max_rounds=MAX_PASS2_SEARCH_ROUNDS + 1,  # +1 for the write_summary call
+            max_tokens=600,
+            tracker=tracker,
+            phase="Pass 2",
+        )
 
-    # Check if the LLM tagged this as low-value
-    skip_index = False
-    if summary_text.upper().startswith("SKIP:"):
-        skip_index = True
-        summary_text = summary_text[5:].strip()
-    elif chunk_category == "boilerplate" and search_value == "low":
-        skip_index = True
+    await asyncio.to_thread(_run_tool_loop)
 
+    # If the LLM never called write_summary (exhausted rounds), force it
+    if state["result"] is None:
+        force_prompt = (
+            "You have used all search rounds. Call write_summary now with your "
+            "best summary of the code chunk based on what you've seen."
+        )
+        def _force():
+            from litellm import completion
+            msgs = [
+                {"role": "user", "content": prompt},
+                {"role": "user", "content": force_prompt},
+            ]
+            resp = completion(
+                model=model, messages=msgs, max_tokens=600,
+                tools=PASS2_TOOLS,
+                tool_choice={"type": "function",
+                             "function": {"name": "write_summary"}},
+            )
+            if tracker:
+                tracker.record("Pass 2 (forced)", resp)
+            msg = resp.choices[0].message
+            if msg.tool_calls:
+                try:
+                    args = json.loads(msg.tool_calls[0].function.arguments)
+                    dispatch("write_summary", args)
+                except (json.JSONDecodeError, TypeError):
+                    pass
+        await asyncio.to_thread(_force)
+
+    # Fallback if still nothing
+    if state["result"] is None:
+        state["result"] = {
+            "summary": f"[{rel_path} chunk {chunk_index}]",
+            "chunk_category": "unknown",
+            "search_value": "low",
+        }
+
+    summary_text   = state["result"]["summary"]
+    chunk_category = state["result"]["chunk_category"]
+    search_value   = state["result"]["search_value"]
+
+    # Determine skip_index
+    skip_index = chunk_category == "boilerplate" and search_value == "low"
+
+    # Reference resolution pass (for --refine; also catches vague markers)
     refined = False
     if not skip_index and _needs_reference_resolution(summary_text):
         improved = await _async_resolve_references(
@@ -3104,22 +3451,24 @@ async def _async_summarize_one_chunk(
         "chunk_category": chunk_category,
         "search_value":   search_value,
         "content_hash":   _chunk_content_hash(chunk),
+        "kb_queries":     state["kb_hits"],
     }
 
 
 async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                     language: str, max_chunks: Optional[int] = None,
-                    rag: bool = False,
                     summaries_path: Optional[Path] = None,
                     tracker: Optional[TokenTracker] = None,
                     workers: int = 4, rpm: int = 60,
                     max_concurrent: int = 50,
                     quiet: bool = False, verbose: bool = False,
                     codebases: Optional[list[Path]] = None) -> list[dict]:
-    """Chunk each file and call the LLM to generate a domain-aware summary per chunk.
+    """Chunk each file and summarize each chunk using a tool loop.
 
-    Uses async concurrency with rate limiting for high throughput.
-    With rag=True, queries the KB before each chunk to inject relevant context.
+    The LLM can call search_kb during summarization to look up unfamiliar
+    types or concepts. Simple chunks go straight to write_summary; complex
+    ones that reference other modules will search first (up to
+    MAX_PASS2_SEARCH_ROUNDS times per chunk).
     If summaries_path is set, writes incrementally for crash-safety.
     """
     global _quota_exhausted
@@ -3212,8 +3561,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     # Collect per-file chunk data for function grouping
     per_file_chunks: list[tuple[str, list[str], "ModuleDefinition"]] = []
 
-    rag_label = " (RAG-augmented)" if rag else ""
-    print(f"\n[Pass 2] Collecting chunks from {len(module_map.modules)} modules{rag_label}...")
+    print(f"\n[Pass 2] Collecting chunks from {len(module_map.modules)} modules...")
 
     for mod in module_map.modules:
         for fname in mod.files:
@@ -3449,17 +3797,22 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
     start_time = time.monotonic()
     completed_count = 0
     refined_count = 0
+    kb_query_count = 0
     error_count = 0
     # Lock protects summaries list + counters against concurrent on_result calls
     _result_lock = asyncio.Lock()
 
     async def on_result(idx, entry):
-        nonlocal completed_count, refined_count
+        nonlocal completed_count, refined_count, kb_query_count
         async with _result_lock:
             ref_tag = ""
             if entry.pop("refined", False):
                 ref_tag = " [refined]"
                 refined_count += 1
+
+            kb_hits = entry.pop("kb_queries", 0)
+            kb_query_count += kb_hits
+            kb_tag = f" [{kb_hits}q]" if kb_hits else ""
 
             summaries.append(entry)
             completed_count += 1
@@ -3475,7 +3828,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             if not quiet:
                 print(f"  [{n:>4}/{len(work_items)}] "
                       f"{work_items[idx]['rel_path']}:{work_items[idx]['chunk_index']} → "
-                      f"{len(entry['summary'])} chars{ref_tag}{eta}")
+                      f"{len(entry['summary'])} chars{ref_tag}{kb_tag}{eta}")
 
             # Incremental write every 10 completions — snapshot while holding lock
             if summaries_path and n % 10 == 0:
@@ -3492,7 +3845,7 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             model, codebase, project_desc,
             it["mod_name"], it["mod_desc"], it["questions"],
             it["rel_path"], it["chunk"], it["chunk_index"],
-            rag=rag, file_summary=it.get("file_summary", ""),
+            file_summary=it.get("file_summary", ""),
             tracker=tracker,
             caller_freq=caller_freq,
             doc_mentions=doc_mentions,
@@ -3603,10 +3956,11 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         if e.get("skip_index"):
             skip_count += 1
 
+    kb_note = f", {kb_query_count} KB queries" if kb_query_count else ""
     print(f"\n[Pass 2] Done: {len(summaries)} summaries total "
           f"({completed_count} new, {total_cached} cached, "
           f"{error_count} errors, {refined_count} refined, "
-          f"{overview_count} overviews, {func_card_count} function cards)")
+          f"{overview_count} overviews, {func_card_count} function cards{kb_note})")
     if cat_counts:
         cat_str = ", ".join(f"{k}={v}" for k, v in sorted(cat_counts.items(), key=lambda x: -x[1]))
         print(f"[Pass 2] Categories: {cat_str}")
@@ -3648,44 +4002,33 @@ def main():
                         help="Primary language (auto-detected if omitted)")
     parser.add_argument("--docs", nargs="+", default=None,
                         help="Path(s) to docs files/directories. Used in Pass 1 context. "
-                             "Also indexed into R2R when --bootstrap-docs is set. "
                              "Can specify multiple: --docs /path/a /path/b")
-    parser.add_argument("--bootstrap-docs", action="store_true",
-                        help="Index --docs into R2R before Pass 2 so RAG has domain vocabulary")
-    parser.add_argument("--rag", action="store_true",
-                        help="Query the KB before each chunk in Pass 2 for richer context. "
-                             "Most useful after --bootstrap-docs.")
-    parser.add_argument("--passes", type=int, default=1,
-                        help="(Deprecated) Number of summarize+review iterations. "
-                             "Use --refine instead for targeted review of weak summaries.")
-    parser.add_argument("--pass1-only", action="store_true",
-                        help="Only run Pass 1 (module discovery). "
-                             "Produces module_map.json. Run --pass2-only next.")
-    parser.add_argument("--pass2-only", action="store_true",
-                        help="Only run Pass 2 (requires existing module_map.json)")
-    parser.add_argument("--review-only", action="store_true",
-                        help="Only run review on existing summaries.json — "
-                             "re-reads each summary, rewrites weak ones using KB context. "
+    parser.add_argument("--discover", action="store_true",
+                        help="Only run module discovery (Pass 1). "
+                             "Produces module_map.json. If module_map.json already has "
+                             "review errors, runs a focused refinement round instead. "
+                             "Run --summarize next.")
+    parser.add_argument("--summarize", action="store_true",
+                        help="Only run summarization (Pass 2). Skips module discovery. "
+                             "Requires an existing module_map.json from a previous --discover run.")
+    parser.add_argument("--improve", action="store_true",
+                        help="Re-read existing summaries.json and rewrite weak ones using KB "
+                             "context. Cheaper than re-running the full pipeline. "
                              "Requires existing summaries.json.")
-    parser.add_argument("--index-only", action="store_true",
-                        help="Only index existing summaries.json into R2R. "
-                             "Useful after editing summaries manually or re-running review.")
+    parser.add_argument("--reindex", action="store_true",
+                        help="Re-index existing summaries.json into R2R without re-summarizing. "
+                             "Useful after editing summaries manually, changing models, or "
+                             "after clearing R2R.")
     parser.add_argument("--refine", action="store_true",
-                        help="After Pass 2, automatically re-run LLM on summaries that contain "
+                        help="After summarization, re-run LLM on summaries that contain "
                              "vague references ('delegates to', 'defined elsewhere', etc.). "
-                             "Much cheaper than --passes 2: only touches ~5%% of summaries.")
-    parser.add_argument("--max-chunks", type=int, default=None,
-                        help="Cap total chunks in Pass 2 (good for quick demos)")
+                             "Much cheaper than --improve: only touches ~5%% of summaries.")
     parser.add_argument("--incremental", action="store_true",
                         help="Only re-summarize files whose content has changed since "
                              "the last run. Uses a hash manifest (file_hashes.json).")
     parser.add_argument("--exclude", nargs="+", default=None,
                         help="Additional directories to skip. Can specify multiple: "
                              "--exclude generated proto_out experimental")
-    parser.add_argument("--include-tests", action="store_true",
-                        help="Include test files and test directories (skipped by default)")
-    parser.add_argument("--workers", type=int, default=4,
-                        help="Parallel workers for Pass 2 summarization (default: 4)")
     parser.add_argument("--rpm", type=int, default=60,
                         help="Rate limit: max LLM calls per minute (default: 60)")
     parser.add_argument("--max-concurrent", type=int, default=50,
@@ -3709,9 +4052,6 @@ def main():
             sys.exit(1)
     # Primary codebase is the first one (used for relative paths and output naming)
     codebase = codebases[0]
-
-    if args.passes < 1:
-        args.passes = 1
 
     # Add user-specified exclusions to SKIP_DIRS
     if args.exclude:
@@ -3737,9 +4077,9 @@ def main():
     files: list[Path] = []
     for cb in codebases:
         cb_files = collect_source_files(cb, language=args.language,
-                                        include_tests=args.include_tests)
+                                        include_tests=False)
         files.extend(cb_files)
-    skip_note = "" if args.include_tests else " (excluding tests — use --include-tests to change)"
+    skip_note = " (excluding tests)"
     if len(codebases) > 1:
         print(f"Found {len(files)} {args.language} source files across {len(codebases)} codebases{skip_note}")
         for cb in codebases:
@@ -3788,10 +4128,6 @@ def main():
     est_cost = est_total / 1_000_000 * rate_per_mtok
 
     total_calls = est_chunks
-    if args.passes > 1:
-        review_tokens = est_chunks * 1500
-        est_total += review_tokens * (args.passes - 1)
-        total_calls += int(est_chunks * 0.7)
     est_minutes = total_calls / args.rpm
 
     if args.dry_run:
@@ -3809,9 +4145,6 @@ def main():
         print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
         print(f"  Est. total tokens: ~{est_total:,}")
         print(f"  Est. cost:         ~${est_cost:.2f} (at ${rate_per_mtok:.2f}/MTok — {_pricing_source})")
-        if args.passes > 1:
-            print(f"  Est. review:       ~{review_tokens:,} tokens/pass × {args.passes - 1} pass(es)")
-            print(f"  Est. total w/review: ~{est_total:,} tokens (~${est_total / 1_000_000 * rate_per_mtok:.2f})")
         if est_minutes > 60:
             print(f"  Est. wall time:    ~{est_minutes / 60:.1f} hours (at {args.rpm} RPM)")
         else:
@@ -3876,24 +4209,6 @@ def main():
             except Exception:
                 pass
 
-    # ── Bootstrap docs into R2R (before Pass 1, so Pass 1 benefits too) ─────────
-    # Auto-detect: if --rag is set and no --docs given, look for common doc dirs
-    if args.rag and not args.docs:
-        for candidate in ("docs", "doc", "documentation", "design"):
-            candidate_path = codebase / candidate
-            if candidate_path.is_dir() and any(candidate_path.rglob("*.md")):
-                args.docs = [str(candidate_path)]
-                args.bootstrap_docs = True
-                print(f"[Auto] Found docs at {candidate_path}, will bootstrap")
-                break
-
-    if args.bootstrap_docs:
-        if not args.docs:
-            print("Error: --bootstrap-docs requires --docs PATH")
-            sys.exit(1)
-        for doc_path in args.docs:
-            bootstrap_docs(Path(doc_path))
-
     tracker = TokenTracker()
     _start_time = time.time()
 
@@ -3917,7 +4232,7 @@ def main():
         print(f"[Review-only] Reviewing {len(summaries)} summaries from {summaries_path}")
         summaries, edit_rate = asyncio.run(run_review(
             args.model, summaries, tracker=tracker,
-            workers=args.workers, rpm=args.rpm,
+            workers=4, rpm=args.rpm,
             max_concurrent=args.max_concurrent,
             quiet=args.quiet,
         ))
@@ -3929,27 +4244,47 @@ def main():
 
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
     if not args.pass2_only:
-        docs_context = None
-        if args.docs:
-            parts = []
-            for doc_arg in args.docs:
-                docs_path = Path(doc_arg)
-                if docs_path.is_file():
-                    parts.append(f"### {docs_path.name}\n"
-                                 f"{docs_path.read_text(encoding='utf-8', errors='replace')[:4000]}")
-                elif docs_path.is_dir():
-                    for doc_file in sorted(docs_path.rglob("*")):
-                        if doc_file.suffix in {".md", ".rst", ".txt"} and doc_file.is_file():
-                            parts.append(f"### {doc_file.name}\n"
-                                         f"{doc_file.read_text(errors='replace')[:2000]}")
-                        if sum(len(p) for p in parts) > 8000:
-                            break
-                if sum(len(p) for p in parts) > 8000:
-                    break
-            docs_context = "\n\n".join(parts) if parts else None
+        # Check if an existing module_map has review errors → focused re-run
+        _focused = False
+        if module_map_path.exists():
+            try:
+                _existing = ModuleMap(**json.loads(module_map_path.read_text()))
+                _error_issues = [i for i in _existing.review_issues
+                                 if i.get("severity") == "error"]
+                if _error_issues:
+                    print(f"\n[Pass 1] Existing module_map has {len(_error_issues)} error issue(s) "
+                          f"→ running focused refinement instead of full Pass 1")
+                    module_map = run_pass1_focused(
+                        args.model, _existing, codebase, files, args.language,
+                        tracker=tracker, codebases=codebases,
+                    )
+                    _focused = True
+            except Exception as _e:
+                print(f"  [warn] Could not load existing module_map ({_e}) — running full Pass 1")
 
-        module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
-                              tracker=tracker, codebases=codebases)
+        if not _focused:
+            docs_context = None
+            if args.docs:
+                parts = []
+                for doc_arg in args.docs:
+                    docs_path = Path(doc_arg)
+                    if docs_path.is_file():
+                        parts.append(f"### {docs_path.name}\n"
+                                     f"{docs_path.read_text(encoding='utf-8', errors='replace')[:4000]}")
+                    elif docs_path.is_dir():
+                        for doc_file in sorted(docs_path.rglob("*")):
+                            if doc_file.suffix in {".md", ".rst", ".txt"} and doc_file.is_file():
+                                parts.append(f"### {doc_file.name}\n"
+                                             f"{doc_file.read_text(errors='replace')[:2000]}")
+                            if sum(len(p) for p in parts) > 8000:
+                                break
+                    if sum(len(p) for p in parts) > 8000:
+                        break
+                docs_context = "\n\n".join(parts) if parts else None
+
+            module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
+                                   tracker=tracker, codebases=codebases)
+
         module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
         print(f"\n[Pass 1] Written to {module_map_path}")
     else:
@@ -3969,60 +4304,21 @@ def main():
     elif est_minutes > 1:
         print(f"\nEstimated time remaining: ~{int(est_minutes)} minutes at {args.rpm} RPM")
 
-    # ── Iterative Pass 2 + Review ────────────────────────────────────────────────
-    #
-    # Pass 1 (pass_num=1): summarize all chunks → index → review → improve
-    # Pass 2+ (pass_num>1): only review+improve (KB is richer from pass 1,
-    #   so the reviewer has better context). Re-running Pass 2 from scratch
-    #   would discard the review edits.
-    summaries: list[dict] = []
-    for pass_num in range(1, args.passes + 1):
-        if args.passes > 1:
-            print(f"\n{'='*60}")
-            print(f"  PASS {pass_num} of {args.passes}")
-            print(f"{'='*60}")
-
-        # Only run full summarization on the first pass
-        if pass_num == 1:
-            summaries = asyncio.run(run_pass2(
-                args.model_fast or args.model, codebase, module_map,
-                language=args.language,
-                max_chunks=args.max_chunks,
-                rag=args.rag,
-                summaries_path=summaries_path,
-                tracker=tracker,
-                workers=args.workers,
-                rpm=args.rpm,
-                max_concurrent=args.max_concurrent,
-                quiet=args.quiet,
-                verbose=args.verbose,
-                codebases=codebases,
-            ))
-
-        if args.passes > 1:
-            # Index summaries so the review pass can query them
-            index_summaries_to_r2r(summaries)
-
-            # Review + improve
-            summaries, edit_rate = asyncio.run(run_review(
-                args.model, summaries, tracker=tracker,
-                workers=args.workers, rpm=args.rpm,
-                max_concurrent=args.max_concurrent,
-                quiet=args.quiet,
-            ))
-
-            # Update R2R with improved summaries
-            index_summaries_to_r2r(summaries)
-
-            summaries_path.write_text(json.dumps(summaries, indent=2))
-            print(f"\n[Pass {pass_num}] {len(summaries)} summaries written to {summaries_path}")
-
-            if edit_rate < CONVERGENCE_THRESHOLD:
-                print(f"\nConverged after pass {pass_num} "
-                      f"(edit rate {edit_rate:.1%} < {CONVERGENCE_THRESHOLD:.0%})")
-                break
-        else:
-            summaries_path.write_text(json.dumps(summaries, indent=2))
+    # ── Pass 2: Summarization ───────────────────────────────────────────────────
+    summaries = asyncio.run(run_pass2(
+        args.model_fast or args.model, codebase, module_map,
+        language=args.language,
+        max_chunks=None,
+        summaries_path=summaries_path,
+        tracker=tracker,
+        workers=4,
+        rpm=args.rpm,
+        max_concurrent=args.max_concurrent,
+        quiet=args.quiet,
+        verbose=args.verbose,
+        codebases=codebases,
+    ))
+    summaries_path.write_text(json.dumps(summaries, indent=2))
 
     # Save hash manifest so --incremental can detect changes next time
     if new_manifest is not None:
@@ -4044,7 +4340,7 @@ def main():
                 args.model,
                 [summaries[i] for i, _ in vague_indices],
                 tracker=tracker,
-                workers=args.workers, rpm=args.rpm,
+                workers=4, rpm=args.rpm,
                 max_concurrent=args.max_concurrent,
                 quiet=args.quiet,
             ))

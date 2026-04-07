@@ -9,9 +9,20 @@ Pass 1 is an **LLM tool-calling loop**, not a static analysis. The LLM
 gets a depth-limited directory tree and 5 tools: `expand_dirs`,
 `list_files`, `read_files`, `search_kb`, and `define_modules`.
 
-It explores iteratively for up to 20 rounds. When `define_modules` is
-called, the result is **validated before acceptance**:
+It explores iteratively for up to 30 rounds. When `define_modules` is
+called, the result goes through two validation gates:
 
+**Gate 1 — Coverage gate** (fires at most once):
+- Tracks which top-level directories have been touched by any
+  exploration tool call (expand_dirs, list_files, or read_files).
+- "Major" directories are those with >= 30 source files.
+- If any major directory is unexplored when `define_modules` is called,
+  the call is rejected with a specific list of unexplored directories.
+- The initial prompt also lists these directories explicitly so the LLM
+  knows up-front what it must visit.
+- Fires at most once — subsequent `define_modules` calls skip it.
+
+**Gate 2 — Structure validation** (up to 2 rejections):
 1. **Minimum module count**: `max(3, top_dirs // 2)` non-test modules
    required for codebases with 500+ files.
 2. **No catch-all modules**: Any single module claiming >40% of
@@ -22,6 +33,25 @@ called, the result is **validated before acceptance**:
 
 If the LLM never calls `define_modules` or hits max rounds, it's forced
 with `tool_choice`, then falls back to one-module-per-top-level-dir.
+
+**After the loop — advisory review:**
+- `review_module_map()` makes a single LLM call to check the accepted map.
+- Issues are classified as `error` (split needed, unrelated dirs merged) or
+  `warn` (generic questions).
+- Issues are saved into `module_map.json` under `review_issues`.
+- Errors print: "Re-run with --pass1-only to fix them."
+
+**Focused refinement (`run_pass1_focused`):**
+- Triggered automatically on the next `--pass1-only` run when `review_issues`
+  contains errors.
+- The LLM receives the full current module map + reviewer feedback.
+- `required_dirs` for the coverage gate is narrowed to only the top-level
+  directories of flagged modules — so the LLM must explore those but is not
+  forced to re-explore already-good areas.
+- Same `define_modules` terminal tool; outputs the complete revised map.
+- After accepting, re-runs `review_module_map()` and saves remaining issues.
+- If all errors are resolved, `review_issues` is empty and the next
+  `--pass1-only` run does a fresh full Pass 1.
 
 **The initial tree depth scales with codebase size**:
 - <500 files: depth 3
@@ -60,7 +90,7 @@ unittest, etc.) to avoid false positives on English words like "latest",
 `_XTEST_PREFIXES` if needed.
 
 Also excludes test files by name pattern (test_*.py, *_test.cpp,
-*_spec.ts, etc.). Use `--include-tests` to override.
+*_spec.ts, etc.).
 
 ## How Pass 2 (summarization) works
 
@@ -73,9 +103,21 @@ The pipeline per chunk:
 2. Class-level summary — shared across chunks in the same class
 3. Function pre-pass — for multi-chunk functions, scans the full function
    to generate targeted questions
-4. Chunk summary — the main LLM call, receives all the above as context
+4. Chunk summarization — a **tool loop** (not a single LLM call):
+   - The LLM receives the chunk + module context
+   - It can call `search_kb(query)` as many times as needed (up to
+     `MAX_PASS2_SEARCH_ROUNDS = 3`) to look up unfamiliar types,
+     domain concepts, or functions called from other modules
+   - When ready, it calls `write_summary(summary, category, search_value)`
+     to commit the result
+   - Simple/self-contained chunks go straight to `write_summary`; complex
+     chunks that reference other modules typically issue 1-2 searches first
+   - If rounds exhausted without `write_summary`, a forced call is made
 5. Call graph inversion — post-pass, no LLM, extracts "calls/called by"
 6. Function card synthesis — for multi-chunk functions, one more LLM call
+
+Progress output shows `[Nq]` next to chunks that issued KB queries.
+The final summary line reports total KB queries across all chunks.
 
 ### Resume
 
@@ -110,7 +152,7 @@ indexing (reducing noise and embedding cost).
 Classification is stored as R2R metadata (`chunk_category`,
 `search_value`) for filtered search. The `contract` category maps to
 `source_kind: specification` and `error_handling` maps to
-`source_kind: operational` for scope-based search.
+`source_kind: operational`.
 
 Pass 2 prints a classification breakdown at the end.
 

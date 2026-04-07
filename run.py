@@ -97,16 +97,10 @@ def main():
                         help="Cheaper model for bulk summarization")
     parser.add_argument("--language", default=None,
                         help="Override language auto-detection")
-    parser.add_argument("--passes", type=int, default=1,
-                        help="Summarize+review iterations (default: 1)")
     parser.add_argument("--exclude", nargs="+", default=None,
                         help="Additional directories to skip (e.g. --exclude generated proto_out)")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process changed files/docs")
-    parser.add_argument("--rpm", type=int, default=60,
-                        help="Rate limit: LLM calls/minute (default: 60)")
-    parser.add_argument("--max-concurrent", type=int, default=50,
-                        help="Max async requests (default: 50)")
     parser.add_argument("--dry-run", action="store_true",
                         help="Estimate cost without running")
     parser.add_argument("--yes", "-y", action="store_true",
@@ -150,10 +144,7 @@ def main():
     # Step 2: Study codebase
     study_cmd = [python, str(project_dir / "indexer" / "study_agent.py"),
                  "--codebase"] + [str(cb) for cb in codebases] + [
-                 "--model", args.model,
-                 "--passes", str(args.passes),
-                 "--rpm", str(args.rpm),
-                 "--max-concurrent", str(args.max_concurrent)]
+                 "--model", args.model]
     if args.language:
         study_cmd += ["--language", args.language]
     if args.model_fast:
@@ -168,7 +159,6 @@ def main():
         study_cmd.append("--yes")
     if args.docs:
         study_cmd += ["--docs"] + args.docs
-        study_cmd.append("--rag")
 
     step_label = "Step 2: Analyzing codebase" if args.docs else "Analyzing codebase"
     rc = _run(study_cmd, step_label)

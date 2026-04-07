@@ -4,34 +4,32 @@ A self-improving domain knowledge base for codebases. Indexes LLM-generated summ
 
 > **What does this do?** Pre-analyzes your codebase with an LLM, creating a searchable knowledge base. Claude Code can then instantly answer questions about architecture, patterns, and implementation details — no more hours of manual code reading.
 
-### Quick Start
+## Quick Start
 
 ```bash
 git clone <repo-url> && cd generic-code-reader
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env              # edit: set OPENAI_API_KEY (or your LLM provider key)
+cp .env.example .env              # set OPENAI_API_KEY (or your LLM provider key)
 source .env
 docker compose -f r2r/compose.yaml up -d
 python preflight.py               # verify everything works
-python indexer/study_agent.py --codebase /path/to/src --language python --dry-run  # estimate cost
-python indexer/study_agent.py --codebase /path/to/src --language python --passes 2
+python run.py --codebase /path/to/src --dry-run   # estimate cost
+python run.py --codebase /path/to/src             # run the full pipeline
 # Done! Open Claude Code in this directory — search_codebase tool is ready.
 ```
-
-For detailed options, see the full [Setup](#setup) section below.
 
 ## Architecture
 
 ```
-doc_agent/doc_agent.py       → Ingests design docs, runbooks, wiki pages into R2R
-indexer/study_agent.py       → Analyzes codebase, generates summaries (multi-pass with RAG)
-indexer/indexer.py           → Feeds summaries into R2R vector DB
-ticket_agent/ticket_agent.py → Extracts knowledge from Jira/PR ticket exports
-auditor/auditor.py           → Detects doc↔code conflicts (staleness, contradictions)
-mcp_server/server.py         → MCP server: search_codebase + suggest_index_item
-reviewer/reviewer_agent.py   → Verifies runtime suggestions before promoting to the KB
-codebase_shared/utils.py     → Shared utilities (TokenTracker, llm_call, llm_tool_loop, RateLimitedExecutor, manifest helpers)
+doc_agent/doc_agent.py         → Ingests design docs, runbooks, wiki pages into R2R
+indexer/study_agent.py         → Analyzes codebase, generates summaries (multi-pass with RAG)
+ticket_agent/ticket_agent.py   → Extracts knowledge from Jira/PR ticket exports
+auditor/auditor.py             → Detects doc↔code conflicts (staleness, contradictions)
+mcp_server/server.py           → MCP server: search_codebase + suggest_index_item
+reviewer/reviewer_agent.py     → Verifies runtime suggestions before promoting to the KB
+codebase_shared/r2r_indexer.py → Standalone concurrent R2R indexer (used by all agents)
+codebase_shared/utils.py       → Shared utilities (TokenTracker, llm_call, AsyncRateLimiter)
 ```
 
 The self-improving loop: when Claude can't find an answer in the KB, it researches manually and calls `suggest_index_item()`. The reviewer agent verifies the suggestion and promotes it into R2R, so the next developer gets an instant answer.
@@ -42,14 +40,27 @@ The self-improving loop: when Claude can't find an answer in the KB, it research
 - **Docker** (for R2R vector database)
 - **LLM API key** — at least one of: OpenAI, Anthropic, Groq, or a local [Ollama](https://ollama.ai) install
 
+The tool reads environment variables from your shell — if they're already set (e.g. from company tooling or `.bashrc`), you do NOT need a `.env` file.
+
+| Variable | Required? | Default |
+|----------|-----------|---------|
+| `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY` / `GROQ_API_KEY`) | At least one | — |
+| `OPENAI_API_BASE` | Only if using a company LLM proxy | — |
+| `LLM_MODEL` | No | `openai/gpt-4o` |
+| `R2R_URL` | No | `http://localhost:7272` |
+| `VOYAGE_API_KEY` | No | — (for R2R embeddings) |
+| `KB_SEARCH_LIMIT` | No | `5` (MCP server results per search) |
+| `GITHUB_TOKEN` | No | — (ticket agent: fetch PR diffs, needs `read:repo`) |
+| `GITLAB_TOKEN` | No | — (ticket agent: fetch MR diffs) |
+| `GITLAB_URL` | No | `https://gitlab.com` (ticket agent: self-hosted GitLab) |
+
 ## Setup
 
-### 1. Clone and create virtualenv
+### 1. Clone and install
 
 ```bash
 git clone <repo-url> && cd generic-code-reader
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
@@ -57,237 +68,203 @@ pip install -r requirements.txt
 
 ```bash
 cp .env.example .env
-# Edit .env — at minimum set:
-#   OPENAI_API_KEY   (for the LLM — or use Ollama for fully local)
-#   VOYAGE_API_KEY   (for R2R embeddings)
+# Edit .env — at minimum set OPENAI_API_KEY (or another provider key)
+source .env
 ```
 
-**IMPORTANT: Embedding dimension configuration**
+**Embedding dimension note**: If you change the embedding model in `r2r/r2r.toml`, ensure `base_dimension` matches: `text-embedding-3-small` → 512, `voyage-code-2` → 1536. All R2R embedding configs must use the same dimension or you'll see a `Both embedding configurations must use the same dimensions` error.
 
-If you change the embedding model in `r2r/r2r.toml`, you must ensure `base_dimension` matches your model's output:
-- `text-embedding-3-small` → 512 dimensions
-- `text-embedding-3-large` → 3072 dimensions (requires all R2R embedding configs to use 3072)
-- `voyage-code-2` → 1536 dimensions
-
-R2R uses multiple embedding configurations internally (for indexing and reranking), and **all must use the same dimension**. If you see an error like `Both embedding configurations must use the same dimensions. Got 3072 and 512`, use `text-embedding-3-small` with `base_dimension = 512` or configure all embedding sections to match.
-
-### 3. Start R2R (vector database)
+### 3. Start R2R
 
 ```bash
-source .env
 docker compose -f r2r/compose.yaml up -d
-
-# Verify everything is ready
+# Wait ~30s for it to be healthy, then verify:
 python preflight.py
 ```
 
-### 4. (Optional) Index design documents
-
-If your project has design docs, architecture docs, runbooks, or wiki exports (supports `.md`, `.html`, `.txt`, `.rst`, `.pdf`):
+### 4. Run the pipeline
 
 ```bash
+# Full pipeline: docs → code analysis → ticket knowledge
+python run.py \
+    --codebase /path/to/src \
+    --docs /path/to/design-docs \      # optional
+    --tickets /path/to/jira-export \   # optional
+    --model-fast openai/gpt-4o-mini    # optional: cheaper model for bulk summarization
+
+# Multiple codebases:
+python run.py --codebase /path/to/src/core /path/to/src/plugins
+```
+
+`run.py` runs the full pipeline in order: doc_agent (if `--docs`) → Pass 1 module discovery → Pass 2 summarization → index to R2R → ticket_agent (if `--tickets`).
+
+### 5. Open Claude Code
+
+The `.mcp.json` is already configured. Open Claude Code in this directory — the `search_codebase` tool is immediately available. It searches across code summaries, docs, and tickets automatically.
+
+## Running Each Step Separately
+
+For large codebases, run phases independently to inspect output before proceeding:
+
+```bash
+# (Optional) Index design docs first so Pass 2 can reference them via RAG
 python -m doc_agent.doc_agent --docs /path/to/docs
+python -m doc_agent.doc_agent --docs /path/to/docs --incremental   # changed docs only
 
-# Re-run only on changed docs
-python -m doc_agent.doc_agent --docs /path/to/docs --incremental
-```
+# Phase 1: Module discovery → indexer/module_map.json
+python indexer/study_agent.py --codebase /path/to/src --pass1-only
+# Inspect module_map.json. Happy? Continue:
 
-Run this **before** the study agent so RAG-augmented summarization can
-reference your documentation.
+# Phase 2: Summarization → indexer/summaries.json → auto-indexed to R2R
+python indexer/study_agent.py --codebase /path/to/src --pass2-only
+# Want to improve vague summaries (~5% of chunks)?
+python indexer/study_agent.py --codebase /path/to/src --refine
 
-### 5. Study the codebase
+# Full review of all summaries (expensive, use --refine instead):
+python indexer/study_agent.py --codebase /path/to/src --review-only
 
-```bash
-# Basic: two-pass analysis (module discovery → summarization)
-python indexer/study_agent.py --codebase /path/to/your/src --language python
+# Re-index without re-summarizing (after edits or R2R restart):
+python indexer/study_agent.py --codebase /path/to/src --index-only
+python -m doc_agent.doc_agent --docs /path/to/docs --index-only
+python -m ticket_agent.ticket_agent --reindex
 
-# With RAG augmentation (recommended after indexing docs):
-python indexer/study_agent.py --codebase /path/to/your/src --rag --passes 3
-
-# Estimate cost before running (no LLM calls)
-python indexer/study_agent.py --codebase /path/to/your/src --dry-run
-
-# Quick test with 20 chunks
-python indexer/study_agent.py --codebase /path/to/your/src --max-chunks 20
-
-# Re-run only on changed files (uses sha256 hash manifest)
-python indexer/study_agent.py --codebase /path/to/your/src --incremental
-```
-
-Token usage is printed at the end of each run and logged to `indexer/cost_log.jsonl`.
-
-### 6. Index summaries into R2R
-
-```bash
-# If you ran with --passes 1 (default), index manually:
-python indexer/indexer.py --index indexer/summaries.json
-
-# If you ran with --passes > 1, summaries are already indexed.
-
-# Verify:
-python indexer/indexer.py --search "your query here"
-```
-
-### 7. (Optional) Index ticket knowledge
-
-If you have exported Jira tickets, PR discussions, or similar:
-
-```bash
-# Export tickets with your existing tools, then:
+# Ticket knowledge extraction:
 python -m ticket_agent.ticket_agent --tickets /path/to/exported/tickets
 
-# Incremental (skip already-processed tickets)
-python -m ticket_agent.ticket_agent --tickets /path/to/tickets --incremental
+# Index lessons generated by the ticket agent into R2R:
+python -m doc_agent.doc_agent --docs ticket_agent/lessons
 ```
 
-The ticket agent filters aggressively (only resolved tickets with comments),
-uses LLM to extract root causes, workarounds, and design decisions, then
-deduplicates against the existing KB before indexing.
+## Incremental Updates
 
-### 8. (Optional) Audit doc↔code consistency
-
-After indexing both docs and code, check for contradictions:
+When source code changes, re-run with `--incremental` — only files with changed content hashes are re-processed:
 
 ```bash
-python -m auditor.auditor
-
-# Custom staleness threshold (default: 90 days)
-python -m auditor.auditor --threshold-days 60
-
-# Results in auditor/conflict_report.json
+python run.py --codebase /path/to/src --incremental
 ```
 
-The auditor compares doc entries against code entries using timestamps
-first, then LLM comparison on flagged pairs. Review the conflict report
-to identify stale documentation.
+## Tuning
 
-### 9. Use with Claude Code
+These flags are on `study_agent.py` directly (not `run.py`, which uses sensible defaults):
 
-The `.mcp.json` is already configured. Open Claude Code in this directory and the `search_codebase` tool will be available. Use the `source_type` parameter to filter results: `"code"` for code summaries, `"doc"` for design docs, `"ticket"` for ticket knowledge, or leave empty for all.
+**`--max-concurrent`** (default: 50) — parallel LLM calls:
+- Company shared proxy: `5-10`
+- Company dedicated quota: `15-25`
+- OpenAI direct: `20-50`
+- Local Ollama/vLLM: `2-4`
 
-### 10. (Optional) Run the reviewer agent
+**`--rpm`** (default: 60) — requests per minute. Auto-detected from proxy headers when possible. OpenAI Tier 1 = 500 RPM.
 
+**`--exclude`** — skip directories that don't add KB value:
 ```bash
-# Process pending suggestions once
-python reviewer/reviewer_agent.py --codebase /path/to/your/src
-
-# Or keep it running in watch mode
-python reviewer/reviewer_agent.py --codebase /path/to/your/src --watch
+python indexer/study_agent.py --codebase /path/to/src \
+    --exclude generated proto_out third_party
 ```
 
-## Configuration
+## Cost and Quota Management
 
-All scripts respect these environment variables:
+**Estimate before running**: `--dry-run` shows token and cost estimates without any LLM calls. The running agent also prompts "Proceed? [Y/n]" — skip with `--yes`.
 
-| Variable | Default | Used by |
-|----------|---------|---------|
-| `R2R_URL` | `http://localhost:7272` | All scripts |
-| `LLM_MODEL` | `openai/gpt-4o` | study_agent, reviewer_agent, auditor, ticket_agent |
-| `OPENAI_API_KEY` | — | LLM calls (if using OpenAI) |
-| `VOYAGE_API_KEY` | — | R2R embeddings |
-| `KB_SEARCH_LIMIT` | `5` | MCP server (max results per search) |
+**Quota exhaustion**: If the LLM hits a budget error mid-run, all agents halt, save progress, and print a resume message. Re-run the same command to continue. Files already in the manifest (`*_hashes.json`) are skipped — you pay zero tokens for completed work.
 
-For fully local operation (no API keys): use Ollama + swap R2R embeddings to a local model.
+## Post-Run
 
 ```bash
-# Ollama example
-ollama pull llama3.1
-python indexer/study_agent.py --codebase /path/to/src --model ollama/llama3.1
+python status.py                                # KB health and stats
+python -m auditor.auditor                       # check doc↔code conflicts
+python dashboard.py --period 7d --by-module     # token savings by module
+```
+
+## Clean Slate
+
+To re-run the full pipeline from scratch (e.g. after changing prompts or the model):
+
+```bash
+# Delete artifacts
+rm -f indexer/module_map.json indexer/summaries.json
+rm -f indexer/context_cache.json indexer/call_graph.json indexer/file_hashes.json
+rm -f doc_agent/doc_hashes.json
+rm -f ticket_agent/ticket_hashes.json ticket_agent/ticket_summaries.json
+
+# Reset R2R
+docker compose -f r2r/compose.yaml down -v && docker compose -f r2r/compose.yaml up -d
+
+# Re-run
+python run.py --codebase /path/to/src ...
+```
+
+> **Note**: If you don't clear R2R, old and new summaries coexist. The indexer replaces entries by content hash, but changed prompts produce different text that won't match — always reset R2R for a true clean slate.
+
+## Evaluating KB Effectiveness
+
+The MCP server logs every `search_codebase` call to `mcp_server/query_log.jsonl`.
+
+```bash
+python eval/eval_kb.py extract --query-log mcp_server/query_log.jsonl  # build benchmark from usage
+python eval/eval_kb.py replay  --query-log mcp_server/query_log.jsonl  # replay against current KB
+python eval/eval_kb.py compare \
+    --questions eval/test_questions.jsonl \
+    --kb-a http://localhost:7272 --kb-b http://localhost:7273            # A/B comparison
+python eval/eval_kb.py blind   --questions eval/test_questions.jsonl    # score against expected files
+```
+
+## Explorer Agent
+
+For targeted deep exploration of a specific area rather than broad coverage:
+
+```bash
+python -m explorer_agent.explorer_agent \
+    --codebase /path/to/src/core/engine \
+    --context-root /path/to/src
+```
+
+Output is compatible with study agent's `summaries.json` schema.
+
+## Reviewer Agent
+
+When Claude Code calls `suggest_index_item()`, suggestions land in `mcp_server/staging_queue.json`. Run the reviewer to verify and promote them:
+
+```bash
+python reviewer/reviewer_agent.py --codebase /path/to/your/src   # process once
+python reviewer/reviewer_agent.py --codebase /path/to/your/src --watch  # continuous
 ```
 
 ## Testing
 
-Run the smoke tests after setup to validate everything works before applying to your codebase:
-
 ```bash
-# Uses this project itself as the test codebase
-python tests/smoke_test.py
-
-# Use a specific directory
-python tests/smoke_test.py --codebase /path/to/your/src
-
-# Different LLM provider
+python tests/smoke_test.py                        # uses this project as test codebase
+python tests/smoke_test.py --codebase /path/to/src
 python tests/smoke_test.py --model ollama/llama3.1
 ```
 
-The smoke tests check, in order:
-
-1. R2R health (Docker is up)
-2. LLM connectivity (API key works)
-3. Embedding round-trip (Voyage embeddings work)
-4. Code chunking (tree-sitter AST splitting)
-5. Index + search round-trip (R2R stores and retrieves)
-6. Study agent Pass 1 (module discovery)
-7. Study agent Pass 2 (summarization)
-8. Index summaries (end-to-end indexing)
-9. MCP server search (tool callable)
-10. Suggest + review loop (self-improving pipeline)
-
-Tests clean up after themselves. Total LLM cost is under $0.01.
+Smoke tests check R2R health, LLM connectivity, embeddings, chunking, indexing, Pass 1, Pass 2, MCP search, and the suggest+review loop. Total cost < $0.01.
 
 ## Troubleshooting
 
-### R2R won't start / embedding errors
-
+**R2R won't start / embedding errors**
 ```bash
-# Check R2R is healthy
 curl http://localhost:7272/v3/health
-
-# If unhealthy, restart
-docker compose -f r2r/compose.yaml down
-docker compose -f r2r/compose.yaml up -d
-
-# Check logs for embedding errors
 docker compose -f r2r/compose.yaml logs r2r 2>&1 | tail -30
+docker compose -f r2r/compose.yaml down && docker compose -f r2r/compose.yaml up -d
 ```
+If you see `Both embedding configurations must use the same dimensions`: check `base_dimension` in `r2r/r2r.toml` matches your model (`voyage-code-2` → 1536, `text-embedding-3-small` → 512).
 
-If you see `Both embedding configurations must use the same dimensions`:
-- Open `r2r/r2r.toml` and check `base_dimension` matches your embedding model
-- `voyage-code-2` → 1536, `text-embedding-3-small` → 512
-
-### LLM calls failing
-
+**LLM calls failing**
 ```bash
-# Test your API key
 python -c "from litellm import completion; print(completion(model='openai/gpt-4o', messages=[{'role':'user','content':'hi'}], max_tokens=5).choices[0].message.content)"
 ```
+- Wrong model string: use litellm format — `openai/gpt-4o`, `anthropic/claude-sonnet-4-20250514`, `ollama/llama3.1`
+- Missing key: set `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY` etc.) and `source .env`
+- Company proxy: set `OPENAI_API_BASE` in `.env`
 
-Common issues:
-- **Wrong model string**: Use litellm format: `openai/gpt-4o`, `anthropic/claude-sonnet-4-20250514`, `ollama/llama3.1`
-- **Missing API key**: Set `OPENAI_API_KEY` (or `ANTHROPIC_API_KEY`, etc.) in `.env` and run `source .env`
-- **Rate limits**: Reduce `--rpm` (default 60) or `--workers` (default 4)
-- **Company proxy**: Set `OPENAI_API_BASE` to your proxy URL in `.env`
+**Pass 1 finds too few modules** (e.g. 2 modules for a 10K-file repo): the LLM rushed. Use at least GPT-4o or Claude Sonnet for Pass 1. Re-run with `--pass1-only` to iterate cheaply.
 
-### Study agent runs out of memory on large codebases
+**Study agent killed mid-run**: just re-run the same command. Content hashes ensure only incomplete files are re-processed.
 
-- Use `--dry-run` to estimate cost first
-- Use `--max-chunks 100` for an initial test run
-- Use `--incremental` for subsequent runs (only re-processes changed files)
-- Reduce `--workers` to lower parallel memory usage
-
-### Database recovery after restart
-
-All agents save intermediate results to disk. After an R2R restart:
-
-```bash
-# Re-index code summaries (no LLM cost)
-python indexer/indexer.py --index indexer/summaries.json
-
-# Re-index ticket knowledge (no LLM cost)
-python -m ticket_agent.ticket_agent --index-only
-
-# Re-index documentation (no LLM cost)
-python -m doc_agent.doc_agent --docs /path/to/docs
-```
-
-### Stale `shared/` import errors
-
-The shared utilities module was renamed from `shared/` to `codebase_shared/` to avoid conflicts with R2R's `shared.abstractions` package. If you see `ModuleNotFoundError: No module named 'shared.utils'`, ensure:
-- The directory is `codebase_shared/` (not `shared/`)
-- All imports use `from codebase_shared.utils import ...`
+**Stale `shared/` import errors**: the module was renamed to `codebase_shared/`. If you see `ModuleNotFoundError: No module named 'shared.utils'`, all imports should use `from codebase_shared.utils import ...`.
 
 ## Supported Languages
 
 `python`, `javascript`, `typescript`, `cpp`, `java`, `go`, `rust`
 
-Pass `--language <lang>` to the study agent. Defaults to `python`.
+The study agent auto-detects language from file extensions. Override with `--language <lang>` if needed.

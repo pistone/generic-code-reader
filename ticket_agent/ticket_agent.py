@@ -5,16 +5,27 @@ Expects pre-exported JSON ticket files on disk (one ticket per file, or a
 JSON array of tickets).  Filters aggressively, then uses LLM to extract
 only the knowledge nuggets worth indexing.
 
+For tickets with linked MRs/PRs, fetches the MR diff and uses it to
+summarize the actual solution and extract generalizable lessons.
+Lessons are written as .md files to ticket_agent/lessons/ for later
+indexing by doc_agent.
+
 Usage:
     python -m ticket_agent.ticket_agent --tickets /path/to/exported/tickets
     python -m ticket_agent.ticket_agent --tickets /tmp/tickets --incremental
-    python -m ticket_agent.ticket_agent --index-only          # re-index from saved summaries
+    python -m ticket_agent.ticket_agent --reindex   # re-index from saved summaries
+
+Environment variables:
+    GITHUB_TOKEN   GitHub personal access token (read:repo scope)
+    GITLAB_TOKEN   GitLab personal access token
+    GITLAB_URL     GitLab instance URL (default: https://gitlab.com)
 """
 
 import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -30,15 +41,24 @@ from codebase_shared.utils import (  # noqa: E402
     _is_quota_error,
 )
 
-R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
-DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o")
-DEDUP_THRESHOLD = 0.85
+R2R_URL        = os.getenv("R2R_URL", "http://localhost:7272")
+DEFAULT_MODEL  = os.getenv("LLM_MODEL", "openai/gpt-4o")
+GITHUB_TOKEN   = os.getenv("GITHUB_TOKEN", "")
+GITLAB_TOKEN   = os.getenv("GITLAB_TOKEN", "")
+GITLAB_URL     = os.getenv("GITLAB_URL", "https://gitlab.com")
 
-RESOLVED_STATUSES = {"done", "closed", "resolved", "fixed", "complete"}
+DEDUP_THRESHOLD   = 0.85
+MAX_DIFF_CHARS    = 4000   # cap on diff text fed to LLM
+MAX_LESSON_CHARS  = 1200   # cap on generated lesson text
+
+RESOLVED_STATUSES  = {"done", "closed", "resolved", "fixed", "complete"}
 REJECT_RESOLUTIONS = {"won't fix", "wontfix", "duplicate", "cannot reproduce",
                       "incomplete", "not a bug"}
 
 _dedup_warned = False
+
+OUTPUT_DIR   = Path(__file__).resolve().parent
+LESSONS_DIR  = OUTPUT_DIR / "lessons"
 
 
 # ---------------------------------------------------------------------------
@@ -69,9 +89,9 @@ def structural_filter(tickets: list[dict]) -> list[dict]:
     """Filter to tickets likely to contain reusable knowledge."""
     passed: list[dict] = []
     for t in tickets:
-        status = (t.get("status") or "").lower().strip()
+        status     = (t.get("status") or "").lower().strip()
         resolution = (t.get("resolution") or "").lower().strip()
-        comments = t.get("comments") or []
+        comments   = t.get("comments") or []
 
         if status and status not in RESOLVED_STATUSES:
             continue
@@ -85,14 +105,175 @@ def structural_filter(tickets: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Step 2b: Fetch MR/PR context
+# ---------------------------------------------------------------------------
+
+# Patterns to extract MR/PR references from text
+_GITHUB_URL_RE = re.compile(
+    r'https?://github\.com/([^/]+)/([^/]+)/pull/(\d+)', re.IGNORECASE)
+_GITLAB_URL_RE = re.compile(
+    r'https?://[^/]*gitlab[^/]*/([^/]+)/([^/]+)/-/merge_requests/(\d+)',
+    re.IGNORECASE)
+_BARE_PR_RE    = re.compile(r'\bPR\s*#?(\d+)\b', re.IGNORECASE)
+_BARE_MR_RE    = re.compile(r'\bMR\s*!?(\d+)\b', re.IGNORECASE)
+
+
+def parse_mr_refs(ticket: dict) -> list[str]:
+    """Extract GitHub PR URLs and GitLab MR URLs from a ticket.
+
+    Looks in linked_prs (list of strings/URLs) and description.
+    Returns a list of canonical API URLs ready for fetching.
+    """
+    text_sources = [ticket.get("description") or ""]
+    for ref in (ticket.get("linked_prs") or []):
+        text_sources.append(str(ref))
+
+    urls: list[str] = []
+    for text in text_sources:
+        for m in _GITHUB_URL_RE.finditer(text):
+            owner, repo, number = m.group(1), m.group(2), m.group(3)
+            urls.append(f"github:{owner}/{repo}/{number}")
+        for m in _GITLAB_URL_RE.finditer(text):
+            owner, repo, number = m.group(1), m.group(2), m.group(3)
+            base = GITLAB_URL.rstrip("/")
+            urls.append(f"gitlab:{base}/{owner}/{repo}/{number}")
+
+    # Deduplicate while preserving order
+    seen: set[str] = set()
+    return [u for u in urls if not (u in seen or seen.add(u))]  # type: ignore[func-returns-value]
+
+
+def _fetch_github_pr(owner: str, repo: str, number: str) -> Optional[str]:
+    """Fetch GitHub PR title, description and diff summary via REST API."""
+    if not GITHUB_TOKEN:
+        return None
+    try:
+        import urllib.request
+        headers = {
+            "Authorization": f"token {GITHUB_TOKEN}",
+            "Accept": "application/vnd.github.v3+json",
+        }
+        # Fetch PR metadata
+        pr_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}"
+        req = urllib.request.Request(pr_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            pr = json.loads(resp.read().decode())
+
+        title = pr.get("title", "")
+        body  = (pr.get("body") or "")[:300]
+
+        # Fetch diff
+        diff_url = f"https://api.github.com/repos/{owner}/{repo}/pulls/{number}/files"
+        req = urllib.request.Request(diff_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            files = json.loads(resp.read().decode())
+
+        diff_lines: list[str] = []
+        total_chars = 0
+        for f in files[:20]:
+            fname    = f.get("filename", "?")
+            additions = f.get("additions", 0)
+            deletions = f.get("deletions", 0)
+            patch    = (f.get("patch") or "")[:800]
+            line = f"  {fname} (+{additions}/-{deletions})\n{patch}"
+            if total_chars + len(line) > MAX_DIFF_CHARS:
+                diff_lines.append("  ... (diff truncated)")
+                break
+            diff_lines.append(line)
+            total_chars += len(line)
+
+        diff_str = "\n".join(diff_lines)
+        return f"PR #{number}: {title}\n{body}\nChanged files:\n{diff_str}"
+
+    except Exception as e:
+        print(f"  [warn] GitHub PR fetch failed ({owner}/{repo}#{number}): {e}")
+        return None
+
+
+def _fetch_gitlab_mr(base: str, owner: str, repo: str, number: str) -> Optional[str]:
+    """Fetch GitLab MR title, description and diff summary via REST API."""
+    if not GITLAB_TOKEN:
+        return None
+    try:
+        import urllib.request
+        import urllib.parse
+        headers = {"PRIVATE-TOKEN": GITLAB_TOKEN}
+        project_path = urllib.parse.quote(f"{owner}/{repo}", safe="")
+
+        mr_url = f"{base}/api/v4/projects/{project_path}/merge_requests/{number}"
+        req = urllib.request.Request(mr_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            mr = json.loads(resp.read().decode())
+
+        title = mr.get("title", "")
+        body  = (mr.get("description") or "")[:300]
+
+        changes_url = f"{base}/api/v4/projects/{project_path}/merge_requests/{number}/changes"
+        req = urllib.request.Request(changes_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+
+        diff_lines: list[str] = []
+        total_chars = 0
+        for f in (data.get("changes") or [])[:20]:
+            fname = f.get("new_path", f.get("old_path", "?"))
+            diff  = (f.get("diff") or "")[:800]
+            line  = f"  {fname}\n{diff}"
+            if total_chars + len(line) > MAX_DIFF_CHARS:
+                diff_lines.append("  ... (diff truncated)")
+                break
+            diff_lines.append(line)
+            total_chars += len(line)
+
+        diff_str = "\n".join(diff_lines)
+        return f"MR !{number}: {title}\n{body}\nChanged files:\n{diff_str}"
+
+    except Exception as e:
+        print(f"  [warn] GitLab MR fetch failed ({owner}/{repo}!{number}): {e}")
+        return None
+
+
+def fetch_mr_context(ticket: dict) -> str:
+    """Fetch MR/PR diffs for a ticket and return a combined context string.
+
+    Returns empty string if no tokens configured or all fetches fail.
+    """
+    refs = parse_mr_refs(ticket)
+    if not refs:
+        return ""
+
+    parts: list[str] = []
+    for ref in refs[:3]:  # cap at 3 MRs per ticket
+        if ref.startswith("github:"):
+            _, rest = ref.split(":", 1)
+            owner, repo, number = rest.rsplit("/", 2)
+            result = _fetch_github_pr(owner, repo, number)
+            if result:
+                parts.append(result)
+        elif ref.startswith("gitlab:"):
+            _, rest = ref.split(":", 1)
+            # rest = base/owner/repo/number
+            tokens = rest.rsplit("/", 3)
+            if len(tokens) == 4:
+                base_url = tokens[0]
+                owner, repo, number = tokens[1], tokens[2], tokens[3]
+                result = _fetch_gitlab_mr(base_url, owner, repo, number)
+                if result:
+                    parts.append(result)
+
+    return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # Step 3: Build LLM context
 # ---------------------------------------------------------------------------
 
-def build_ticket_context(ticket: dict, max_chars: int = 3000) -> str:
-    """Compose a condensed view of a ticket for LLM extraction."""
+def build_ticket_context(ticket: dict, mr_context: str = "",
+                         max_chars: int = 3000) -> str:
+    """Compose a condensed view of a ticket (+ MR diffs) for LLM extraction."""
     parts: list[str] = []
 
-    key = ticket.get("key", "unknown")
+    key   = ticket.get("key", "unknown")
     title = ticket.get("title", "")
     parts.append(f"Ticket: {key} — {title}")
 
@@ -104,23 +285,21 @@ def build_ticket_context(ticket: dict, max_chars: int = 3000) -> str:
     if resolution:
         parts.append(f"\nResolution: {resolution}")
 
-    linked = ticket.get("linked_prs") or []
-    if linked:
-        parts.append(f"Linked PRs: {', '.join(str(p) for p in linked)}")
-
     labels = ticket.get("labels") or []
     if labels:
         parts.append(f"Labels: {', '.join(labels)}")
 
     comments = ticket.get("comments") or []
     if comments:
-        # Take last 5 comments, cap each at 300 chars
         recent = comments[-5:]
         parts.append("\nRecent comments:")
         for c in recent:
             author = c.get("author", "?")
-            body = (c.get("body") or "")[:300]
+            body   = (c.get("body") or "")[:300]
             parts.append(f"  [{author}]: {body}")
+
+    if mr_context:
+        parts.append(f"\nMerge request(s):\n{mr_context[:MAX_DIFF_CHARS]}")
 
     text = "\n".join(parts)
     return text[:max_chars]
@@ -133,7 +312,8 @@ def build_ticket_context(ticket: dict, max_chars: int = 3000) -> str:
 EXTRACT_SYSTEM = (
     "You extract reusable technical knowledge from resolved tickets. "
     "If the ticket contains a root cause, workaround, design decision, "
-    "or recurring pattern worth remembering, extract it as a concise summary. "
+    "or recurring pattern worth remembering, extract it concisely. "
+    "If MR/PR diffs are provided, summarize what the solution actually changed. "
     "If the ticket is just a routine bug fix with no reusable insight, "
     "mark it as not useful. "
     "Output ONLY valid JSON — no markdown fences, no commentary."
@@ -146,7 +326,8 @@ Extract the reusable technical knowledge from this ticket.
 Output this JSON:
 {{
   "useful": true or false,
-  "summary": "1-3 sentence knowledge nugget (only if useful)",
+  "summary": "1-3 sentence description of the problem and its context (only if useful)",
+  "solution": "1-2 sentence description of what the fix/change actually did — specific classes, functions, patterns used (only if useful and MR diff is available, otherwise omit)",
   "category": "root_cause" or "workaround" or "design_decision" or "pattern" (only if useful)
 }}
 
@@ -158,17 +339,104 @@ def extract_knowledge(model: str, context: str,
     """LLM call to extract knowledge from a ticket."""
     prompt = EXTRACT_PROMPT_TEMPLATE.format(context=context)
     raw = llm_call(model, EXTRACT_SYSTEM, prompt,
-                   max_tokens=256, json_mode=True,
+                   max_tokens=400, json_mode=True,
                    tracker=tracker, phase="Extraction")
     try:
         result = json.loads(raw)
         return {
-            "useful": bool(result.get("useful", False)),
-            "summary": str(result.get("summary", "")),
+            "useful":   bool(result.get("useful", False)),
+            "summary":  str(result.get("summary", "")),
+            "solution": str(result.get("solution", "")),
             "category": str(result.get("category", "general")),
         }
     except (json.JSONDecodeError, TypeError):
-        return {"useful": False, "summary": "", "category": ""}
+        return {"useful": False, "summary": "", "solution": "", "category": ""}
+
+
+# ---------------------------------------------------------------------------
+# Step 4b: Generate lesson learned
+# ---------------------------------------------------------------------------
+
+LESSON_SYSTEM = (
+    "You generate generalizable lessons from resolved engineering tickets. "
+    "A lesson is a reusable how-to or pattern that helps a future developer "
+    "working in this area of the codebase — not a summary of the bug itself. "
+    "Be specific: name the classes, patterns, or conventions involved. "
+    "Output ONLY the lesson text (plain markdown, no JSON, no preamble)."
+)
+
+LESSON_PROMPT_TEMPLATE = """Ticket: {key} — {title}
+
+Problem summary: {summary}
+
+Solution: {solution}
+
+Write a lesson learned that a future developer can apply. Focus on:
+- What pattern or convention this reveals (how to do X in this codebase)
+- What to watch out for (pitfalls, assumptions the code makes)
+- Any architectural constraint the fix exposed
+
+Write 2-4 sentences of plain prose. Be specific — use actual class/function
+names from the solution if available. Do NOT summarize the bug; teach the lesson."""
+
+
+def generate_lesson(model: str, ticket: dict, extraction: dict,
+                    tracker: Optional[TokenTracker] = None) -> Optional[str]:
+    """Generate a generalizable lesson from an extracted ticket.
+
+    Returns lesson text, or None if no meaningful lesson can be generated.
+    Only called when extraction has a non-empty solution.
+    """
+    solution = extraction.get("solution", "").strip()
+    summary  = extraction.get("summary", "").strip()
+    if not solution or not summary:
+        return None
+
+    prompt = LESSON_PROMPT_TEMPLATE.format(
+        key=ticket.get("key", ""),
+        title=ticket.get("title", ""),
+        summary=summary,
+        solution=solution,
+    )
+    try:
+        lesson = llm_call(model, LESSON_SYSTEM, prompt,
+                          max_tokens=300, tracker=tracker, phase="Lessons")
+        lesson = lesson.strip()
+        if len(lesson) < 30:
+            return None
+        return lesson[:MAX_LESSON_CHARS]
+    except Exception as e:
+        print(f"  [warn] Lesson generation failed: {e}")
+        return None
+
+
+def save_lesson_file(ticket: dict, extraction: dict, lesson: str) -> Path:
+    """Write a lesson to ticket_agent/lessons/<KEY>.md.
+
+    The file includes YAML frontmatter so doc_agent can classify it as
+    a tutorial/how-to when it indexes the lessons/ directory.
+    Returns the path written.
+    """
+    LESSONS_DIR.mkdir(exist_ok=True)
+    key      = ticket.get("key", "unknown")
+    title    = ticket.get("title", "")
+    category = extraction.get("category", "general")
+    date     = (ticket.get("resolved") or ticket.get("created") or "")[:10]
+
+    content = (
+        f"---\n"
+        f"ticket: {key}\n"
+        f"title: \"{title}\"\n"
+        f"category: {category}\n"
+        f"date: {date}\n"
+        f"---\n\n"
+        f"# Lesson from {key}: {title}\n\n"
+        f"{lesson}\n"
+    )
+
+    path = LESSONS_DIR / f"{key}.md"
+    path.write_text(content, encoding="utf-8")
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -200,30 +468,41 @@ def dedup_against_kb(client: R2RClient, summary: str,
 # Step 6: Index to R2R
 # ---------------------------------------------------------------------------
 
+_CATEGORY_TO_KIND = {
+    "root_cause":       "rationale",
+    "workaround":       "operational",
+    "design_decision":  "rationale",
+    "pattern":          "reference",
+}
+
+
 def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
     """Index extracted ticket knowledge into R2R.
 
-    Returns a dict mapping ticket key → doc_id for successfully indexed entries.
-    Failed entries are omitted from the result (no misaligned zips).
+    Each entry is indexed as two documents if a lesson exists:
+      - ticket_summary: problem + solution (for "why did X fail?" queries)
+      - lesson: generalizable guidance (for "how do I do X?" queries)
+
+    Returns a dict mapping ticket key → doc_id of the summary document.
     """
-    client = R2RClient(R2R_URL)
+    client   = R2RClient(R2R_URL)
     indexed: dict[str, str] = {}
 
     for i, entry in enumerate(entries):
-        # Map ticket category to source_kind for unified filtering
-        _category_to_kind = {
-            "root_cause": "rationale",
-            "workaround": "operational",
-            "design_decision": "rationale",
-            "pattern": "reference",
-        }
-        source_kind = _category_to_kind.get(entry["category"], "reference")
+        key        = entry["key"]
+        source_kind = _CATEGORY_TO_KIND.get(entry["category"], "reference")
+
+        # Compose the indexed text: summary + solution if present
+        text_parts = [entry["summary"]]
+        if entry.get("solution"):
+            text_parts.append(f"Solution: {entry['solution']}")
+        text = "\n".join(text_parts)
 
         try:
             resp = client.documents.create(
-                raw_text=entry["summary"],
+                raw_text=text,
                 metadata={
-                    "source_file":   entry["key"],
+                    "source_file":   key,
                     "module":        entry["category"],
                     "chunk_type":    "ticket_summary",
                     "source_type":   "ticket",
@@ -232,9 +511,28 @@ def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
                     "last_modified": entry.get("resolved", ""),
                 },
             )
-            indexed[entry["key"]] = str(resp.results.document_id)
+            indexed[key] = str(resp.results.document_id)
         except Exception as e:
-            print(f"  [warn] {entry['key']}: index failed: {e}")
+            print(f"  [warn] {key}: index failed: {e}")
+            continue
+
+        # Index lesson separately if present
+        if entry.get("lesson"):
+            try:
+                client.documents.create(
+                    raw_text=entry["lesson"],
+                    metadata={
+                        "source_file":   key,
+                        "module":        entry["category"],
+                        "chunk_type":    "lesson",
+                        "source_type":   "ticket",
+                        "source_kind":   "tutorial",
+                        "doc_title":     f"Lesson from {key}: {entry['title']}",
+                        "last_modified": entry.get("resolved", ""),
+                    },
+                )
+            except Exception as e:
+                print(f"  [warn] {key}: lesson index failed: {e}")
 
         if i > 0 and i % 20 == 0:
             time.sleep(0.5)
@@ -254,11 +552,9 @@ def ticket_hash(ticket: dict) -> str:
         str(len(ticket.get("comments") or [])),
         ticket.get("resolution", ""),
         ticket.get("status", ""),
+        ",".join(str(p) for p in (ticket.get("linked_prs") or [])),
     ]
     return hashlib.sha256("|".join(parts).encode()).hexdigest()[:16]
-
-
-# load_manifest / save_manifest imported from codebase_shared.utils
 
 
 # ---------------------------------------------------------------------------
@@ -272,25 +568,23 @@ def main():
     parser.add_argument("--tickets", default=None,
                         help="Directory of exported ticket JSON files")
     parser.add_argument("--model", default=DEFAULT_MODEL,
-                        help="litellm model string (default: %(default)s). "
-                             "Examples: openai/gpt-4o, anthropic/claude-sonnet-4-20250514, ollama/llama3.1")
+                        help="litellm model string (default: %(default)s)")
     parser.add_argument("--incremental", action="store_true",
                         help="Only process tickets changed since last run")
-    parser.add_argument("--index-only", action="store_true",
+    parser.add_argument("--reindex", action="store_true",
                         help="Skip extraction; re-index from saved ticket_summaries.json")
-    parser.add_argument("--verbose", action="store_true",
-                        help="Print detailed progress")
+    parser.add_argument("--no-mr", action="store_true",
+                        help="Disable MR/PR fetching (skips GITHUB_TOKEN / GITLAB_TOKEN lookups)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-item progress, show only summaries")
     args = parser.parse_args()
 
-    output_dir = Path(__file__).resolve().parent
-    manifest_path = output_dir / "ticket_hashes.json"
-    cost_log_path = output_dir / "cost_log.jsonl"
-    summaries_path = output_dir / "ticket_summaries.json"
+    manifest_path  = OUTPUT_DIR / "ticket_hashes.json"
+    cost_log_path  = OUTPUT_DIR / "cost_log.jsonl"
+    summaries_path = OUTPUT_DIR / "ticket_summaries.json"
 
-    # --index-only: replay from saved summaries, no LLM calls
-    if args.index_only:
+    # --reindex: replay from saved summaries, no LLM calls
+    if args.reindex:
         if not summaries_path.exists():
             print(f"Error: {summaries_path} not found. Run extraction first.")
             sys.exit(1)
@@ -305,7 +599,7 @@ def main():
         return
 
     if not args.tickets:
-        print("Error: --tickets is required unless using --index-only")
+        print("Error: --tickets is required unless using --reindex")
         sys.exit(1)
 
     tickets_dir = Path(args.tickets).resolve()
@@ -313,7 +607,12 @@ def main():
         print(f"Error: '{tickets_dir}' is not a directory")
         sys.exit(1)
 
-    tracker = TokenTracker()
+    fetch_mrs = not args.no_mr
+    if fetch_mrs and not GITHUB_TOKEN and not GITLAB_TOKEN:
+        print("  [info] No GITHUB_TOKEN or GITLAB_TOKEN set — MR fetching disabled")
+        fetch_mrs = False
+
+    tracker  = TokenTracker()
     manifest = load_manifest(manifest_path)
 
     # Step 1: load
@@ -334,7 +633,7 @@ def main():
         changed: list[dict] = []
         for t in candidates:
             key = t.get("key", "")
-            h = ticket_hash(t)
+            h   = ticket_hash(t)
             if manifest.get(key, {}).get("hash") != h:
                 changed.append(t)
         if not changed:
@@ -343,12 +642,7 @@ def main():
         print(f"[Incremental] {len(changed)}/{len(candidates)} tickets changed")
         candidates = changed
 
-    # Steps 3-4: extract knowledge
-    #   Manifest is saved after each ticket so we can resume on quota exhaustion.
     client = R2RClient(R2R_URL)
-    useful_entries: list[dict] = []
-    not_useful = 0
-    duplicates = 0
 
     # Load existing summaries for merging
     existing_summaries: list[dict] = []
@@ -359,13 +653,11 @@ def main():
             existing_summaries = []
     existing_keys = {e["key"] for e in existing_summaries}
 
-    # Skip tickets already in manifest (resume support)
+    # Skip tickets already processed in a prior run (resume support)
     remaining: list[dict] = []
     for t in candidates:
         key = t.get("key", "")
-        if key and key in manifest and manifest[key].get("hash") == ticket_hash(t):
-            if not args.quiet:
-                print(f"  {key}: already processed, skipping")
+        if key and manifest.get(key, {}).get("hash") == ticket_hash(t):
             continue
         remaining.append(t)
 
@@ -373,19 +665,30 @@ def main():
         print("[Resume] All candidate tickets already processed.")
         return
 
-    print(f"\nExtracting knowledge from {len(remaining)} ticket(s)"
+    print(f"\nProcessing {len(remaining)} ticket(s)"
           f" ({len(candidates) - len(remaining)} already done)...")
 
+    useful_entries: list[dict] = []
+    not_useful = 0
+    duplicates = 0
+    lessons_written = 0
     quota_hit = False
+
     for i, t in enumerate(remaining, 1):
         key = t.get("key", "unknown")
-        context = build_ticket_context(t)
+
+        # Fetch MR context (best-effort)
+        mr_context = ""
+        if fetch_mrs:
+            mr_context = fetch_mr_context(t)
+
+        context = build_ticket_context(t, mr_context=mr_context)
+
         try:
             result = extract_knowledge(args.model, context, tracker=tracker)
         except Exception as e:
             if _is_quota_error(str(e).lower()):
-                print(f"\n⚠ Quota exhausted at ticket {key} "
-                      f"({i}/{len(remaining)})")
+                print(f"\n  Quota exhausted at ticket {key} ({i}/{len(remaining)})")
                 print(f"  Progress saved. Re-run to resume.")
                 quota_hit = True
                 break
@@ -395,26 +698,45 @@ def main():
             not_useful += 1
             if not args.quiet:
                 print(f"  [{i}/{len(remaining)}] {key}: not useful")
-            # Mark in manifest so we don't re-process
             manifest[key] = {"hash": ticket_hash(t), "doc_id": None}
         else:
-            # Step 5: dedup
+            # Dedup against existing KB
             if dedup_against_kb(client, result["summary"]):
                 duplicates += 1
                 if not args.quiet:
                     print(f"  [{i}/{len(remaining)}] {key}: duplicate (skipped)")
                 manifest[key] = {"hash": ticket_hash(t), "doc_id": None}
             else:
+                # Generate lesson if we have a solution from MR diff
+                lesson: Optional[str] = None
+                if result.get("solution"):
+                    try:
+                        lesson = generate_lesson(args.model, t, result,
+                                                 tracker=tracker)
+                    except Exception as e:
+                        if _is_quota_error(str(e).lower()):
+                            quota_hit = True
+                            break
+                        print(f"  [warn] Lesson generation error for {key}: {e}")
+
+                # Write lesson .md file
+                lesson_path: Optional[Path] = None
+                if lesson:
+                    lesson_path = save_lesson_file(t, result, lesson)
+                    lessons_written += 1
+
                 entry = {
-                    "key": key,
-                    "title": t.get("title", ""),
-                    "summary": result["summary"],
+                    "key":      key,
+                    "title":    t.get("title", ""),
+                    "summary":  result["summary"],
+                    "solution": result.get("solution", ""),
+                    "lesson":   lesson or "",
                     "category": result["category"],
                     "resolved": t.get("resolved", ""),
                 }
                 useful_entries.append(entry)
 
-                # Save to summaries file immediately
+                # Persist to summaries file after each ticket
                 if key not in existing_keys:
                     existing_summaries.append(entry)
                     existing_keys.add(key)
@@ -427,65 +749,61 @@ def main():
                     json.dumps(existing_summaries, indent=2))
 
                 if not args.quiet:
+                    lesson_tag = f" + lesson → {lesson_path.name}" if lesson_path else ""
                     print(f"  [{i}/{len(remaining)}] {key}: "
                           f"[{result['category']}] "
-                          f"{result['summary'][:80]}...")
+                          f"{result['summary'][:80]}...{lesson_tag}")
 
-                # Mark in manifest (no doc_id yet — indexing comes later)
                 manifest[key] = {
                     "hash": ticket_hash(t),
                     "doc_id": None,
                     "extracted": True,
                 }
 
-        # Save manifest after each ticket (resume support)
         save_manifest(manifest_path, manifest)
-        time.sleep(0.3)  # rate limit
+        time.sleep(0.3)
 
     print(f"\nExtraction: {len(useful_entries)} useful, "
-          f"{not_useful} not useful, {duplicates} duplicates")
+          f"{not_useful} not useful, {duplicates} duplicates, "
+          f"{lessons_written} lessons written")
 
-    if existing_summaries:
-        print(f"Saved {len(existing_summaries)} total summaries "
-              f"to {summaries_path}")
+    if lessons_written:
+        print(f"  Lessons saved to {LESSONS_DIR}/")
+        print(f"  Run: python -m doc_agent.doc_agent --docs {LESSONS_DIR} "
+              f"to index them into R2R")
 
-    # Step 6: index (skip entries already indexed in a prior run)
+    # Index to R2R
     to_index = [
         e for e in useful_entries
         if not manifest.get(e["key"], {}).get("doc_id")
     ]
     if to_index:
-        print(f"\nIndexing {len(to_index)} ticket summaries into R2R"
+        print(f"\nIndexing {len(to_index)} ticket entries into R2R"
               f" ({len(useful_entries) - len(to_index)} already indexed)...")
         indexed = index_ticket_summaries(to_index)
 
-        # Update manifest with doc_ids from indexing
         for entry in to_index:
-            key = entry["key"]
+            key    = entry["key"]
             doc_id = indexed.get(key)
             if doc_id is None:
                 continue
             orig = next((t for t in remaining if t.get("key") == key), {})
-            manifest[key] = {
-                "hash": ticket_hash(orig),
-                "doc_id": doc_id,
-            }
+            manifest[key] = {"hash": ticket_hash(orig), "doc_id": doc_id}
         save_manifest(manifest_path, manifest)
     else:
         print("\nNo new knowledge to index.")
 
-    # Token tracking
     if tracker.phases:
         print(f"\n{tracker.summary()}")
-        entry = tracker.to_log_entry(model=args.model, agent="ticket_agent")
+        log_entry = tracker.to_log_entry(model=args.model, agent="ticket_agent")
         with cost_log_path.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
+            f.write(json.dumps(log_entry) + "\n")
 
     if quota_hit:
         print(f"\n[Paused] {len(useful_entries)} entries extracted so far. "
               f"Re-run to continue from ticket {i}/{len(remaining)}.")
     else:
-        print(f"\n[Done] {len(useful_entries)} ticket knowledge entries indexed")
+        print(f"\n[Done] {len(useful_entries)} ticket entries indexed")
 
 
 if __name__ == "__main__":
