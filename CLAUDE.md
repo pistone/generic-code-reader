@@ -58,6 +58,69 @@ implementation details.
 
 ---
 
+## Prerequisites — What Each Tool Needs Before Running
+
+Use this section as a checklist before invoking any tool.
+
+### Always required (every tool)
+| Requirement | How to check | Fix |
+|---|---|---|
+| Python venv active | `which python` → `.venv/bin/python` | `source .venv/bin/activate` |
+| `.env` sourced | `echo $OPENAI_API_KEY` (or your provider) | `source .env` |
+| LLM API key set | `echo $LLM_MODEL` (default: `openai/gpt-4o`) | set key in `.env` |
+
+### R2R vector database (required by study_agent, doc_agent, ticket_agent, mcp_server)
+```bash
+curl -s http://localhost:7272/v3/health   # must return {"results":{"response":"ok"}}
+# If not running:
+cd r2r && docker compose up -d
+```
+
+### `indexer/study_agent.py` — codebase analysis
+- R2R running (indexes results at the end of Pass 2)
+- `--codebase /path/to/src` pointing to a readable directory
+- Recommended: GPT-4o or Claude Sonnet or better (weaker models rush Pass 1)
+
+### `doc_agent/doc_agent.py` — document ingestion
+- R2R running
+- `--docs /path/to/docs` pointing to a directory with `.md`, `.pdf`, `.txt`, etc.
+
+### `ticket_agent/fetch_tickets.py` — Jira ticket fetch
+- No R2R needed (writes plain JSON files only)
+- No LLM needed
+- Required env vars:
+  - `JIRA_URL` — e.g. `https://yourco.atlassian.net`
+  - `JIRA_EMAIL` — Atlassian account email that **owns** the API token (must match — wrong email = silent empty results)
+  - `JIRA_TOKEN` — API token from https://id.atlassian.com/manage-profile/security/api-tokens
+- Verify identity before a long run: `python -m ticket_agent.fetch_tickets --project PROJ --debug` prints the authenticated user
+
+### `ticket_agent/ticket_agent.py` — knowledge extraction from tickets
+- R2R running (indexes summaries and lessons at the end)
+- LLM API key set
+- Ticket JSON files on disk: run `fetch_tickets.py` first
+- Optional (for richer extractions):
+  - `GITHUB_TOKEN` — `read:repo` scope, for fetching PR diffs
+  - `GITLAB_TOKEN` + `GITLAB_URL` — for fetching MR diffs
+  - Without these, MR fetching is silently skipped; tickets still processed
+- Resumable: if interrupted, re-run the same command — already-processed tickets are skipped via hash manifest
+
+### `mcp_server/server.py` — MCP search server
+- R2R running with indexed content (run study_agent + doc_agent first)
+- No LLM needed at runtime (search is embedding-based)
+- Registered automatically via `.mcp.json` when opening Claude Code in this directory
+
+### `reviewer/reviewer_agent.py` — suggestion reviewer
+- R2R running
+- LLM API key set
+- Runs continuously; triggered by `suggest_index_item()` calls from the MCP server
+
+### Quick environment sanity check
+```bash
+python preflight.py    # checks R2R health, LLM connectivity, embeddings in one shot
+```
+
+---
+
 ## Key Design Decisions
 
 ### 1. LLM-generated summaries, not raw chunks
