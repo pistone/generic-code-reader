@@ -388,14 +388,33 @@ def main():
     client = JiraClient(JIRA_URL, JIRA_EMAIL, JIRA_TOKEN)
 
     if args.debug and args.project:
-        # Probe: bare project query with no field restrictions to verify auth + endpoint
         probe_jql = f"project = {args.project[0]}"
-        print(f"[DEBUG] Probe: sending minimal JQL with no fields: {probe_jql!r}")
-        probe = client.search(probe_jql, debug=True)
-        probe_count = len(probe.get("issues", []))
-        probe_total = probe.get("total", "<absent>")
-        print(f"[DEBUG] Probe result: {probe_count} issue(s) returned, total={probe_total}")
-        print(f"[DEBUG] If probe returned issues but main query did not, the status/date filter is the culprit.")
+
+        # Probe A: search/jql endpoint (current), no fields restriction
+        print(f"[DEBUG] Probe A — search/jql, bare JQL: {probe_jql!r}")
+        probe_a = client.search(probe_jql, debug=True)
+        count_a = len(probe_a.get("issues", []))
+        print(f"[DEBUG] Probe A result: {count_a} issue(s), total={probe_a.get('total','<absent>')}")
+        print()
+
+        # Probe B: classic search endpoint, same bare JQL
+        print(f"[DEBUG] Probe B — classic /search endpoint, bare JQL: {probe_jql!r}")
+        try:
+            probe_b = client._get("search", {"jql": probe_jql, "maxResults": 5}, debug=True)
+            count_b = len(probe_b.get("issues", []))
+            print(f"[DEBUG] Probe B result: {count_b} issue(s), total={probe_b.get('total','<absent>')}")
+        except RuntimeError as e:
+            print(f"[DEBUG] Probe B error: {e}")
+        print()
+
+        # Probe C: search/jql with ONLY project filter (no status, no date, no fields)
+        print(f"[DEBUG] Probe C — search/jql, no status/date filter, no fields param")
+        try:
+            probe_c = client._get("search/jql", {"jql": probe_jql, "maxResults": 5}, debug=True)
+            count_c = len(probe_c.get("issues", []))
+            print(f"[DEBUG] Probe C result: {count_c} issue(s), total={probe_c.get('total','<absent>')}")
+        except RuntimeError as e:
+            print(f"[DEBUG] Probe C error: {e}")
         print()
 
     # Build JQL: explicit --jql wins; --project uses default template; bare default
