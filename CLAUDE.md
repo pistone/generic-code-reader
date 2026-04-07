@@ -98,10 +98,11 @@ cd r2r && docker compose up -d
 - R2R running (indexes summaries and lessons at the end)
 - LLM API key set
 - Ticket JSON files on disk: run `fetch_tickets.py` first
-- Optional (for richer extractions):
-  - `GITHUB_TOKEN` — `read:repo` scope, for fetching PR diffs
-  - `GITLAB_TOKEN` + `GITLAB_URL` — for fetching MR diffs
-  - Without these, MR fetching is silently skipped; tickets still processed
+- MR/PR token — **required** (MR diffs are the primary source of solution context):
+  - `GITHUB_TOKEN` — `read:repo` scope, for GitHub PRs
+  - `GITLAB_TOKEN` + `GITLAB_URL` — for GitLab MRs (default URL: https://gitlab.com)
+  - At least one must be set or the agent exits with an error
+  - Use `--no-mr` only if tokens are genuinely unavailable or tickets have no linked MRs
 - Resumable: if interrupted, re-run the same command — already-processed tickets are skipped via hash manifest
 
 ### `mcp_server/server.py` — MCP search server

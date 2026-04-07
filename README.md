@@ -51,12 +51,14 @@ The tool reads environment variables from your shell — if they're already set 
 | `R2R_URL` | No | `http://localhost:7272` |
 | `VOYAGE_API_KEY` | No | — (for R2R embeddings) |
 | `KB_SEARCH_LIMIT` | No | `5` (MCP server results per search) |
-| `GITHUB_TOKEN` | No | — (ticket agent: fetch PR diffs, needs `read:repo`) |
-| `GITLAB_TOKEN` | No | — (ticket agent: fetch MR diffs) |
+| `GITHUB_TOKEN` | ticket_agent* | — (fetch PR diffs, needs `read:repo` scope) |
+| `GITLAB_TOKEN` | ticket_agent* | — (fetch MR diffs) |
 | `GITLAB_URL` | No | `https://gitlab.com` (ticket agent: self-hosted GitLab) |
 | `JIRA_URL` | No | — (fetch_tickets: e.g. `https://yourco.atlassian.net`) |
 | `JIRA_EMAIL` | No | — (fetch_tickets: Atlassian account email) |
 | `JIRA_TOKEN` | No | — (fetch_tickets: API token from id.atlassian.com) |
+
+\* `ticket_agent`: at least one of `GITHUB_TOKEN` / `GITLAB_TOKEN` is required — MR diffs are the primary source of solution context. Use `--no-mr` only if tokens are unavailable.
 
 ## Setup
 

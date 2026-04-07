@@ -585,7 +585,9 @@ def main():
                              "(e.g. '^ABC-' to restrict to the ABC project, "
                              "'^(ABC|DEF)-' for two teams). Applied before other filters.")
     parser.add_argument("--no-mr", action="store_true",
-                        help="Disable MR/PR fetching (skips GITHUB_TOKEN / GITLAB_TOKEN lookups)")
+                        help="Disable MR/PR fetching (not recommended — MR diffs are the "
+                             "primary source of solution context; only use if tokens are "
+                             "unavailable or tickets have no linked MRs)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-item progress, show only summaries")
     args = parser.parse_args()
@@ -629,8 +631,10 @@ def main():
 
     fetch_mrs = not args.no_mr
     if fetch_mrs and not GITHUB_TOKEN and not GITLAB_TOKEN:
-        print("  [info] No GITHUB_TOKEN or GITLAB_TOKEN set — MR fetching disabled")
-        fetch_mrs = False
+        print("Error: MR/PR fetching is enabled but neither GITHUB_TOKEN nor GITLAB_TOKEN is set.")
+        print("  Set the appropriate token in your .env file, or pass --no-mr to skip MR fetching")
+        print("  (not recommended — MR diffs are the primary source of solution context).")
+        sys.exit(1)
 
     tracker  = TokenTracker()
     manifest = load_manifest(manifest_path)
