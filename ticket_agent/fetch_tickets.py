@@ -387,6 +387,17 @@ def main():
 
     client = JiraClient(JIRA_URL, JIRA_EMAIL, JIRA_TOKEN)
 
+    if args.debug and args.project:
+        # Probe: bare project query with no field restrictions to verify auth + endpoint
+        probe_jql = f"project = {args.project[0]}"
+        print(f"[DEBUG] Probe: sending minimal JQL with no fields: {probe_jql!r}")
+        probe = client.search(probe_jql, debug=True)
+        probe_count = len(probe.get("issues", []))
+        probe_total = probe.get("total", "<absent>")
+        print(f"[DEBUG] Probe result: {probe_count} issue(s) returned, total={probe_total}")
+        print(f"[DEBUG] If probe returned issues but main query did not, the status/date filter is the culprit.")
+        print()
+
     # Build JQL: explicit --jql wins; --project uses default template; bare default
     if args.jql:
         jql = args.jql
@@ -411,6 +422,8 @@ def main():
 
     print(f"Fetching from {JIRA_URL}")
     print(f"JQL: {jql}")
+    if args.debug:
+        print(f"[DEBUG] JQL repr (shows exact quoting): {jql!r}")
     print(f"Output: {TICKETS_DIR}\n")
 
     fetched, updated, newest_updated = fetch_tickets(client, jql, quiet=args.quiet,
