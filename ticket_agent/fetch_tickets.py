@@ -390,6 +390,17 @@ def main():
     if args.debug and args.project:
         probe_jql = f"project = {args.project[0]}"
 
+        # Identity check: who does this token authenticate as?
+        print(f"[DEBUG] Identity check — GET /rest/api/3/myself")
+        try:
+            me = client._get("myself")
+            print(f"[DEBUG]   accountId:    {me.get('accountId', '?')}")
+            print(f"[DEBUG]   displayName:  {me.get('displayName', '?')}")
+            print(f"[DEBUG]   emailAddress: {me.get('emailAddress', '?')}")
+        except RuntimeError as e:
+            print(f"[DEBUG]   ERROR: {e}")
+        print()
+
         # Probe A: search/jql endpoint (current), no fields restriction
         print(f"[DEBUG] Probe A — search/jql, bare JQL: {probe_jql!r}")
         probe_a = client.search(probe_jql, debug=True)
