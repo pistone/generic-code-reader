@@ -85,14 +85,21 @@ def load_tickets(tickets_dir: Path) -> list[dict]:
 # Step 2: Structural filter
 # ---------------------------------------------------------------------------
 
-def structural_filter(tickets: list[dict]) -> list[dict]:
-    """Filter to tickets likely to contain reusable knowledge."""
+def structural_filter(tickets: list[dict],
+                      key_pattern: Optional[re.Pattern] = None) -> list[dict]:
+    """Filter to tickets likely to contain reusable knowledge.
+
+    key_pattern: if set, only tickets whose key matches are kept.
+    """
     passed: list[dict] = []
     for t in tickets:
+        key        = t.get("key") or ""
         status     = (t.get("status") or "").lower().strip()
         resolution = (t.get("resolution") or "").lower().strip()
         comments   = t.get("comments") or []
 
+        if key_pattern and not key_pattern.search(key):
+            continue
         if status and status not in RESOLVED_STATUSES:
             continue
         if resolution in REJECT_RESOLUTIONS:
@@ -573,6 +580,10 @@ def main():
                         help="Only process tickets changed since last run")
     parser.add_argument("--reindex", action="store_true",
                         help="Skip extraction; re-index from saved ticket_summaries.json")
+    parser.add_argument("--key-pattern", default=None, metavar="REGEX",
+                        help="Only process tickets whose key matches this regex "
+                             "(e.g. '^ABC-' to restrict to the ABC project, "
+                             "'^(ABC|DEF)-' for two teams). Applied before other filters.")
     parser.add_argument("--no-mr", action="store_true",
                         help="Disable MR/PR fetching (skips GITHUB_TOKEN / GITLAB_TOKEN lookups)")
     parser.add_argument("--quiet", action="store_true",
@@ -607,6 +618,15 @@ def main():
         print(f"Error: '{tickets_dir}' is not a directory")
         sys.exit(1)
 
+    # Compile key pattern once (fail early on bad regex)
+    key_pattern: Optional[re.Pattern] = None
+    if args.key_pattern:
+        try:
+            key_pattern = re.compile(args.key_pattern, re.IGNORECASE)
+        except re.error as e:
+            print(f"Error: invalid --key-pattern regex '{args.key_pattern}': {e}")
+            sys.exit(1)
+
     fetch_mrs = not args.no_mr
     if fetch_mrs and not GITHUB_TOKEN and not GITLAB_TOKEN:
         print("  [info] No GITHUB_TOKEN or GITLAB_TOKEN set — MR fetching disabled")
@@ -621,9 +641,11 @@ def main():
     if not all_tickets:
         return
 
-    # Step 2: structural filter
-    candidates = structural_filter(all_tickets)
-    print(f"Structural filter: {len(candidates)}/{len(all_tickets)} passed")
+    # Step 2: structural filter (includes optional key-pattern check)
+    candidates = structural_filter(all_tickets, key_pattern=key_pattern)
+    filter_desc = f"key=/{args.key_pattern}/, " if key_pattern else ""
+    print(f"Structural filter ({filter_desc}resolved, ≥2 comments): "
+          f"{len(candidates)}/{len(all_tickets)} passed")
     if not candidates:
         print("No tickets passed the structural filter.")
         return

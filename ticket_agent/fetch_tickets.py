@@ -305,11 +305,14 @@ DEFAULT_SINCE = "-365d"   # fetch tickets updated within the past year by defaul
 DEFAULT_STATUS_FILTER = 'status in (Done, Closed, Resolved, Fixed)'
 
 
-def _build_default_jql(project: Optional[str], since: str) -> str:
+def _build_default_jql(projects: list[str], since: str) -> str:
     """Build a sensible default JQL when the user hasn't supplied one."""
     parts = [DEFAULT_STATUS_FILTER, f'updated >= "{since}"']
-    if project:
-        parts.insert(0, f"project = {project}")
+    if len(projects) == 1:
+        parts.insert(0, f"project = {projects[0]}")
+    elif len(projects) > 1:
+        keys = ", ".join(projects)
+        parts.insert(0, f"project in ({keys})")
     return " AND ".join(parts)
 
 
@@ -327,9 +330,9 @@ def main():
     jql_group.add_argument("--jql",
                            help="Full JQL query. If omitted, fetches resolved tickets "
                                 f"updated in the past year (use --since to adjust).")
-    jql_group.add_argument("--project",
-                           help="Jira project key (e.g. PROJ). Shorthand for a default "
-                                "JQL that fetches resolved tickets from that project.")
+    jql_group.add_argument("--project", nargs="+", metavar="KEY",
+                           help="One or more Jira project keys (e.g. --project ABC DEF). "
+                                "Shorthand for a default JQL scoped to those projects.")
     parser.add_argument("--since", default=DEFAULT_SINCE, metavar="PERIOD",
                         help=f"How far back to look when using the default JQL "
                              f"(Jira relative date, e.g. -365d, -90d, -1y). "
@@ -363,7 +366,7 @@ def main():
     if args.jql:
         jql = args.jql
     else:
-        jql = _build_default_jql(project=args.project, since=args.since)
+        jql = _build_default_jql(projects=args.project or [], since=args.since)
         print(f"[Default JQL] {jql}")
 
     # Incremental: inject updated filter
