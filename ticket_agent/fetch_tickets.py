@@ -5,7 +5,12 @@ Each ticket is saved as ticket_agent/tickets/<KEY>.json — one file per ticket,
 human-readable, browsable, and editable. Re-runs only fetch tickets updated
 since the last fetch (incremental via last_fetch.json watermark).
 
+By default fetches resolved tickets updated in the past year. Override with
+--project, --since, or a full --jql expression.
+
 The persisted tickets are the input to ticket_agent.py:
+    python -m ticket_agent.fetch_tickets --project PROJ
+    python -m ticket_agent.fetch_tickets --project PROJ --since -90d
     python -m ticket_agent.fetch_tickets --jql "project = PROJ AND status = Done"
     python -m ticket_agent.ticket_agent --tickets ticket_agent/tickets/
 
@@ -296,7 +301,21 @@ def fetch_tickets(client: JiraClient, jql: str,
 # Main
 # ---------------------------------------------------------------------------
 
+DEFAULT_SINCE = "-365d"   # fetch tickets updated within the past year by default
+DEFAULT_STATUS_FILTER = 'status in (Done, Closed, Resolved, Fixed)'
+
+
+def _build_default_jql(project: Optional[str], since: str) -> str:
+    """Build a sensible default JQL when the user hasn't supplied one."""
+    parts = [DEFAULT_STATUS_FILTER, f'updated >= "{since}"']
+    if project:
+        parts.insert(0, f"project = {project}")
+    return " AND ".join(parts)
+
+
 def main():
+    global TICKETS_DIR, WATERMARK_PATH  # may be overridden by --output
+
     parser = argparse.ArgumentParser(
         description=(
             "Fetch Jira tickets and save as individual JSON files in "
@@ -304,8 +323,17 @@ def main():
             "and editable. Feed the directory to ticket_agent.py."
         ),
     )
-    parser.add_argument("--jql", required=True,
-                        help="JQL query, e.g. \"project = PROJ AND status = Done AND updated >= -90d\"")
+    jql_group = parser.add_mutually_exclusive_group()
+    jql_group.add_argument("--jql",
+                           help="Full JQL query. If omitted, fetches resolved tickets "
+                                f"updated in the past year (use --since to adjust).")
+    jql_group.add_argument("--project",
+                           help="Jira project key (e.g. PROJ). Shorthand for a default "
+                                "JQL that fetches resolved tickets from that project.")
+    parser.add_argument("--since", default=DEFAULT_SINCE, metavar="PERIOD",
+                        help=f"How far back to look when using the default JQL "
+                             f"(Jira relative date, e.g. -365d, -90d, -1y). "
+                             f"Ignored if --jql is supplied. Default: {DEFAULT_SINCE}")
     parser.add_argument("--output", default=None,
                         help=f"Directory to write tickets (default: {TICKETS_DIR})")
     parser.add_argument("--incremental", action="store_true",
@@ -325,15 +353,20 @@ def main():
         sys.exit(1)
 
     # Override output dir if specified
-    global TICKETS_DIR, WATERMARK_PATH
     if args.output:
         TICKETS_DIR    = Path(args.output).resolve()
         WATERMARK_PATH = TICKETS_DIR / "last_fetch.json"
 
     client = JiraClient(JIRA_URL, JIRA_EMAIL, JIRA_TOKEN)
 
+    # Build JQL: explicit --jql wins; --project uses default template; bare default
+    if args.jql:
+        jql = args.jql
+    else:
+        jql = _build_default_jql(project=args.project, since=args.since)
+        print(f"[Default JQL] {jql}")
+
     # Incremental: inject updated filter
-    jql = args.jql
     if args.incremental:
         watermark = load_watermark()
         if watermark:
