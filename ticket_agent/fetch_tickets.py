@@ -330,7 +330,7 @@ DEFAULT_STATUS_FILTER = 'status in (Done, Closed, Resolved, Fixed, Verified)'
 
 def _build_default_jql(projects: list[str], since: str) -> str:
     """Build a sensible default JQL when the user hasn't supplied one."""
-    parts = [DEFAULT_STATUS_FILTER, f'updated >= "{since}"']
+    parts = [DEFAULT_STATUS_FILTER, f'updated >= {since}']
     if len(projects) == 1:
         parts.insert(0, f"project = {projects[0]}")
     elif len(projects) > 1:
