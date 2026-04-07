@@ -69,11 +69,10 @@ class JiraClient:
             body = e.read().decode(errors="replace")[:500]
             raise RuntimeError(f"Jira API {e.code} for {url}: {body}") from e
 
-    def search(self, jql: str, start_at: int = 0,
+    def search(self, jql: str, next_page_token: Optional[str] = None,
                max_results: int = PAGE_SIZE) -> dict:
-        return self._get("search/jql", {
+        params: dict = {
             "jql":        jql,
-            "startAt":    start_at,
             "maxResults": max_results,
             "fields":     ",".join([
                 "summary", "description", "status", "resolution",
@@ -81,10 +80,11 @@ class JiraClient:
                 "created", "updated", "resolutiondate",
                 "comment", "issuelinks", "fixVersions",
                 "components", "issuetype", "parent",
-                "customfield_10014",   # Epic Link (common)
-                "customfield_10016",   # Story Points (common)
             ]),
-        })
+        }
+        if next_page_token:
+            params["nextPageToken"] = next_page_token
+        return self._get("search/jql", params)
 
     def get_issue(self, key: str) -> dict:
         return self._get(f"issue/{key}")
@@ -222,34 +222,39 @@ def save_watermark(timestamp: str) -> None:
 # ---------------------------------------------------------------------------
 
 def fetch_tickets(client: JiraClient, jql: str,
-                  quiet: bool = False) -> tuple[int, int]:
+                  quiet: bool = False) -> tuple[int, int, Optional[str]]:
     """Fetch all tickets matching jql, write each to TICKETS_DIR/<KEY>.json.
 
-    Returns (fetched_count, updated_count).
+    Uses the search/jql cursor-based pagination API (nextPageToken).
+    Returns (fetched_count, updated_count, newest_updated_timestamp).
     updated_count counts files that were written (new or changed).
     """
     TICKETS_DIR.mkdir(exist_ok=True)
 
-    total    = None
-    start_at = 0
-    fetched  = 0
-    updated  = 0
+    next_page_token: Optional[str] = None
+    first_page      = True
+    fetched         = 0
+    updated         = 0
     newest_updated: Optional[str] = None
 
-    while total is None or start_at < total:
+    while True:
         try:
-            page = client.search(jql, start_at=start_at)
+            page = client.search(jql, next_page_token=next_page_token)
         except RuntimeError as e:
             print(f"  [error] {e}")
             break
 
-        if total is None:
-            total = page.get("total", 0)
-            print(f"  {total} ticket(s) match the query")
-            if total == 0:
-                break
-
         issues = page.get("issues", [])
+
+        if first_page:
+            # total is advisory — not always present in search/jql responses
+            total = page.get("total")
+            if total is not None:
+                print(f"  {total} ticket(s) match the query")
+            else:
+                print(f"  Fetching tickets (total unknown until last page)...")
+            first_page = False
+
         if not issues:
             break
 
@@ -267,9 +272,7 @@ def fetch_tickets(client: JiraClient, jql: str,
             new_text = json.dumps(ticket, indent=2, ensure_ascii=False)
             if path.exists():
                 try:
-                    old_text = path.read_text(encoding="utf-8")
-                    # Compare without _fetched_at (changes every run)
-                    old_data = json.loads(old_text)
+                    old_data = json.loads(path.read_text(encoding="utf-8"))
                     new_data = json.loads(new_text)
                     old_data.pop("_fetched_at", None)
                     new_data.pop("_fetched_at", None)
@@ -290,9 +293,12 @@ def fetch_tickets(client: JiraClient, jql: str,
                       f"status={ticket['status']}, "
                       f"resolution={ticket['resolution'] or '—'})")
 
-        start_at += len(issues)
-        if start_at < total:
-            time.sleep(0.3)   # be polite to the Jira API
+        # Advance cursor; absence of nextPageToken means we're on the last page
+        next_page_token = page.get("nextPageToken")
+        if not next_page_token:
+            break
+
+        time.sleep(0.3)   # be polite to the Jira API
 
     return fetched, updated, newest_updated
 
