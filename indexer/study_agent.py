@@ -2539,15 +2539,20 @@ Output JSON only:
         print(f"  [Pass 1 review] Error: {e}")
         llm_issues, overall = [], "Review failed — skipping."
 
-    # Merge: auto-flagged errors first, then LLM issues (skip LLM too_large for
-    # auto-flagged modules since we already have the deterministic flag — keep
-    # the LLM entry only if it adds a split plan).
+    # Severity enforcement: only too_large and orphaned_files can be errors.
+    # bad_split and poor_questions are always warns — they don't justify a re-run.
+    WARN_ONLY_TYPES = {"bad_split", "poor_questions"}
+
+    # Merge: auto-flagged errors first, then LLM issues.
+    # For auto-flagged modules, replace the terse description with the LLM's split plan.
     merged: list[dict] = list(auto_flagged_issues)
     auto_flagged_in_llm: dict[str, dict] = {}
     for issue in llm_issues:
+        itype = issue.get("issue_type", "")
+        if itype in WARN_ONLY_TYPES:
+            issue = {**issue, "severity": "warn"}
         mod = issue.get("module", "")
-        if mod in auto_flagged_names and issue.get("issue_type") == "too_large":
-            # Replace the terse auto-flag description with the LLM's split plan
+        if mod in auto_flagged_names and itype == "too_large":
             auto_flagged_in_llm[mod] = issue
         else:
             merged.append(issue)
@@ -4231,6 +4236,10 @@ def main():
                              "Produces module_map.json. If module_map.json already has "
                              "review errors, runs a focused refinement round instead. "
                              "Run --summarize next.")
+    parser.add_argument("--merge", action="store_true",
+                        help="Merge newly discovered modules into an existing module_map.json "
+                             "instead of replacing it. Use with --discover when pointing at a "
+                             "subdirectory to add modules for that area without disturbing the rest.")
     parser.add_argument("--summarize", action="store_true",
                         help="Only run summarization (Pass 2). Skips module discovery. "
                              "Requires an existing module_map.json from a previous --discover run.")
@@ -4586,6 +4595,20 @@ def main():
 
             module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
                                    tracker=tracker, codebases=codebases)
+
+        if args.merge and module_map_path.exists():
+            try:
+                existing = ModuleMap(**json.loads(module_map_path.read_text()))
+                existing_names = {m.name for m in existing.modules}
+                added = [m for m in module_map.modules if m.name not in existing_names]
+                existing.modules.extend(added)
+                # Clear review issues — map changed, needs fresh review
+                existing.review_issues = []
+                module_map = existing
+                print(f"\n[Pass 1] Merged {len(added)} new module(s) into existing map "
+                      f"({len(module_map.modules)} total). Run --review to re-check.")
+            except Exception as _e:
+                print(f"  [warn] Could not load existing module_map for merge ({_e}) — overwriting")
 
         module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
         print(f"\n[Pass 1] Written to {module_map_path}")
