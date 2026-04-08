@@ -94,12 +94,39 @@ cd r2r && docker compose up -d
   - `JIRA_TOKEN` — API token from https://id.atlassian.com/manage-profile/security/api-tokens
 - Verify identity before a long run: `python -m ticket_agent.fetch_tickets --project PROJ --debug` prints the authenticated user
 
-### `ticket_agent/ticket_agent.py` — knowledge extraction from tickets
+### Ticket pipeline — run ALL three steps in order
+
+The ticket workflow is a mandatory three-step pipeline. Skipping any step
+leaves knowledge out of the KB:
+
+```
+Step 1: fetch_tickets  →  Step 2: ticket_agent  →  Step 3: doc_agent on lessons
+```
+
+```bash
+# Step 1: Fetch tickets from Jira → ticket_agent/tickets/*.json
+python -m ticket_agent.fetch_tickets --project PROJ
+
+# Step 2: Extract knowledge + generate lessons → indexes ticket summaries into R2R
+#         Also writes how-to lesson .md files to ticket_agent/lessons/
+python -m ticket_agent.ticket_agent --tickets ticket_agent/tickets/
+
+# Step 3: REQUIRED — index the generated lessons into R2R as rich searchable documents
+#         Without this step, how-to recipes from tickets are NOT in the knowledge base.
+python -m doc_agent.doc_agent --docs ticket_agent/lessons
+```
+
+**Why Step 3 is required**: `ticket_agent` writes lesson text to `ticket_agent/lessons/*.md`
+and indexes a plain-text copy into R2R. `doc_agent` re-indexes those same lessons with
+richer chunking and classification, making them properly searchable as how-to guides.
+Skipping Step 3 means lessons exist as files but are not fully indexed.
+
+#### `ticket_agent/ticket_agent.py` prerequisites
 - R2R running — required for indexing. If R2R is unreachable the agent warns
   and asks to confirm before proceeding; extraction results are always saved to
   `ticket_summaries.json` so `--reindex` can recover once R2R is up.
 - LLM API key set
-- Ticket JSON files on disk: run `fetch_tickets.py` first
+- Ticket JSON files on disk: run `fetch_tickets.py` first (Step 1)
 - MR/PR token — **required** (MR diffs are the primary source of solution context):
   - `GITHUB_TOKEN` — `read:repo` scope, for GitHub PRs
   - `GITLAB_TOKEN` + `GITLAB_URL` — for GitLab MRs (default URL: https://gitlab.com)
