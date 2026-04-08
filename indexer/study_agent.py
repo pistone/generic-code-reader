@@ -2359,41 +2359,87 @@ def review_module_map(
     total_files: int,
     tracker: Optional[TokenTracker] = None,
 ) -> tuple[list[dict], str]:
-    """Thorough LLM review of the module map quality.
+    """Thorough review of the module map quality.
+
+    Phase 1 (deterministic): auto-flag modules that exceed hard size thresholds.
+    Phase 2 (LLM): ask for split plans on auto-flagged modules + quality review
+                   on everything else (bad_split, poor_questions, orphaned_files).
 
     Returns (issues, overall_comment).
     issues: list of {"module", "issue_type", "description", "severity"}
       severity: "error" → re-run with --discover to fix
                 "warn"  → advisory, noted but not blocking
-
-    issue_type values:
-      too_large      — module is a bag of unrelated things that should be split
-      bad_split      — module mixes dirs/files with unrelated purposes
-      poor_questions — questions are generic instead of domain-specific
-      orphaned_files — "other" module contains files that clearly belong elsewhere
-                       or form a coherent new module
     """
     import collections
 
-    lines = []
+    LARGE_DIR_THRESHOLD  = 3      # dirs: ≥ this → auto-flagged
+    LARGE_PCT_THRESHOLD  = 25.0   # % of total files: > this → auto-flagged
+    LARGE_FILE_THRESHOLD = 60     # absolute file count: > this → auto-flagged
+
+    _OTHER_NAMES = {"other", "miscellaneous", "misc", "unknown"}
+
+    # ── Build per-module metadata ─────────────────────────────────────────────
+    module_meta: list[dict] = []
     for m in module_map.modules:
         pct = len(m.files) / total_files * 100 if total_files else 0
-        is_other = m.name.lower() in ("other", "miscellaneous", "misc", "unknown")
+        is_other = m.name.lower() in _OTHER_NAMES
+        n_dirs = len(m.dir_paths)
 
-        # Per-directory file breakdown within this module
         dir_counts: dict[str, list[str]] = collections.defaultdict(list)
         for f in m.files:
             top = f.split("/")[0] if "/" in f else "(root)"
             dir_counts[top].append(f)
+
+        auto_large = (not is_other) and (
+            n_dirs >= LARGE_DIR_THRESHOLD
+            or pct > LARGE_PCT_THRESHOLD
+            or len(m.files) > LARGE_FILE_THRESHOLD
+        )
+        module_meta.append(dict(
+            m=m, pct=pct, is_other=is_other, n_dirs=n_dirs,
+            dir_counts=dir_counts, auto_large=auto_large,
+        ))
+
+    # ── Phase 1: deterministic size flags ────────────────────────────────────
+    auto_flagged_issues: list[dict] = []
+    auto_flagged_names: set[str] = set()
+    for meta in module_meta:
+        if not meta["auto_large"]:
+            continue
+        m = meta["m"]
+        reasons = []
+        if meta["n_dirs"] >= LARGE_DIR_THRESHOLD:
+            reasons.append(f"{meta['n_dirs']} dirs assigned")
+        if meta["pct"] > LARGE_PCT_THRESHOLD:
+            reasons.append(f"{meta['pct']:.0f}% of codebase")
+        if len(m.files) > LARGE_FILE_THRESHOLD:
+            reasons.append(f"{len(m.files)} files")
+        auto_flagged_issues.append({
+            "module": m.name,
+            "issue_type": "too_large",
+            "description": f"AUTO-FLAGGED ({', '.join(reasons)}). "
+                           f"Dirs: {', '.join(sorted(m.dir_paths))}. "
+                           f"Split plan required — see LLM analysis below.",
+            "severity": "error",
+        })
+        auto_flagged_names.add(m.name)
+
+    if auto_flagged_names:
+        print(f"  [Review] Auto-flagged as too_large: {', '.join(sorted(auto_flagged_names))}")
+
+    # ── Build prompt lines ────────────────────────────────────────────────────
+    lines = []
+    for meta in module_meta:
+        m, pct, is_other = meta["m"], meta["pct"], meta["is_other"]
+        n_dirs, dir_counts = meta["n_dirs"], meta["dir_counts"]
+
         dir_summary = "; ".join(
             f"{d}/: {len(fs)} files" for d, fs in sorted(dir_counts.items())
         )
 
-        # Show more files for large/other modules; all files for small modules
         if is_other or len(m.files) <= 40:
-            file_list = m.files  # show everything
+            file_list = m.files
         else:
-            # sample evenly across directories
             sample: list[str] = []
             per_dir = max(3, 30 // max(len(dir_counts), 1))
             for fs in dir_counts.values():
@@ -2404,97 +2450,70 @@ def review_module_map(
         if len(m.files) > len(file_list):
             file_display += f" … (+{len(m.files) - len(file_list)} more)"
 
-        n_dirs = len(m.dir_paths)
-        size_flag = ""
+        tag = ""
         if is_other:
-            size_flag = " ← CATCH-ALL"
-        elif n_dirs >= 3 or pct > 25:
-            size_flag = f" ← LARGE ({n_dirs} dirs, {pct:.0f}% of codebase) — scrutinise"
+            tag = " ← CATCH-ALL"
+        elif meta["auto_large"]:
+            tag = f" ← AUTO-FLAGGED TOO LARGE ({n_dirs} dirs, {pct:.0f}%)"
 
         lines.append(
-            f"Module: {m.name} ({len(m.files)} files, {pct:.0f}% of codebase, {n_dirs} dir(s))"
-            + size_flag + "\n"
-            f"  Dirs assigned: {', '.join(sorted(m.dir_paths)) or '(unknown)'}\n"
-            f"  Internal breakdown: {dir_summary}\n"
+            f"Module: {m.name} ({len(m.files)} files, {pct:.0f}%, {n_dirs} dir(s)){tag}\n"
+            f"  Dirs: {', '.join(sorted(m.dir_paths)) or '(unknown)'}\n"
+            f"  Breakdown: {dir_summary}\n"
             f"  Files: {file_display}\n"
             f"  Questions: {'; '.join(m.questions)}"
         )
 
     all_module_names = [m.name for m in module_map.modules
-                        if m.name.lower() not in ("other", "miscellaneous", "misc", "unknown")]
+                        if m.name.lower() not in _OTHER_NAMES]
+
+    split_section = ""
+    if auto_flagged_names:
+        split_section = f"""
+{"=" * 60}
+REQUIRED: SPLIT PLANS FOR AUTO-FLAGGED MODULES
+{"=" * 60}
+
+The following modules were automatically flagged as too large by hard thresholds
+and WILL be marked as errors regardless of your assessment:
+  {", ".join(sorted(auto_flagged_names))}
+
+For each auto-flagged module you MUST provide a split plan in the issues list:
+- Name each proposed new module
+- List exactly which dirs go into each new module
+- One-line description of each new module's responsibility
+- Which dirs (if any) stay in the original module
+
+Do not argue against the split. Provide the best split you can based on the
+directory names and file samples shown.
+"""
 
     prompt = f"""\
 Project: {module_map.project}
 Description: {module_map.description}
-Total source files: {total_files}
-Modules defined: {len(module_map.modules)}
+Total source files: {total_files}  Modules: {len(module_map.modules)}
 
 {"=" * 60}
 MODULE MAP
 {"=" * 60}
 
 {chr(10).join(lines)}
-
+{split_section}
 {"=" * 60}
-REVIEW INSTRUCTIONS
+REVIEW TASKS (beyond auto-flagged modules)
 {"=" * 60}
 
-Analyse this module map carefully. Be thorough and be tough — this is the foundation
-of the entire knowledge base. Every bloated module you let through will make the
-knowledge base useless for that area of the codebase. When in doubt, flag it.
+1. BAD_SPLIT — module mixes dirs with clearly unrelated purposes.
+   Name the dirs that should separate and suggest destination modules.
 
-The most common failure is too few modules — the LLM that built this map tends
-to lump things together. Your job is to catch that and demand splits.
+2. POOR_QUESTIONS — generic phrasing ("What does X do?") instead of domain-specific
+   investigative questions. Rewrite 2-3 concrete improved examples in your description.
 
-Check each module for:
+3. ORPHANED_FILES — for the catch-all "other" module only.
+   For each coherent file group: name the existing or new module it belongs to.
+   Flag as "error".
 
-1. TOO_LARGE / needs splitting
-   This is the most critical check. Be aggressive. A bloated module is the
-   single biggest failure mode — it makes the knowledge base useless for that area.
-
-   Hard rules (flag as error automatically):
-   - Module owns 3 or more distinct directories → almost always splittable. Prove
-     it isn't before letting it pass.
-   - Module covers >25% of all files → must justify why it is truly one coherent thing.
-   - Module has >50 files → scrutinise carefully.
-
-   Soft rule: even a small module with 2 dirs of clearly different concerns should
-   be flagged (e.g. "src/auth" + "src/billing" in one module is wrong regardless of size).
-
-   When you flag too_large, your description MUST include:
-   - The specific directories that should split off
-   - The proposed name and one-line description for each new module
-   - Which remaining dirs stay in the original module
-   Example: "Split into: 'parser' (src/parser, src/grammar — AST construction),
-   'runtime' (src/vm, src/gc — execution and memory), keeping 'compiler' for
-   src/codegen only."
-
-   Do NOT give a pass to a large module just because its files are related at a
-   high level ("they're all backend code"). Subsystem separation is what matters.
-
-2. BAD_SPLIT / wrong grouping
-   Flag if: files from two dirs have nothing in common (e.g. UI templates and
-   database migration scripts lumped together). The dirs should be in different modules.
-
-3. POOR_QUESTIONS
-   Flag if: questions are generic ("What does X do?", "How is Y used?") instead of
-   domain-specific and investigative. Good questions name specific algorithms,
-   data formats, protocols, or failure modes relevant to that module's concerns.
-   In your description: rewrite 2-3 of the worst questions as concrete examples.
-
-4. ORPHANED_FILES (only for the "other"/"miscellaneous" catch-all module)
-   This is the most important check. Look at every file listed in the catch-all.
-   For each coherent group:
-   a) If files clearly belong to an existing module, name which one.
-   b) If files form a coherent new module not yet defined, name it and describe it.
-   Flag as "error" — orphaned important files degrade the whole knowledge base.
-   In your description: list specific file groups and their suggested destination module.
-
-Severity rules:
-  "error" — must fix before Pass 2 (re-run --discover will address it)
-  "warn"  — should fix but won't block
-
-Available modules for re-assignment: {", ".join(all_module_names)}
+Available modules: {", ".join(all_module_names)}
 
 Output JSON only:
 {{
@@ -2502,25 +2521,44 @@ Output JSON only:
     {{
       "module": "<module name exactly as shown>",
       "issue_type": "too_large|bad_split|poor_questions|orphaned_files",
-      "description": "<specific, actionable description — name dirs, files, and suggested new module names>",
+      "description": "<actionable — name dirs, proposed new module names and their dirs>",
       "severity": "error|warn"
     }}
   ],
-  "overall": "<2-4 sentence assessment: what is good, what is missing, confidence in this module map>"
-}}
-
-If the map is genuinely good, say so in overall and return an empty issues list.
-Do not invent problems. But do not let real problems pass unchallenged."""
+  "overall": "<2-4 sentence assessment of the map>"
+}}"""
 
     try:
         raw = llm_call(model, PASS1_REVIEW_SYSTEM, prompt,
                        max_tokens=2500, json_mode=True,
                        tracker=tracker, phase="Pass 1 review")
         data = json.loads(raw)
-        return data.get("issues", []), data.get("overall", "")
+        llm_issues: list[dict] = data.get("issues", [])
+        overall: str = data.get("overall", "")
     except Exception as e:
         print(f"  [Pass 1 review] Error: {e}")
-        return [], "Review failed — skipping."
+        llm_issues, overall = [], "Review failed — skipping."
+
+    # Merge: auto-flagged errors first, then LLM issues (skip LLM too_large for
+    # auto-flagged modules since we already have the deterministic flag — keep
+    # the LLM entry only if it adds a split plan).
+    merged: list[dict] = list(auto_flagged_issues)
+    auto_flagged_in_llm: dict[str, dict] = {}
+    for issue in llm_issues:
+        mod = issue.get("module", "")
+        if mod in auto_flagged_names and issue.get("issue_type") == "too_large":
+            # Replace the terse auto-flag description with the LLM's split plan
+            auto_flagged_in_llm[mod] = issue
+        else:
+            merged.append(issue)
+
+    # Upgrade auto-flagged entries with LLM split plans where available
+    for i, issue in enumerate(merged):
+        if issue["module"] in auto_flagged_in_llm:
+            llm_version = auto_flagged_in_llm[issue["module"]]
+            merged[i] = {**issue, "description": llm_version.get("description", issue["description"])}
+
+    return merged, overall
 
 
 def run_pass1_focused(
