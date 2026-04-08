@@ -414,7 +414,7 @@ def main():
         quota_hit = False
         if use_llm:
             all_file_chunks = [(fw[0].path, fw[1], fw[2]) for fw in file_work]
-            _, quota_hit = asyncio.run(
+            quota_hit = asyncio.run(
                 _summarize_chunks_async(
                     args.model, all_file_chunks,
                     tracker=tracker,
