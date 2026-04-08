@@ -373,7 +373,21 @@ def llm_tool_loop(
         kwargs = dict(model=model, messages=messages,
                       tools=tools, tool_choice="auto")
         _apply_max_tokens(kwargs, model, max_tokens)
-        response = completion(**kwargs)
+
+        for _attempt in range(3):
+            try:
+                response = completion(**kwargs)
+                break
+            except Exception as e:
+                if _is_context_overflow(e) and _attempt < 2:
+                    print(f"  [warn] Context overflow in tool loop (attempt {_attempt + 1}), "
+                          f"trimming prompt by {15 * (_attempt + 1)}% and retrying...")
+                    kwargs["messages"] = _trim_messages_for_retry(
+                        kwargs["messages"], fraction=0.15 * (_attempt + 1))
+                else:
+                    raise
+        else:
+            raise RuntimeError("Context overflow: prompt could not be trimmed enough to fit.")
 
         if tracker and phase:
             tracker.record(f"{phase} (round {round_num})", response)
