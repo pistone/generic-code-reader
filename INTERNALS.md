@@ -161,7 +161,7 @@ Pass 2 prints a classification breakdown at the end.
 `--refine` scans summaries for vague markers ("delegates to", "defined
 elsewhere", "uses a helper", etc.) and only re-runs LLM on those
 chunks. Typically touches ~5% of summaries at ~5% of the cost of a
-full `--review-only` pass.
+full `--improve` pass.
 
 ## How the doc agent works
 

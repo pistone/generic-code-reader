@@ -123,6 +123,10 @@ python indexer/study_agent.py --codebase /path/to/src --discover
 # If errors are found, re-run --discover to trigger a focused refinement round:
 python indexer/study_agent.py --codebase /path/to/src --discover   # fixes flagged modules
 
+# Re-run only the reviewer on an existing module_map.json (no Pass 1):
+python indexer/study_agent.py --codebase /path/to/src --review
+# If --review flags errors, run --discover to fix them.
+
 # Phase 2: Summarization → indexer/summaries.json → auto-indexed to R2R
 # The LLM can call search_kb during summarization to look up unfamiliar types and concepts.
 python indexer/study_agent.py --codebase /path/to/src --summarize
