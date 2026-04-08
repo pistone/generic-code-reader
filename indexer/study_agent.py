@@ -1649,10 +1649,20 @@ MAX_EXPLORE_ROUNDS = 30  # cap on interactive exploration rounds
 MAX_FILES_PER_READ = 8   # max files per read_files call
 
 
+def _normalise_dir_path(dp: str) -> str:
+    """Strip leading ./ and trailing / from a dir_path provided by the LLM."""
+    dp = dp.strip()
+    if dp.startswith("./"):
+        dp = dp[2:]
+    dp = dp.rstrip("/")
+    return dp or "."
+
+
 def _group_files_by_dir(codebase: Path, files: list[Path],
                          dir_path: str, codebases: Optional[list[Path]] = None) -> list[Path]:
     """Return files that live under a specific directory path."""
     all_codebases = codebases if codebases else [codebase]
+    dir_path = _normalise_dir_path(dir_path)
 
     def _relative_to_any(f: Path) -> str:
         for cb in all_codebases:
@@ -2236,17 +2246,56 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
     if test_modules_skipped:
         print(f"[Pass 1] Skipped {test_modules_skipped} test module(s)")
 
-    # Catch orphans
+    # Catch orphans — try to assign to nearest module by longest dir prefix match
     orphaned = [str(_relative_to_any(f)) for f in files
                 if str(_relative_to_any(f)) not in assigned_files]
     if orphaned:
-        print(f"[Pass 1] {len(orphaned)} orphaned files → 'other' module")
-        modules.append(ModuleDefinition(
-            name="other",
-            description="Files not assigned to a specific module",
-            files=orphaned,
-            questions=["What do these miscellaneous files do?"],
-        ))
+        # Build a flat list of (normalised_dir_path, module_index) for prefix matching
+        dir_to_mod: list[tuple[str, int]] = []
+        for mi, m in enumerate(modules):
+            for dp in m.dir_paths:
+                dir_to_mod.append((_normalise_dir_path(dp), mi))
+
+        reassigned = 0
+        true_orphans: list[str] = []
+        for rel in orphaned:
+            best_len = 0
+            best_mod = -1
+            for dp, mi in dir_to_mod:
+                # Check how many path components they share
+                if rel.startswith(dp + "/") or rel == dp:
+                    if len(dp) > best_len:
+                        best_len = len(dp)
+                        best_mod = mi
+                else:
+                    # Partial match: common ancestor
+                    parts_rel = rel.split("/")
+                    parts_dp  = dp.split("/")
+                    common = 0
+                    for a, b in zip(parts_rel, parts_dp):
+                        if a == b:
+                            common += 1
+                        else:
+                            break
+                    if common > 0 and common > best_len:
+                        best_len = common
+                        best_mod = mi
+            if best_mod >= 0:
+                modules[best_mod].files.append(rel)
+                reassigned += 1
+            else:
+                true_orphans.append(rel)
+
+        if reassigned:
+            print(f"[Pass 1] {reassigned} orphaned files reassigned to nearest module by path prefix")
+        if true_orphans:
+            print(f"[Pass 1] {len(true_orphans)} files with no matching module → 'other'")
+            modules.append(ModuleDefinition(
+                name="other",
+                description="Files not assigned to any module",
+                files=true_orphans,
+                questions=["What do these miscellaneous files do?"],
+            ))
 
     for m in modules:
         print(f"  - {m.name}: {len(m.files)} files, {len(m.questions)} Qs — {m.description[:80]}")
@@ -2587,17 +2636,45 @@ def run_pass1_focused(
     if test_modules_skipped:
         print(f"[Pass 1 focused] Skipped {test_modules_skipped} test module(s)")
 
-    # Orphaned files → other
+    # Orphaned files — try prefix-match before falling back to 'other'
     orphaned = [str(_relative_to_any(f)) for f in files
                 if str(_relative_to_any(f)) not in assigned_files]
     if orphaned:
-        print(f"[Pass 1 focused] {len(orphaned)} orphaned files → 'other'")
-        new_modules.append(ModuleDefinition(
-            name="other",
-            description="Files not assigned to a specific module",
-            files=orphaned,
-            questions=["What do these miscellaneous files do?"],
-        ))
+        dir_to_mod: list[tuple[str, int]] = []
+        for mi, m in enumerate(new_modules):
+            for dp in m.dir_paths:
+                dir_to_mod.append((_normalise_dir_path(dp), mi))
+
+        reassigned = 0
+        true_orphans: list[str] = []
+        for rel in orphaned:
+            best_len, best_mod = 0, -1
+            for dp, mi in dir_to_mod:
+                if rel.startswith(dp + "/") or rel == dp:
+                    if len(dp) > best_len:
+                        best_len, best_mod = len(dp), mi
+                else:
+                    parts_rel = rel.split("/")
+                    parts_dp  = dp.split("/")
+                    common = sum(1 for a, b in zip(parts_rel, parts_dp) if a == b)
+                    if common > best_len:
+                        best_len, best_mod = common, mi
+            if best_mod >= 0:
+                new_modules[best_mod].files.append(rel)
+                reassigned += 1
+            else:
+                true_orphans.append(rel)
+
+        if reassigned:
+            print(f"[Pass 1 focused] {reassigned} orphaned files reassigned by path prefix")
+        if true_orphans:
+            print(f"[Pass 1 focused] {len(true_orphans)} files with no match → 'other'")
+            new_modules.append(ModuleDefinition(
+                name="other",
+                description="Files not assigned to any module",
+                files=true_orphans,
+                questions=["What do these miscellaneous files do?"],
+            ))
 
     for m in new_modules:
         flag = " ← revised" if m.name in flagged_names else ""
