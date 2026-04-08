@@ -4019,6 +4019,10 @@ def main():
                         help="Re-index existing summaries.json into R2R without re-summarizing. "
                              "Useful after editing summaries manually, changing models, or "
                              "after clearing R2R.")
+    parser.add_argument("--purge-code", action="store_true",
+                        help="Delete only the code chunks (source_type=code) from R2R using "
+                             "doc_ids stored in summaries.json. Leaves docs and tickets intact. "
+                             "Run before re-running study_agent to avoid duplicates.")
     parser.add_argument("--refine", action="store_true",
                         help="After summarization, re-run LLM on summaries that contain "
                              "vague references ('delegates to', 'defined elsewhere', etc.). "
@@ -4213,6 +4217,33 @@ def main():
     _start_time = time.time()
 
     # ── Index-only mode: just push existing summaries to R2R ─────────────────
+    if args.purge_code:
+        if not summaries_path.exists():
+            print(f"Error: {summaries_path} not found — nothing to purge.")
+            sys.exit(1)
+        summaries = json.loads(summaries_path.read_text())
+        doc_ids = []
+        for e in summaries:
+            if e.get("doc_id"):
+                doc_ids.append(e["doc_id"])
+            if e.get("code_doc_id"):
+                doc_ids.append(e["code_doc_id"])
+        if not doc_ids:
+            print("No doc_ids found in summaries.json — nothing to purge.")
+            print("(They are stored after a successful --reindex or full run.)")
+            return
+        print(f"Purging {len(doc_ids)} code chunk document(s) from R2R "
+              f"(docs and tickets untouched)...")
+        from codebase_shared.r2r_indexer import purge_docs
+        purge_docs(doc_ids)
+        # Clear stored doc_ids so a subsequent --reindex starts fresh
+        for e in summaries:
+            e.pop("doc_id", None)
+            e.pop("code_doc_id", None)
+        summaries_path.write_text(json.dumps(summaries, indent=2))
+        print(f"Done. Re-run with --reindex (or full run) to re-populate R2R.")
+        return
+
     if args.index_only:
         if not summaries_path.exists():
             print(f"Error: {summaries_path} not found. Run Pass 2 first.")
