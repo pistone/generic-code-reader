@@ -317,12 +317,17 @@ def build_ticket_context(ticket: dict, mr_context: str = "",
 # ---------------------------------------------------------------------------
 
 EXTRACT_SYSTEM = (
-    "You extract reusable technical knowledge from resolved tickets. "
+    "You extract reusable technical knowledge from resolved engineering tickets. "
     "If the ticket contains a root cause, workaround, design decision, "
     "or recurring pattern worth remembering, extract it concisely. "
     "If MR/PR diffs are provided, summarize what the solution actually changed. "
     "If the ticket is just a routine bug fix with no reusable insight, "
     "mark it as not useful. "
+    "IMPORTANT: Write in declarative, factual statements only. "
+    "NEVER use investigative or procedural language — do not write "
+    "'check if', 'open file X', 'see whether', 'look for', 'verify that', "
+    "'to reproduce', or any instruction that tells the reader to do something. "
+    "State facts: what the root cause WAS, what the fix DID, what the pattern IS. "
     "Output ONLY valid JSON — no markdown fences, no commentary."
 )
 
@@ -333,8 +338,8 @@ Extract the reusable technical knowledge from this ticket.
 Output this JSON:
 {{
   "useful": true or false,
-  "summary": "1-3 sentence description of the problem and its context (only if useful)",
-  "solution": "1-2 sentence description of what the fix/change actually did — specific classes, functions, patterns used (only if useful and MR diff is available, otherwise omit)",
+  "summary": "1-3 sentences stating the problem and its context as facts — what the root cause was, what condition triggers it, what component is involved. Write in past or present tense ('X fails when Y', 'The bug was caused by Z'). No instructions, no steps to reproduce.",
+  "solution": "1-2 sentences stating what the fix did — specific classes, functions, files, or patterns changed. ('The fix added X to Y', 'Class Z now calls W before V'). Only if useful and MR diff is available, otherwise omit.",
   "category": "root_cause" or "workaround" or "design_decision" or "pattern" (only if useful)
 }}
 
