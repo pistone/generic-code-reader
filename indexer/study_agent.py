@@ -4120,8 +4120,8 @@ def main():
     else:
         est_total = pass1_tokens + pass2_tokens
     # Try to get real pricing from litellm's model database
-    rate_per_mtok = 5.0  # fallback: ~GPT-4o blended rate
-    _pricing_source = "default estimate"
+    rate_per_mtok = None
+    _pricing_source = None
     try:
         from litellm import get_model_info
         _cost_model = args.model_fast or args.model
@@ -4134,7 +4134,7 @@ def main():
             _pricing_source = _cost_model
     except Exception:
         pass
-    est_cost = est_total / 1_000_000 * rate_per_mtok
+    est_cost = est_total / 1_000_000 * rate_per_mtok if rate_per_mtok else None
 
     total_calls = 1 if args.discover else est_chunks   # Pass 1 is one tool-loop, not per-chunk
     est_minutes = total_calls / args.rpm
@@ -4158,7 +4158,12 @@ def main():
             print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
             print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
         print(f"  Est. total tokens: ~{est_total:,}")
-        print(f"  Est. cost:         ~${est_cost:.2f} (at ${rate_per_mtok:.2f}/MTok — {_pricing_source})")
+        if est_cost is not None:
+            print(f"  Est. cost:         ~${est_cost:.2f} (at ${rate_per_mtok:.2f}/MTok — {_pricing_source})")
+        else:
+            _cost_model = args.model_fast or args.model
+            print(f"  Est. cost:         unknown — '{_cost_model}' not in litellm pricing db")
+            print(f"                     Check provider pricing and multiply by ~{est_total/1_000_000:.1f}M tokens")
         if est_minutes > 60:
             print(f"  Est. wall time:    ~{est_minutes / 60:.1f} hours (at {args.rpm} RPM)")
         else:
@@ -4172,12 +4177,16 @@ def main():
 
     # Show cost estimate and confirm (unless --yes)
     if not args.yes:
-        est_cost_total = est_total / 1_000_000 * rate_per_mtok
         if est_minutes > 60:
             time_str = f"~{est_minutes / 60:.1f} hours"
         else:
             time_str = f"~{int(est_minutes)} minutes"
-        print(f"\nEstimate: ~{est_chunks:,} chunks, ~${est_cost_total:.2f}, {time_str} at {args.rpm} RPM")
+        if est_cost is not None:
+            print(f"\nEstimate: ~{est_chunks:,} chunks, ~${est_cost:.2f}, {time_str} at {args.rpm} RPM")
+        else:
+            _cost_model = args.model_fast or args.model
+            print(f"\nEstimate: ~{est_chunks:,} chunks, ~{est_total/1_000_000:.1f}M tokens "
+                  f"(cost unknown — '{_cost_model}' not in litellm pricing db), {time_str} at {args.rpm} RPM")
         if not args.model_fast and len(files) > 100:
             print(f"  Tip: --model-fast openai/gpt-4o-mini cuts Pass 2 cost ~90%")
         try:
