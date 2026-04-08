@@ -428,7 +428,7 @@ def generate_lesson(model: str, ticket: dict, extraction: dict,
     )
     try:
         lesson = llm_call(model, LESSON_SYSTEM, prompt,
-                          max_tokens=700, tracker=tracker, phase="Lessons")
+                          max_tokens=1200, tracker=tracker, phase="Lessons")
         lesson = lesson.strip()
         if len(lesson) < 30:
             return None
