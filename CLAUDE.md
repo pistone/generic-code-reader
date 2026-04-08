@@ -16,6 +16,33 @@ implementation details.
 
 ---
 
+## ⚠ The KB is empty until you populate it — required build order
+
+The MCP server and R2R database start empty. Before any search queries
+will return useful results, you MUST run the population pipeline in order:
+
+```
+# 0. Start R2R (once)
+cd r2r && docker compose up -d
+
+# 1. (Optional) Index design docs and runbooks
+python -m doc_agent.doc_agent --docs /path/to/docs
+
+# 2. REQUIRED — Analyze the codebase and index summaries into R2R
+#    This is the primary KB population step. Without it the KB has nothing.
+python indexer/study_agent.py --codebase /path/to/src
+
+# 3. (Optional) Fetch and process Jira tickets — full 3-step pipeline:
+python -m ticket_agent.fetch_tickets --project PROJ          # fetch
+python -m ticket_agent.ticket_agent --tickets ticket_agent/tickets/  # extract
+python -m doc_agent.doc_agent --docs ticket_agent/lessons    # index lessons
+```
+
+**Do NOT skip to "use the knowledge base" without running at least step 2.**
+An empty KB will return no results for any query.
+
+---
+
 ## Architecture
 
 ```
