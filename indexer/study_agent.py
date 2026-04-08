@@ -2298,7 +2298,9 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
             ))
 
     for m in modules:
+        dirs = ", ".join(sorted(m.dir_paths)) if m.dir_paths else "(unknown)"
         print(f"  - {m.name}: {len(m.files)} files, {len(m.questions)} Qs — {m.description[:80]}")
+        print(f"      dirs: {dirs}")
 
     module_map = ModuleMap(
         project=codebase.name,
@@ -2678,7 +2680,9 @@ def run_pass1_focused(
 
     for m in new_modules:
         flag = " ← revised" if m.name in flagged_names else ""
+        dirs = ", ".join(sorted(m.dir_paths)) if m.dir_paths else "(unknown)"
         print(f"  - {m.name}: {len(m.files)} files{flag}")
+        print(f"      dirs: {dirs}")
 
     # Re-run advisory review on the refined map (issues cleared on success)
     refined_map = ModuleMap(
