@@ -49,7 +49,7 @@ GITLAB_URL     = os.getenv("GITLAB_URL", "https://gitlab.com")
 
 DEDUP_THRESHOLD   = 0.85
 MAX_DIFF_CHARS    = 4000   # cap on diff text fed to LLM
-MAX_LESSON_CHARS  = 1200   # cap on generated lesson text
+MAX_LESSON_CHARS  = 3000   # soft cap on generated lesson text (how-to recipes can be long)
 
 RESOLVED_STATUSES  = {"done", "closed", "resolved", "fixed", "complete", "verified"}
 REJECT_RESOLUTIONS = {"won't fix", "wontfix", "duplicate", "cannot reproduce",
@@ -427,7 +427,10 @@ def generate_lesson(model: str, ticket: dict, extraction: dict,
         lesson = lesson.strip()
         if len(lesson) < 30:
             return None
-        return lesson[:MAX_LESSON_CHARS]
+        if len(lesson) > MAX_LESSON_CHARS:
+            print(f"  [warn] Lesson truncated at {MAX_LESSON_CHARS} chars (was {len(lesson)})")
+            return lesson[:MAX_LESSON_CHARS]
+        return lesson
     except Exception as e:
         print(f"  [warn] Lesson generation failed: {e}")
         return None
