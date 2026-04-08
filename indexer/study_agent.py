@@ -2887,6 +2887,165 @@ def _fallback_module_map(codebase: Path, files: list[Path],
     }
 
 
+# ── Import modules from definition files ──────────────────────────────────────
+
+QUESTION_GEN_SYSTEM = """\
+You are a senior software engineer generating domain-specific questions about a codebase module.
+Questions must be investigative and specific — they should reveal algorithms, data structures,
+protocols, APIs, error modes, and design decisions relevant to this module's purpose.
+Output ONLY valid JSON.\
+"""
+
+
+async def _generate_questions_async(
+    model: str,
+    name: str,
+    description: str,
+    files: list[str],
+    note: str,
+    language: str,
+    tracker: Optional[TokenTracker] = None,
+) -> list[str]:
+    """Generate domain-specific questions for one module via a single LLM call."""
+    sample = files[:20]
+    note_line = f"\nNote: {note}" if note else ""
+    prompt = f"""\
+Module: {name}
+Description: {description}{note_line}
+Language: {language}
+Sample files ({len(files)} total): {', '.join(sample)}
+
+Generate 5-7 specific questions a developer would need answered to understand this module.
+Good questions name actual subsystems, algorithms, data formats, or failure modes.
+Bad: "What does {name} do?" (too generic)
+Good: "How does the liveness analysis propagate kill sets across loop back-edges?" (specific)
+
+Output JSON:
+{{"questions": ["...", "...", ...]}}"""
+
+    try:
+        raw = await allm_call(model, QUESTION_GEN_SYSTEM, prompt,
+                              max_tokens=400, json_mode=True,
+                              tracker=tracker, phase="Import questions")
+        data = json.loads(raw)
+        qs = data.get("questions", [])
+        if qs:
+            return qs
+    except Exception:
+        pass
+    return [f"What are the key data structures and algorithms in {name}?",
+            f"What are the main entry points and public APIs of {name}?",
+            f"What error modes and edge cases does {name} handle?"]
+
+
+def import_modules_from_definitions(
+    definition_files: list[Path],
+    codebase: Path,
+    files: list[Path],
+    language: str,
+    model: str,
+    tracker: Optional[TokenTracker] = None,
+    codebases: Optional[list[Path]] = None,
+) -> ModuleMap:
+    """Build a ModuleMap from human-authored definition JSON files.
+
+    Each file must contain:
+      { "modules": [ { "name", "description", "directories": [...], "note"? } ] }
+
+    directories are relative to --codebase. Files are resolved and questions
+    generated via LLM (one call per module, run concurrently).
+    """
+    all_codebases = codebases if codebases else [codebase]
+
+    def _rel(f: Path) -> str:
+        return str(_relative_to_any(f, all_codebases))
+
+    # ── Parse all definition files ────────────────────────────────────────────
+    raw_modules: list[dict] = []
+    for def_file in definition_files:
+        try:
+            data = json.loads(def_file.read_text())
+            raw_modules.extend(data.get("modules", []))
+            print(f"  [Import] {def_file.name}: {len(data.get('modules', []))} module(s)")
+        except Exception as e:
+            print(f"  [Import] ERROR reading {def_file}: {e}")
+    print(f"[Import] {len(raw_modules)} module definition(s) total")
+
+    # ── Resolve files for each module ─────────────────────────────────────────
+    assigned_files: set[str] = set()
+    resolved: list[dict] = []   # {name, description, directories, note, files}
+
+    for raw in raw_modules:
+        name        = raw.get("name", "unknown")
+        description = raw.get("description", "")
+        directories = [_normalise_dir_path(str(d)) for d in raw.get("directories", [])]
+        note        = raw.get("note", "")
+
+        mod_files: list[str] = []
+        for dp in directories:
+            for f in _group_files_by_dir(codebase, files, dp, codebases=all_codebases):
+                rel = _rel(f)
+                if rel not in assigned_files:
+                    mod_files.append(rel)
+                    assigned_files.add(rel)
+
+        resolved.append(dict(name=name, description=description,
+                             directories=directories, note=note, files=mod_files))
+
+    # Report coverage
+    total_files = len(files)
+    covered = len(assigned_files)
+    orphans = [_rel(f) for f in files if _rel(f) not in assigned_files]
+    print(f"[Import] Coverage: {covered}/{total_files} files assigned "
+          f"({100*covered//total_files if total_files else 0}%)")
+    if orphans:
+        print(f"  {len(orphans)} file(s) not covered by any definition — "
+              f"they will appear in an 'other' module")
+
+    # ── Generate questions concurrently ───────────────────────────────────────
+    print(f"[Import] Generating questions for {len(resolved)} module(s)...")
+
+    async def _gen_all() -> list[list[str]]:
+        sem = asyncio.Semaphore(10)
+        async def _one(r: dict) -> list[str]:
+            async with sem:
+                return await _generate_questions_async(
+                    model, r["name"], r["description"], r["files"],
+                    r["note"], language, tracker=tracker)
+        return await asyncio.gather(*[_one(r) for r in resolved])
+
+    all_questions = asyncio.run(_gen_all())
+
+    # ── Build ModuleDefinitions ───────────────────────────────────────────────
+    modules: list[ModuleDefinition] = []
+    for r, questions in zip(resolved, all_questions):
+        dirs_str = ", ".join(sorted(r["directories"]))
+        print(f"  - {r['name']}: {len(r['files'])} files — {r['description'][:70]}")
+        print(f"      dirs: {dirs_str}")
+        modules.append(ModuleDefinition(
+            name=r["name"],
+            description=r["description"],
+            files=r["files"],
+            questions=questions,
+            dir_paths=r["directories"],
+        ))
+
+    if orphans:
+        modules.append(ModuleDefinition(
+            name="other",
+            description="Files not covered by any module definition",
+            files=orphans,
+            questions=["What do these miscellaneous files do?"],
+            dir_paths=[],
+        ))
+
+    return ModuleMap(
+        project=codebase.name,
+        description=f"Imported from {', '.join(f.name for f in definition_files)}",
+        modules=modules,
+    )
+
+
 # ── Pass 2: Summarization ──────────────────────────────────────────────────────
 
 PASS2_SYSTEM = (
@@ -4238,6 +4397,11 @@ def main():
                              "refinement instead. If it has no errors, new modules are merged "
                              "in (useful for pointing at a subdirectory to fill gaps). "
                              "Run --summarize next.")
+    parser.add_argument("--import-modules", nargs="+", metavar="FILE",
+                        help="Import module definitions from one or more JSON files "
+                             "(format: {modules:[{name,description,directories[],note?}]}). "
+                             "Files are resolved and questions generated via LLM. "
+                             "Merges with existing module_map.json. Run --summarize next.")
     parser.add_argument("--summarize", action="store_true",
                         help="Only run summarization (Pass 2). Skips module discovery. "
                              "Requires an existing module_map.json from a previous --discover run.")
@@ -4524,6 +4688,44 @@ def main():
         print(f"[Review-only] Done. Edit rate: {edit_rate:.1%}")
         print(f"  Run with --reindex to push updated summaries to R2R.")
         tracker.print_summary()
+        return
+
+    # ── Import modules from definition files ─────────────────────────────────────
+    if args.import_modules:
+        def_files = [Path(f) for f in args.import_modules]
+        missing = [f for f in def_files if not f.exists()]
+        if missing:
+            print(f"Error: definition file(s) not found: {', '.join(str(f) for f in missing)}")
+            sys.exit(1)
+
+        print(f"\n[Import] Loading module definitions from {len(def_files)} file(s)...")
+        imported = import_modules_from_definitions(
+            def_files, codebase, files, args.language, args.model,
+            tracker=tracker, codebases=codebases,
+        )
+
+        # Merge with existing module_map using file-based conflict resolution
+        if module_map_path.exists():
+            try:
+                existing = ModuleMap(**json.loads(module_map_path.read_text()))
+                new_files: set[str] = {f for m in imported.modules for f in m.files}
+                surviving = []
+                moved = 0
+                for m in existing.modules:
+                    remaining = [f for f in m.files if f not in new_files]
+                    moved += len(m.files) - len(remaining)
+                    if remaining:
+                        m.files = remaining
+                        surviving.append(m)
+                imported.modules.extend(surviving)
+                imported.review_issues = []
+                print(f"  [Import] Merged with existing map: {len(surviving)} existing module(s) "
+                      f"retained, {moved} file(s) reassigned ({len(imported.modules)} total).")
+            except Exception as e:
+                print(f"  [warn] Could not load existing module_map for merge ({e}) — overwriting")
+
+        module_map_path.write_text(json.dumps(imported.model_dump(), indent=2))
+        print(f"\n[Import] Written to {module_map_path}. Run --summarize next.")
         return
 
     # ── Standalone review ────────────────────────────────────────────────────────
