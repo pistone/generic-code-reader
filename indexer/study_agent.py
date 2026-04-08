@@ -3893,7 +3893,8 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             print(f"[Pass 2] Loaded context cache "
                   f"({len(cached_context.get('file_summaries', {}))} file, "
                   f"{len(cached_context.get('class_summaries', {}))} class, "
-                  f"{len(cached_context.get('func_summaries', {}))} func summaries)")
+                  f"{len(cached_context.get('func_summaries', {}))} func, "
+                  f"{len(cached_context.get('caller_freq', {}))} caller freq)")
         except Exception:
             cached_context = {}
 
@@ -3912,35 +3913,37 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         )
 
     # ── Build caller frequency map (single pass, no LLM) ─────────────────
-    all_files_for_freq: list[Path] = []
-    for mod in module_map.modules:
-        for fname in mod.files:
-            fpath = _resolve_file(fname, codebase, all_codebases)
-            if fpath:
-                all_files_for_freq.append(fpath)
-
-    import time as _time_freq
-    t0 = _time_freq.monotonic()
-    caller_freq = build_caller_frequency_map(
-        all_files_for_freq, codebases=all_codebases, codebase=codebase)
-    elapsed = _time_freq.monotonic() - t0
-    # Look up doc mentions for frequently-called functions
-    doc_mentions: dict[str, str] = {}
-    if caller_freq:
-        print(f"\n[Caller frequency] {len(caller_freq)} frequently-called functions "
-              f"detected ({elapsed:.1f}s)")
-        # Show top 5 for visibility
-        top5 = sorted(caller_freq.items(), key=lambda x: -x[1])[:5]
-        for sym, count in top5:
-            print(f"  {sym}: called from {count} files")
-
-        # Query R2R for doc mentions (degrades gracefully if RAG unavailable)
-        doc_mentions = _lookup_doc_mentions(list(caller_freq.keys()))
-        if doc_mentions:
-            print(f"[Caller frequency] Found doc mentions for "
-                  f"{len(doc_mentions)} functions")
+    if cached_context.get("caller_freq") is not None:
+        caller_freq: dict[str, int] = cached_context["caller_freq"]
+        doc_mentions: dict[str, str] = cached_context.get("doc_mentions", {})
+        print(f"[Caller frequency] Loaded from cache "
+              f"({len(caller_freq)} functions, {len(doc_mentions)} doc mentions)")
     else:
-        print(f"\n[Caller frequency] No frequently-called functions detected ({elapsed:.1f}s)")
+        all_files_for_freq: list[Path] = []
+        for mod in module_map.modules:
+            for fname in mod.files:
+                fpath = _resolve_file(fname, codebase, all_codebases)
+                if fpath:
+                    all_files_for_freq.append(fpath)
+
+        import time as _time_freq
+        t0 = _time_freq.monotonic()
+        caller_freq = build_caller_frequency_map(
+            all_files_for_freq, codebases=all_codebases, codebase=codebase)
+        elapsed = _time_freq.monotonic() - t0
+        doc_mentions = {}
+        if caller_freq:
+            print(f"\n[Caller frequency] {len(caller_freq)} frequently-called functions "
+                  f"detected ({elapsed:.1f}s)")
+            top5 = sorted(caller_freq.items(), key=lambda x: -x[1])[:5]
+            for sym, count in top5:
+                print(f"  {sym}: called from {count} files")
+            doc_mentions = _lookup_doc_mentions(list(caller_freq.keys()))
+            if doc_mentions:
+                print(f"[Caller frequency] Found doc mentions for "
+                      f"{len(doc_mentions)} functions")
+        else:
+            print(f"\n[Caller frequency] No frequently-called functions detected ({elapsed:.1f}s)")
 
     # ── Collect chunks and detect multi-chunk functions ──────────────────
     work_items: list[dict] = []
@@ -4064,10 +4067,13 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
             "func_summaries": {
                 f"{rp}|{ci}": s for (rp, ci), s in func_summaries.items()
             },
+            "caller_freq": caller_freq,
+            "doc_mentions": doc_mentions,
         }
         context_cache_path.write_text(json.dumps(_ctx, indent=2))
         print(f"[Pass 2] Saved context cache ({len(file_summaries)} file, "
-              f"{len(class_summaries)} class, {len(func_summaries)} func)")
+              f"{len(class_summaries)} class, {len(func_summaries)} func, "
+              f"{len(caller_freq)} caller freq)")
 
     # ── Build work items ──────────────────────────────────────────────────
     stale_count = 0
