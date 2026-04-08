@@ -4596,21 +4596,35 @@ def main():
             module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
                                    tracker=tracker, codebases=codebases)
 
-        # Always merge back with the existing map so no modules are lost.
-        # For focused refinement: run_pass1_focused should include all modules, but
-        # any the LLM accidentally dropped are re-added from the original.
-        # For fresh Pass 1: modules with new names are added to the existing set.
+        # Merge with the existing map using file-level conflict resolution:
+        # - Files covered by the new run belong to the new modules (new run wins)
+        # - Files NOT covered by the new run stay in their existing modules
+        # - Existing modules that become empty after file removal are dropped
         if _existing_map is not None:
-            new_names = {m.name for m in module_map.modules}
-            preserved = [m for m in _existing_map.modules if m.name not in new_names]
-            if preserved:
-                module_map.modules.extend(preserved)
-                print(f"  [Pass 1] Preserved {len(preserved)} existing module(s) not touched by this run.")
-            added = len(module_map.modules) - len(_existing_map.modules)
-            if added > 0:
-                print(f"  [Pass 1] Added {added} new module(s) "
-                      f"({len(module_map.modules)} total). Run --review to re-check.")
+            # All files claimed by the new run
+            new_files: set[str] = {f for m in module_map.modules for f in m.files}
+
+            # Strip those files from existing modules; drop modules that go empty
+            surviving: list = []
+            moved_count = 0
+            for m in _existing_map.modules:
+                remaining = [f for f in m.files if f not in new_files]
+                moved = len(m.files) - len(remaining)
+                moved_count += moved
+                if remaining:
+                    m.files = remaining
+                    surviving.append(m)
+                # else: module is now empty — drop it
+
+            # Append surviving existing modules to the new map
+            module_map.modules.extend(surviving)
             module_map.review_issues = []  # stale after any change
+
+            n_new = len([m for m in module_map.modules if m not in surviving])
+            print(f"  [Pass 1] Merged: {n_new} module(s) from this run, "
+                  f"{len(surviving)} existing module(s) retained "
+                  f"({moved_count} file(s) reassigned, "
+                  f"{len(module_map.modules)} total). Run --review to re-check.")
 
         module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
         print(f"\n[Pass 1] Written to {module_map_path}")
