@@ -95,7 +95,9 @@ cd r2r && docker compose up -d
 - Verify identity before a long run: `python -m ticket_agent.fetch_tickets --project PROJ --debug` prints the authenticated user
 
 ### `ticket_agent/ticket_agent.py` — knowledge extraction from tickets
-- R2R running (indexes summaries and lessons at the end)
+- R2R running — required for indexing. If R2R is unreachable the agent warns
+  and asks to confirm before proceeding; extraction results are always saved to
+  `ticket_summaries.json` so `--reindex` can recover once R2R is up.
 - LLM API key set
 - Ticket JSON files on disk: run `fetch_tickets.py` first
 - MR/PR token — **required** (MR diffs are the primary source of solution context):

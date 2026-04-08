@@ -636,6 +636,23 @@ def main():
         print("  (not recommended — MR diffs are the primary source of solution context).")
         sys.exit(1)
 
+    # R2R health check — warn early before spending LLM budget.
+    # Extraction results are always saved to ticket_summaries.json so
+    # --reindex can recover if R2R comes up later, but it's better to know now.
+    try:
+        _r2r_probe = R2RClient(R2R_URL)
+        _r2r_probe.retrieval.search(query="ping", search_settings={"limit": 1})
+        print(f"R2R: connected at {R2R_URL}")
+    except Exception as _e:
+        print(f"Warning: R2R is not reachable at {R2R_URL} ({_e})")
+        print("  Extraction will proceed and results saved to ticket_summaries.json,")
+        print("  but nothing will be indexed. Start R2R then run --reindex afterwards.")
+        print("  To abort: Ctrl-C now. To continue anyway: press Enter.")
+        try:
+            input()
+        except KeyboardInterrupt:
+            sys.exit(0)
+
     tracker  = TokenTracker()
     manifest = load_manifest(manifest_path)
 
