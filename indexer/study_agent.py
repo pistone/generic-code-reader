@@ -2331,10 +2331,12 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
 
 # ── Pass 1: Review & Focused Refinement ───────────────────────────────────────
 
-PASS1_REVIEW_SYSTEM = (
-    "You are reviewing a codebase module map for quality. "
-    "Output ONLY valid JSON — no markdown, no text outside the JSON."
-)
+PASS1_REVIEW_SYSTEM = """\
+You are a senior software architect reviewing a codebase module map.
+Your job is to find real structural problems — missing modules, bloated modules,
+misclassified files, and orphaned files that belong somewhere specific.
+Be thorough. Do not save words. Output ONLY valid JSON.\
+"""
 
 PASS1_FOCUSED_SYSTEM = (
     "You are a senior software architect refining a codebase module map. "
@@ -2357,7 +2359,7 @@ def review_module_map(
     total_files: int,
     tracker: Optional[TokenTracker] = None,
 ) -> tuple[list[dict], str]:
-    """Single LLM call to review the module map quality.
+    """Thorough LLM review of the module map quality.
 
     Returns (issues, overall_comment).
     issues: list of {"module", "issue_type", "description", "severity"}
@@ -2365,52 +2367,127 @@ def review_module_map(
                 "warn"  → advisory, noted but not blocking
 
     issue_type values:
-      too_large      — module covers >35% of files and contains separable subsystems
+      too_large      — module is a bag of unrelated things that should be split
+      bad_split      — module mixes dirs/files with unrelated purposes
       poor_questions — questions are generic instead of domain-specific
-      bad_split      — module combines unrelated concerns
+      orphaned_files — "other" module contains files that clearly belong elsewhere
+                       or form a coherent new module
     """
+    import collections
+
     lines = []
     for m in module_map.modules:
         pct = len(m.files) / total_files * 100 if total_files else 0
-        sample = ", ".join(m.files[:8])
-        lines.append(
-            f"Module: {m.name} ({len(m.files)} files, {pct:.0f}% of codebase)\n"
-            f"  Dirs: {', '.join(m.dir_paths) or '(unknown)'}\n"
-            f"  Sample files: {sample}\n"
-            f"  Questions: {'; '.join(m.questions[:4])}"
+        is_other = m.name.lower() in ("other", "miscellaneous", "misc", "unknown")
+
+        # Per-directory file breakdown within this module
+        dir_counts: dict[str, list[str]] = collections.defaultdict(list)
+        for f in m.files:
+            top = f.split("/")[0] if "/" in f else "(root)"
+            dir_counts[top].append(f)
+        dir_summary = "; ".join(
+            f"{d}/: {len(fs)} files" for d, fs in sorted(dir_counts.items())
         )
 
-    prompt = (
-        f"Review this module map ({total_files} source files total).\n\n"
-        + "\n\n".join(lines)
-        + f"""
+        # Show more files for large/other modules; all files for small modules
+        if is_other or len(m.files) <= 40:
+            file_list = m.files  # show everything
+        else:
+            # sample evenly across directories
+            sample: list[str] = []
+            per_dir = max(3, 30 // max(len(dir_counts), 1))
+            for fs in dir_counts.values():
+                sample.extend(fs[:per_dir])
+            file_list = sample[:40]
 
-Identify quality problems. Output JSON:
+        file_display = ", ".join(file_list)
+        if len(m.files) > len(file_list):
+            file_display += f" … (+{len(m.files) - len(file_list)} more)"
+
+        lines.append(
+            f"Module: {m.name} ({len(m.files)} files, {pct:.0f}% of codebase)"
+            + (" ← CATCH-ALL" if is_other else "") + "\n"
+            f"  Dirs assigned: {', '.join(sorted(m.dir_paths)) or '(unknown)'}\n"
+            f"  Internal breakdown: {dir_summary}\n"
+            f"  Files: {file_display}\n"
+            f"  Questions: {'; '.join(m.questions)}"
+        )
+
+    all_module_names = [m.name for m in module_map.modules
+                        if m.name.lower() not in ("other", "miscellaneous", "misc", "unknown")]
+
+    prompt = f"""\
+Project: {module_map.project}
+Description: {module_map.description}
+Total source files: {total_files}
+Modules defined: {len(module_map.modules)}
+
+{"=" * 60}
+MODULE MAP
+{"=" * 60}
+
+{chr(10).join(lines)}
+
+{"=" * 60}
+REVIEW INSTRUCTIONS
+{"=" * 60}
+
+Analyse this module map carefully. Be thorough — this is the foundation
+of the entire knowledge base. Every issue you miss will degrade search quality.
+
+Check each module for:
+
+1. TOO_LARGE / needs splitting
+   Flag if: a module contains directories with clearly different concerns
+   (e.g. "src/parser" + "src/runtime" + "src/optimizer" all in one module).
+   A single module owning >30% of files is suspicious but not automatically wrong —
+   flag it only if the file samples reveal unrelated subsystems inside.
+   In your description: name the specific dirs that should split off and what
+   each new module would be called.
+
+2. BAD_SPLIT / wrong grouping
+   Flag if: files from two dirs have nothing in common (e.g. UI templates and
+   database migration scripts lumped together). The dirs should be in different modules.
+
+3. POOR_QUESTIONS
+   Flag if: questions are generic ("What does X do?", "How is Y used?") instead of
+   domain-specific and investigative. Good questions name specific algorithms,
+   data formats, protocols, or failure modes relevant to that module's concerns.
+   In your description: rewrite 2-3 of the worst questions as concrete examples.
+
+4. ORPHANED_FILES (only for the "other"/"miscellaneous" catch-all module)
+   This is the most important check. Look at every file listed in the catch-all.
+   For each coherent group:
+   a) If files clearly belong to an existing module, name which one.
+   b) If files form a coherent new module not yet defined, name it and describe it.
+   Flag as "error" — orphaned important files degrade the whole knowledge base.
+   In your description: list specific file groups and their suggested destination module.
+
+Severity rules:
+  "error" — must fix before Pass 2 (re-run --discover will address it)
+  "warn"  — should fix but won't block
+
+Available modules for re-assignment: {", ".join(all_module_names)}
+
+Output JSON only:
 {{
   "issues": [
     {{
-      "module": "name",
-      "issue_type": "too_large|poor_questions|bad_split",
-      "description": "specific problem and concrete suggestion (name dirs to split, example good questions)",
+      "module": "<module name exactly as shown>",
+      "issue_type": "too_large|bad_split|poor_questions|orphaned_files",
+      "description": "<specific, actionable description — name dirs, files, and suggested new module names>",
       "severity": "error|warn"
     }}
   ],
-  "overall": "1-2 sentence overall assessment"
+  "overall": "<2-4 sentence assessment: what is good, what is missing, confidence in this module map>"
 }}
 
-Flag as error (re-run needed):
-- too_large: module covers >35% of all files AND file samples show clearly separable subsystems
-- bad_split: module mixes dirs with unrelated purposes visible from sample files
-
-Flag as warn:
-- poor_questions: questions use generic phrasing ("What does X do?") instead of domain vocabulary
-
-Only flag real problems. Return empty issues list if the map is reasonable."""
-    )
+If the map is genuinely good, say so in overall and return an empty issues list.
+Do not invent problems. But do not let real problems pass unchallenged."""
 
     try:
         raw = llm_call(model, PASS1_REVIEW_SYSTEM, prompt,
-                       max_tokens=800, json_mode=True,
+                       max_tokens=2500, json_mode=True,
                        tracker=tracker, phase="Pass 1 review")
         data = json.loads(raw)
         return data.get("issues", []), data.get("overall", "")
