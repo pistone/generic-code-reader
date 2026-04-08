@@ -2404,9 +2404,16 @@ def review_module_map(
         if len(m.files) > len(file_list):
             file_display += f" … (+{len(m.files) - len(file_list)} more)"
 
+        n_dirs = len(m.dir_paths)
+        size_flag = ""
+        if is_other:
+            size_flag = " ← CATCH-ALL"
+        elif n_dirs >= 3 or pct > 25:
+            size_flag = f" ← LARGE ({n_dirs} dirs, {pct:.0f}% of codebase) — scrutinise"
+
         lines.append(
-            f"Module: {m.name} ({len(m.files)} files, {pct:.0f}% of codebase)"
-            + (" ← CATCH-ALL" if is_other else "") + "\n"
+            f"Module: {m.name} ({len(m.files)} files, {pct:.0f}% of codebase, {n_dirs} dir(s))"
+            + size_flag + "\n"
             f"  Dirs assigned: {', '.join(sorted(m.dir_paths)) or '(unknown)'}\n"
             f"  Internal breakdown: {dir_summary}\n"
             f"  Files: {file_display}\n"
@@ -2432,18 +2439,38 @@ MODULE MAP
 REVIEW INSTRUCTIONS
 {"=" * 60}
 
-Analyse this module map carefully. Be thorough — this is the foundation
-of the entire knowledge base. Every issue you miss will degrade search quality.
+Analyse this module map carefully. Be thorough and be tough — this is the foundation
+of the entire knowledge base. Every bloated module you let through will make the
+knowledge base useless for that area of the codebase. When in doubt, flag it.
+
+The most common failure is too few modules — the LLM that built this map tends
+to lump things together. Your job is to catch that and demand splits.
 
 Check each module for:
 
 1. TOO_LARGE / needs splitting
-   Flag if: a module contains directories with clearly different concerns
-   (e.g. "src/parser" + "src/runtime" + "src/optimizer" all in one module).
-   A single module owning >30% of files is suspicious but not automatically wrong —
-   flag it only if the file samples reveal unrelated subsystems inside.
-   In your description: name the specific dirs that should split off and what
-   each new module would be called.
+   This is the most critical check. Be aggressive. A bloated module is the
+   single biggest failure mode — it makes the knowledge base useless for that area.
+
+   Hard rules (flag as error automatically):
+   - Module owns 3 or more distinct directories → almost always splittable. Prove
+     it isn't before letting it pass.
+   - Module covers >25% of all files → must justify why it is truly one coherent thing.
+   - Module has >50 files → scrutinise carefully.
+
+   Soft rule: even a small module with 2 dirs of clearly different concerns should
+   be flagged (e.g. "src/auth" + "src/billing" in one module is wrong regardless of size).
+
+   When you flag too_large, your description MUST include:
+   - The specific directories that should split off
+   - The proposed name and one-line description for each new module
+   - Which remaining dirs stay in the original module
+   Example: "Split into: 'parser' (src/parser, src/grammar — AST construction),
+   'runtime' (src/vm, src/gc — execution and memory), keeping 'compiler' for
+   src/codegen only."
+
+   Do NOT give a pass to a large module just because its files are related at a
+   high level ("they're all backend code"). Subsystem separation is what matters.
 
 2. BAD_SPLIT / wrong grouping
    Flag if: files from two dirs have nothing in common (e.g. UI templates and
