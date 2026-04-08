@@ -4103,17 +4103,22 @@ def main():
     est_chunks = len(files) * 3
     est_prompt_tokens = est_chunks * 2000
     est_completion_tokens = est_chunks * 500
-    est_total = est_prompt_tokens + est_completion_tokens
     file_summary_tokens = len(files) * 500
-    est_total += file_summary_tokens
-    func_prepass_tokens = int(est_chunks * 0.2 * 600)   # pre-pass with questions
-    est_total += func_prepass_tokens
-    func_card_tokens = int(est_chunks * 0.15 * 1200)   # function card synthesis
-    est_total += func_card_tokens
+    func_prepass_tokens = int(est_chunks * 0.2 * 600)
+    func_card_tokens    = int(est_chunks * 0.15 * 1200)
     class_summary_tokens = int(len(files) / 5 * 500)
-    est_total += class_summary_tokens
     pass1_tokens = 50000
-    est_total += pass1_tokens
+    pass2_tokens = (est_prompt_tokens + est_completion_tokens
+                    + file_summary_tokens + func_prepass_tokens
+                    + func_card_tokens + class_summary_tokens)
+
+    # Only count the passes that will actually run
+    if args.discover:
+        est_total = pass1_tokens
+    elif args.summarize:
+        est_total = pass2_tokens
+    else:
+        est_total = pass1_tokens + pass2_tokens
     # Try to get real pricing from litellm's model database
     rate_per_mtok = 5.0  # fallback: ~GPT-4o blended rate
     _pricing_source = "default estimate"
@@ -4131,22 +4136,27 @@ def main():
         pass
     est_cost = est_total / 1_000_000 * rate_per_mtok
 
-    total_calls = est_chunks
+    total_calls = 1 if args.discover else est_chunks   # Pass 1 is one tool-loop, not per-chunk
     est_minutes = total_calls / args.rpm
 
     if args.dry_run:
+        mode = ("Pass 1 only (--discover)" if args.discover
+                else "Pass 2 only (--summarize)" if args.summarize
+                else "Full pipeline (Pass 1 + Pass 2)")
         print(f"\n{'='*60}")
-        print(f"  DRY RUN — Cost Estimate")
+        print(f"  DRY RUN — Cost Estimate  [{mode}]")
         print(f"{'='*60}")
         print(f"  Source files:      {len(files):,}")
-        print(f"  Est. chunks:       ~{est_chunks:,} (avg 3/file)")
-        print(f"  Est. Pass 1:       ~{pass1_tokens:,} tokens")
-        print(f"  Est. file summaries: ~{file_summary_tokens:,} tokens ({len(files):,} files × ~500 tok)")
-        print(f"  Est. func pre-pass:  ~{func_prepass_tokens:,} tokens (~20% multi-chunk funcs × ~600 tok)")
-        print(f"  Est. func cards:     ~{func_card_tokens:,} tokens (~15% multi-chunk funcs × ~1200 tok)")
-        print(f"  Est. class summaries: ~{class_summary_tokens:,} tokens (~1 class per 5 files)")
-        print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
-        print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
+        if not args.summarize:
+            print(f"  Est. Pass 1:       ~{pass1_tokens:,} tokens")
+        if not args.discover:
+            print(f"  Est. chunks:       ~{est_chunks:,} (avg 3/file)")
+            print(f"  Est. file summaries: ~{file_summary_tokens:,} tokens ({len(files):,} files × ~500 tok)")
+            print(f"  Est. func pre-pass:  ~{func_prepass_tokens:,} tokens (~20% multi-chunk funcs × ~600 tok)")
+            print(f"  Est. func cards:     ~{func_card_tokens:,} tokens (~15% multi-chunk funcs × ~1200 tok)")
+            print(f"  Est. class summaries: ~{class_summary_tokens:,} tokens (~1 class per 5 files)")
+            print(f"  Est. Pass 2:       ~{est_prompt_tokens + est_completion_tokens:,} tokens")
+            print(f"                     ({est_chunks:,} chunks × ~2,500 tok/chunk)")
         print(f"  Est. total tokens: ~{est_total:,}")
         print(f"  Est. cost:         ~${est_cost:.2f} (at ${rate_per_mtok:.2f}/MTok — {_pricing_source})")
         if est_minutes > 60:
@@ -4154,7 +4164,7 @@ def main():
         else:
             print(f"  Est. wall time:    ~{int(est_minutes)} minutes (at {args.rpm} RPM)")
         print(f"{'='*60}")
-        if not args.model_fast:
+        if not args.discover and not args.model_fast:
             print(f"\n  Tip: Use --model-fast openai/gpt-4o-mini to reduce Pass 2 cost by ~90%")
         print(f"\n  Note: Actual cost depends on model, file sizes, and content.")
         print(f"  Run without --dry-run to proceed.")
@@ -4244,18 +4254,18 @@ def main():
         print(f"Done. Re-run with --reindex (or full run) to re-populate R2R.")
         return
 
-    if args.index_only:
+    if args.reindex:
         if not summaries_path.exists():
             print(f"Error: {summaries_path} not found. Run Pass 2 first.")
             sys.exit(1)
         summaries = json.loads(summaries_path.read_text())
-        print(f"[Index-only] Indexing {len(summaries)} summaries from {summaries_path}")
+        print(f"[Reindex] Indexing {len(summaries)} summaries from {summaries_path}")
         index_summaries_to_r2r(summaries)
-        print("[Index-only] Done.")
+        print("[Reindex] Done.")
         return
 
     # ── Review-only mode: re-review existing summaries ───────────────────────
-    if args.review_only:
+    if args.improve:
         if not summaries_path.exists():
             print(f"Error: {summaries_path} not found. Run Pass 2 first.")
             sys.exit(1)
@@ -4269,12 +4279,12 @@ def main():
         ))
         summaries_path.write_text(json.dumps(summaries, indent=2))
         print(f"[Review-only] Done. Edit rate: {edit_rate:.1%}")
-        print(f"  Run with --index-only to push updated summaries to R2R.")
+        print(f"  Run with --reindex to push updated summaries to R2R.")
         tracker.print_summary()
         return
 
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
-    if not args.pass2_only:
+    if not args.summarize:
         # Check if an existing module_map has review errors → focused re-run
         _focused = False
         if module_map_path.exists():
@@ -4325,8 +4335,8 @@ def main():
         module_map = ModuleMap(**json.loads(module_map_path.read_text()))
         print(f"[Pass 2] Loaded {len(module_map.modules)} modules from {module_map_path}")
 
-    if args.pass1_only:
-        print("\nPass 1 complete. Run with --pass2-only to generate summaries.")
+    if args.discover:
+        print("\nPass 1 complete. Run with --summarize to generate summaries.")
         return
 
     # ── Show ETA ─────────────────────────────────────────────────────────────
