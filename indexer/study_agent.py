@@ -4177,6 +4177,10 @@ def main():
                         help="Re-index existing summaries.json into R2R without re-summarizing. "
                              "Useful after editing summaries manually, changing models, or "
                              "after clearing R2R.")
+    parser.add_argument("--review", action="store_true",
+                        help="Re-run the module map reviewer on an existing module_map.json "
+                             "without re-running Pass 1. Updates review_issues in-place. "
+                             "If errors are found, run --discover next to fix them.")
     parser.add_argument("--purge-code", action="store_true",
                         help="Delete only the code chunks (source_type=code) from R2R using "
                              "doc_ids stored in summaries.json. Leaves docs and tickets intact. "
@@ -4448,6 +4452,31 @@ def main():
         print(f"[Review-only] Done. Edit rate: {edit_rate:.1%}")
         print(f"  Run with --reindex to push updated summaries to R2R.")
         tracker.print_summary()
+        return
+
+    # ── Standalone review ────────────────────────────────────────────────────────
+    if args.review:
+        if not module_map_path.exists():
+            print(f"Error: {module_map_path} not found. Run --discover first.")
+            sys.exit(1)
+        module_map = ModuleMap(**json.loads(module_map_path.read_text()))
+        print(f"[Review] Loaded {len(module_map.modules)} modules from {module_map_path}")
+        print(f"[Review] Running reviewer...")
+        issues, overall = review_module_map(args.model, module_map, len(files), tracker=tracker)
+        print(f"[Review] {overall}")
+        errors = [i for i in issues if i.get("severity") == "error"]
+        warns  = [i for i in issues if i.get("severity") == "warn"]
+        for i in warns:
+            print(f"  {bold('[warn]')}  {i['module']}: {i['description']}")
+        for i in errors:
+            print(f"  {red('[error]')} {i['module']}: {i['description']}")
+        module_map.review_issues = issues
+        module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
+        print(f"\n[Review] Issues saved to {module_map_path}")
+        if errors:
+            print(f"  {bold(str(len(errors)))} error(s) found — run --discover to fix them.")
+        else:
+            print(f"  No errors found. Run --summarize when ready.")
         return
 
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
