@@ -2594,12 +2594,13 @@ def run_pass1_focused(
     flagged_names = {i["module"] for i in error_issues}
     flagged_mods = {m.name: m for m in module_map.modules if m.name in flagged_names}
 
-    # Compute required_dirs: top-level dirs of flagged modules that need exploration
+    # Compute required_dirs: top-level dirs of flagged modules that need exploration.
+    # Exclude "." — it can never be marked as explored by _mark_explored.
     required_dirs: set[str] = set()
     for m in flagged_mods.values():
         for dp in m.dir_paths:
             top = dp.split("/")[0] if "/" in dp else dp
-            if top:
+            if top and top != ".":
                 required_dirs.add(top)
 
     print(f"\n[Pass 1 focused] Fixing {len(error_issues)} flagged module(s): "
