@@ -10,6 +10,7 @@ Provides:
 
 import asyncio
 import json
+import re
 import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -126,6 +127,33 @@ def _extract_content(response) -> str:
 _MAX_COMPLETION_TOKEN_MODELS = {"o1", "o1-mini", "o1-preview", "o3", "o3-mini"}
 
 
+def _is_context_overflow(err: Exception) -> bool:
+    """Return True if the error is a context-length overflow."""
+    msg = str(err).lower()
+    return any(phrase in msg for phrase in (
+        "context length", "context_length", "maximum context",
+        "input is too long", "input_tokens", "prompt is too long",
+        "reduce the length", "tokens exceeds",
+    ))
+
+
+def _trim_messages_for_retry(messages: list[dict], fraction: float = 0.15) -> list[dict]:
+    """Return a copy of messages with the largest user/human message trimmed by fraction."""
+    import copy
+    trimmed = copy.deepcopy(messages)
+    # Find the longest user message and trim it
+    longest_idx = max(
+        (i for i, m in enumerate(trimmed) if m["role"] in ("user", "human")),
+        key=lambda i: len(trimmed[i].get("content") or ""),
+        default=None,
+    )
+    if longest_idx is not None:
+        content = trimmed[longest_idx].get("content") or ""
+        keep = int(len(content) * (1 - fraction))
+        trimmed[longest_idx]["content"] = content[:keep] + "\n[...truncated to fit context window...]"
+    return trimmed
+
+
 def _apply_max_tokens(kwargs: dict, model: str, max_tokens: int) -> None:
     """Set the right max tokens parameter for the model.
 
@@ -160,7 +188,20 @@ def llm_call_multi(model: str, system: str, messages: list[dict],
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    response = completion(**kwargs)
+    for _attempt in range(3):
+        try:
+            response = completion(**kwargs)
+            break
+        except Exception as e:
+            if _is_context_overflow(e) and _attempt < 2:
+                print(f"  [warn] Context overflow on attempt {_attempt + 1}, "
+                      f"trimming prompt by {15 * (_attempt + 1)}% and retrying...")
+                kwargs["messages"] = _trim_messages_for_retry(
+                    kwargs["messages"], fraction=0.15 * (_attempt + 1))
+            else:
+                raise
+    else:
+        raise RuntimeError("Context overflow: prompt could not be trimmed enough to fit.")
 
     if tracker and phase:
         tracker.record(phase, response)
@@ -193,7 +234,20 @@ def llm_call(model: str, system: str, user: str,
     if stream:
         kwargs["stream_options"] = {"include_usage": True}
 
-    response = completion(**kwargs)
+    for _attempt in range(3):
+        try:
+            response = completion(**kwargs)
+            break
+        except Exception as e:
+            if _is_context_overflow(e) and _attempt < 2:
+                print(f"  [warn] Context overflow on attempt {_attempt + 1}, "
+                      f"trimming prompt by {15 * (_attempt + 1)}% and retrying...")
+                kwargs["messages"] = _trim_messages_for_retry(
+                    kwargs["messages"], fraction=0.15 * (_attempt + 1))
+            else:
+                raise
+    else:
+        raise RuntimeError("Context overflow: prompt could not be trimmed enough to fit.")
 
     if stream:
         def _gen():
@@ -235,7 +289,20 @@ async def allm_call(model: str, system: str, user: str,
     if json_mode:
         kwargs["response_format"] = {"type": "json_object"}
 
-    response = await acompletion(**kwargs)
+    for _attempt in range(3):
+        try:
+            response = await acompletion(**kwargs)
+            break
+        except Exception as e:
+            if _is_context_overflow(e) and _attempt < 2:
+                print(f"  [warn] Context overflow on attempt {_attempt + 1}, "
+                      f"trimming prompt by {15 * (_attempt + 1)}% and retrying...")
+                kwargs["messages"] = _trim_messages_for_retry(
+                    kwargs["messages"], fraction=0.15 * (_attempt + 1))
+            else:
+                raise
+    else:
+        raise RuntimeError("Context overflow: prompt could not be trimmed enough to fit.")
 
     if tracker and phase:
         tracker.record(phase, response)
