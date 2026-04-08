@@ -4232,14 +4232,11 @@ def main():
                         help="Path(s) to docs files/directories. Used in Pass 1 context. "
                              "Can specify multiple: --docs /path/a /path/b")
     parser.add_argument("--discover", action="store_true",
-                        help="Only run module discovery (Pass 1). "
-                             "Produces module_map.json. If module_map.json already has "
-                             "review errors, runs a focused refinement round instead. "
+                        help="Only run module discovery (Pass 1). Produces module_map.json. "
+                             "If module_map.json already has review errors, runs focused "
+                             "refinement instead. If it has no errors, new modules are merged "
+                             "in (useful for pointing at a subdirectory to fill gaps). "
                              "Run --summarize next.")
-    parser.add_argument("--merge", action="store_true",
-                        help="Merge newly discovered modules into an existing module_map.json "
-                             "instead of replacing it. Use with --discover when pointing at a "
-                             "subdirectory to add modules for that area without disturbing the rest.")
     parser.add_argument("--summarize", action="store_true",
                         help="Only run summarization (Pass 2). Skips module discovery. "
                              "Requires an existing module_map.json from a previous --discover run.")
@@ -4555,23 +4552,26 @@ def main():
 
     # ── Pass 1 ──────────────────────────────────────────────────────────────────
     if not args.summarize:
-        # Check if an existing module_map has review errors → focused re-run
+        # Check if an existing module_map has review errors → focused re-run;
+        # otherwise run fresh Pass 1 and merge new modules into the existing map.
         _focused = False
+        _existing_map: Optional["ModuleMap"] = None
         if module_map_path.exists():
             try:
-                _existing = ModuleMap(**json.loads(module_map_path.read_text()))
-                _error_issues = [i for i in _existing.review_issues
+                _existing_map = ModuleMap(**json.loads(module_map_path.read_text()))
+                _error_issues = [i for i in _existing_map.review_issues
                                  if i.get("severity") == "error"]
                 if _error_issues:
                     print(f"\n[Pass 1] Existing module_map has {len(_error_issues)} error issue(s) "
                           f"→ running focused refinement instead of full Pass 1")
                     module_map = run_pass1_focused(
-                        args.model, _existing, codebase, files, args.language,
+                        args.model, _existing_map, codebase, files, args.language,
                         tracker=tracker, codebases=codebases,
                     )
                     _focused = True
             except Exception as _e:
                 print(f"  [warn] Could not load existing module_map ({_e}) — running full Pass 1")
+                _existing_map = None
 
         if not _focused:
             docs_context = None
@@ -4596,19 +4596,15 @@ def main():
             module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
                                    tracker=tracker, codebases=codebases)
 
-        if args.merge and module_map_path.exists():
-            try:
-                existing = ModuleMap(**json.loads(module_map_path.read_text()))
-                existing_names = {m.name for m in existing.modules}
+            # Merge into existing map — new modules are added, existing ones kept.
+            if _existing_map is not None:
+                existing_names = {m.name for m in _existing_map.modules}
                 added = [m for m in module_map.modules if m.name not in existing_names]
-                existing.modules.extend(added)
-                # Clear review issues — map changed, needs fresh review
-                existing.review_issues = []
-                module_map = existing
+                _existing_map.modules.extend(added)
+                _existing_map.review_issues = []  # stale after merge — re-review if needed
+                module_map = _existing_map
                 print(f"\n[Pass 1] Merged {len(added)} new module(s) into existing map "
                       f"({len(module_map.modules)} total). Run --review to re-check.")
-            except Exception as _e:
-                print(f"  [warn] Could not load existing module_map for merge ({_e}) — overwriting")
 
         module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
         print(f"\n[Pass 1] Written to {module_map_path}")

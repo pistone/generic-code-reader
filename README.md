@@ -127,6 +127,9 @@ python indexer/study_agent.py --codebase /path/to/src --discover   # fixes flagg
 python indexer/study_agent.py --codebase /path/to/src --review
 # If --review flags errors, run --discover to fix them.
 
+# Point at a subdirectory to fill in missing modules — new ones are merged in automatically:
+python indexer/study_agent.py --codebase /path/to/src/some/subdir --discover
+
 # Phase 2: Summarization → indexer/summaries.json → auto-indexed to R2R
 # The LLM can call search_kb during summarization to look up unfamiliar types and concepts.
 python indexer/study_agent.py --codebase /path/to/src --summarize
