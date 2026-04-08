@@ -1,0 +1,372 @@
+{
+  "modules": [
+    {
+      "name": "analysis-core",
+      "description": "Main analysis entry point, command-line parsing, flags, and memory management",
+      "directories": [
+        "."
+      ],
+      "note": "Root-level files: main.cpp, parseargs.cpp, analysis-flags.cpp, analysis-memory.cpp, logging.cpp"
+    },
+    {
+      "name": "cov-analyze",
+      "description": "Main analysis driver and orchestration framework",
+      "directories": [
+        "cov-analyze"
+      ]
+    },
+    {
+      "name": "traversal",
+      "description": "AST traversal infrastructure and utilities",
+      "directories": [
+        "traversal"
+      ]
+    },
+    {
+      "name": "context",
+      "description": "Analysis context management",
+      "directories": [
+        "context"
+      ]
+    },
+    {
+      "name": "exceptions",
+      "description": "Exception and error handling framework",
+      "directories": [
+        "exceptions"
+      ]
+    },
+    {
+      "name": "dataflow",
+      "description": "Core dataflow analysis infrastructure",
+      "directories": [
+        "dataflow"
+      ]
+    },
+    {
+      "name": "global-dataflow",
+      "description": "Interprocedural and global dataflow analysis",
+      "directories": [
+        "global-dataflow",
+        "global-dataflow/cpp-framework-analyzer",
+        "global-dataflow/cs-dynamic-map-analyzer"
+      ],
+      "note": "Excludes test subdirectories"
+    },
+    {
+      "name": "buda",
+      "description": "Bottom-up dataflow analysis framework",
+      "directories": [
+        "buda",
+        "buda/dataflow-callgraph-checker",
+        "buda/dflow-test",
+        "buda/directives",
+        "buda/locations",
+        "buda/prepass-resolution-checker",
+        "buda/view-resolution-tests"
+      ],
+      "note": "Excludes test-* subdirectories and ported-global-dataflow-tests"
+    },
+    {
+      "name": "value-propagation",
+      "description": "Value propagation analysis",
+      "directories": [
+        "value-propagation"
+      ]
+    },
+    {
+      "name": "liveness",
+      "description": "Liveness analysis for variables and resources",
+      "directories": [
+        "liveness"
+      ]
+    },
+    {
+      "name": "abstract-interpretation",
+      "description": "Abstract interpretation framework with caching and state management",
+      "directories": [
+        "abstract-interpretation",
+        "abstract-interpretation/caching",
+        "abstract-interpretation/state"
+      ]
+    },
+    {
+      "name": "checkers-generic",
+      "description": "Generic core checkers for common defect patterns",
+      "directories": [
+        "checkers/generic"
+      ]
+    },
+    {
+      "name": "checkers-security",
+      "description": "Security vulnerability checkers (injection, XSS, crypto misuse, etc.)",
+      "directories": [
+        "checkers/security"
+      ]
+    },
+    {
+      "name": "checkers-concurrency",
+      "description": "Concurrency and threading defect checkers",
+      "directories": [
+        "checkers/concurrency"
+      ]
+    },
+    {
+      "name": "checkers-type",
+      "description": "Type system and type safety checkers",
+      "directories": [
+        "checkers/type-checkers"
+      ]
+    },
+    {
+      "name": "checker-libs",
+      "description": "Shared checker libraries and utilities",
+      "directories": [
+        "checkers/checker-libs",
+        "checkers/lib"
+      ]
+    },
+    {
+      "name": "compliance-AUTOSAR",
+      "description": "AUTOSAR C++ coding standard checkers",
+      "directories": [
+        "checkers/AUTOSAR"
+      ]
+    },
+    {
+      "name": "compliance-MISRA",
+      "description": "MISRA C/C++ coding standard checkers",
+      "directories": [
+        "checkers/MISRA",
+        "checkers/former-PSO-MISRA"
+      ]
+    },
+    {
+      "name": "compliance-CERT",
+      "description": "CERT secure coding standard checkers",
+      "directories": [
+        "checkers/CERT"
+      ]
+    },
+    {
+      "name": "compliance-HIS",
+      "description": "HIS automotive coding standard checkers",
+      "directories": [
+        "checkers/HIS"
+      ]
+    },
+    {
+      "name": "compliance-android",
+      "description": "Android platform-specific checkers",
+      "directories": [
+        "checkers/android"
+      ]
+    },
+    {
+      "name": "compliance-framework",
+      "description": "Compliance checker framework and infrastructure",
+      "directories": [
+        "compliance"
+      ]
+    },
+    {
+      "name": "codexm",
+      "description": "CodeXM custom modeling language parser, interpreter, and dataflow integration",
+      "directories": [
+        "codexm"
+      ],
+      "note": "Excludes test subdirectories like csharp-pattern-tests, cstest-print, cudatest-print"
+    },
+    {
+      "name": "codexm-shared",
+      "description": "Shared CodeXM utilities and infrastructure",
+      "directories": [
+        "codexm-shared"
+      ]
+    },
+    {
+      "name": "codexm-checkers",
+      "description": "CodeXM-based custom checkers",
+      "directories": [
+        "checkers/codexm",
+        "checkers/codexm-wuhan"
+      ]
+    },
+    {
+      "name": "ast-utils",
+      "description": "AST manipulation and query utilities",
+      "directories": [
+        "ast-utils"
+      ]
+    },
+    {
+      "name": "ast-analysis",
+      "description": "AST-level analysis tools",
+      "directories": [
+        "ast-analysis"
+      ]
+    },
+    {
+      "name": "cfg-analysis",
+      "description": "Control flow graph construction and analysis",
+      "directories": [
+        "cfg-analysis"
+      ]
+    },
+    {
+      "name": "constraint-utils",
+      "description": "Constraint solving utilities",
+      "directories": [
+        "constraint-utils"
+      ]
+    },
+    {
+      "name": "fpp",
+      "description": "False path pruning with constraint solvers",
+      "directories": [
+        "fpp",
+        "fpp/solvers"
+      ]
+    },
+    {
+      "name": "core-derivers",
+      "description": "Core derivers for function pointers, killpaths, length functions, and printf",
+      "directories": [
+        "core-derivers",
+        "core-derivers/fnptr-source",
+        "core-derivers/killpaths",
+        "core-derivers/length-function",
+        "core-derivers/printf-function"
+      ]
+    },
+    {
+      "name": "global",
+      "description": "Global analysis coordination and infrastructure",
+      "directories": [
+        "global"
+      ]
+    },
+    {
+      "name": "crypto",
+      "description": "Cryptography API usage analysis",
+      "directories": [
+        "crypto"
+      ],
+      "note": "Excludes crypto/tests"
+    },
+    {
+      "name": "statistical",
+      "description": "Statistical analysis and metrics",
+      "directories": [
+        "statistical"
+      ]
+    },
+    {
+      "name": "preprocessor-directive-analysis",
+      "description": "Preprocessor directive analysis",
+      "directories": [
+        "preprocessor-directive-analysis"
+      ]
+    },
+    {
+      "name": "iface-tracker",
+      "description": "Interface tracking and analysis",
+      "directories": [
+        "iface-tracker"
+      ]
+    },
+    {
+      "name": "metadata-sms",
+      "description": "Metadata and SMS (source management system) handling",
+      "directories": [
+        "metadata-sms"
+      ]
+    },
+    {
+      "name": "modelling",
+      "description": "Function and library modeling framework",
+      "directories": [
+        "modelling"
+      ]
+    },
+    {
+      "name": "prevent-models",
+      "description": "User-defined models, directives, and configurations",
+      "directories": [
+        "prevent-models",
+        "prevent-models/config",
+        "prevent-models/directives",
+        "prevent-models/models",
+        "prevent-models/prompts",
+        "prevent-models/tslang"
+      ],
+      "note": "Excludes prevent-models/tests"
+    },
+    {
+      "name": "sm",
+      "description": "State machine analysis",
+      "directories": [
+        "sm"
+      ]
+    },
+    {
+      "name": "watchdog",
+      "description": "Analysis watchdog and timeout management",
+      "directories": [
+        "watchdog"
+      ],
+      "note": "Excludes watchdog/test1"
+    },
+    {
+      "name": "errrep",
+      "description": "Error reporting infrastructure",
+      "directories": [
+        "errrep"
+      ]
+    },
+    {
+      "name": "ide-integration",
+      "description": "IDE integration support and utilities",
+      "directories": [
+        "ide-integration"
+      ]
+    },
+    {
+      "name": "extend",
+      "description": "Extensibility framework for custom analysis",
+      "directories": [
+        "extend"
+      ]
+    },
+    {
+      "name": "code-analysis",
+      "description": "General code analysis utilities",
+      "directories": [
+        "code-analysis"
+      ]
+    }
+  ],
+  "metadata": {
+    "base_path": "/data00/songtao/prevent/analysis",
+    "total_modules": 44,
+    "excludes": [
+      "All directories matching test-*",
+      "All directories matching *-tests",
+      "parallel-tests/",
+      "buda/ported-global-dataflow-tests/",
+      "crypto/tests/",
+      "prevent-models/tests/",
+      "watchdog/test1/",
+      "checkers/csp_testsuite/",
+      "checkers/jp-testsuite/",
+      "checkers/test-checkers/",
+      "checkers/examples/",
+      "checkers/directives-override/"
+    ],
+    "notes": [
+      "All directory paths are relative to /data00/songtao/prevent/analysis",
+      "Test directories are explicitly excluded per module discovery best practices",
+      "The analysis-core module uses '.' to represent root-level source files"
+    ]
+  }
+}

@@ -1,0 +1,487 @@
+{
+  "modules": [
+    {
+      "name": "ast-infrastructure",
+      "description": "Abstract Syntax Tree infrastructure, manipulation, and emission",
+      "directories": [
+        "ast",
+        "ast/ast",
+        "ast/emit",
+        "ast/expr-eval",
+        "ast/MISRA",
+        "ast/patterns",
+        "ast/preprocessor-info",
+        "ast/scope",
+        "ast/symbols",
+        "ast/types",
+        "ast/xref-emitter",
+        "ast/xrefs"
+      ]
+    },
+    {
+      "name": "language-frontends-dotnet",
+      "description": ".NET/C#/VB language frontend support and bytecode processing",
+      "directories": [
+        "dotnet",
+        "dotnet-assembly",
+        "bytecode-decompilation/dotnet",
+        "ms-clr",
+        "typelib",
+        "swig-go-ast",
+        "swig-java-ast"
+      ]
+    },
+    {
+      "name": "language-frontends-java",
+      "description": "Java language frontend support and bytecode processing",
+      "directories": [
+        "jfe",
+        "java-runtime",
+        "bytecode-decompilation/java",
+        "jar-manifest-parser",
+        "jsp-dom"
+      ],
+      "note": "Excludes jfe/unit-test"
+    },
+    {
+      "name": "language-frontends-web",
+      "description": "JavaScript/TypeScript/web language support",
+      "directories": [
+        "embedded-lang",
+        "sourcemap-utils",
+        "webapp-mapping"
+      ]
+    },
+    {
+      "name": "security-analysis",
+      "description": "Security vulnerability analysis libraries",
+      "directories": [
+        "security-da",
+        "security-da/csharp",
+        "security-da/java",
+        "xss-prover",
+        "xss-context",
+        "sql-context",
+        "crypto",
+        "crypto-types"
+      ],
+      "note": "Excludes xss-prover/test-data"
+    },
+    {
+      "name": "authentication-licensing",
+      "description": "Authentication, licensing, and host identification",
+      "directories": [
+        "auth-key",
+        "license",
+        "hostid"
+      ],
+      "note": "Excludes auth-key/test-* subdirs"
+    },
+    {
+      "name": "database-persistence",
+      "description": "Database access and defect storage",
+      "directories": [
+        "db",
+        "defects-db",
+        "datablock",
+        "commit-protocol",
+        "commit-protocol/avro",
+        "commit-protocol/spec"
+      ]
+    },
+    {
+      "name": "file-io",
+      "description": "File operations, archiving, and compression",
+      "directories": [
+        "file",
+        "zip",
+        "unzip",
+        "tar",
+        "minizip-wrapper",
+        "lookahead-reader"
+      ]
+    },
+    {
+      "name": "text-processing",
+      "description": "Text manipulation, parsing, and formatting",
+      "directories": [
+        "text",
+        "text-flatten",
+        "structured-text",
+        "tokenizer",
+        "char-enc",
+        "istring",
+        "printf-format",
+        "scanf-format",
+        "parse-format-string"
+      ]
+    },
+    {
+      "name": "data-formats",
+      "description": "JSON, XML, YAML, and structured data handling",
+      "directories": [
+        "json",
+        "json-options",
+        "json-schema",
+        "xml",
+        "xslt",
+        "simdjson-helpers",
+        "properties-file"
+      ],
+      "note": "Excludes xml/unit-test, simdjson-helpers/unit-test"
+    },
+    {
+      "name": "network-http",
+      "description": "HTTP, WebSocket, and network client libraries",
+      "directories": [
+        "http",
+        "http-client",
+        "websocket-client",
+        "uri",
+        "cim-url"
+      ]
+    },
+    {
+      "name": "memory-management",
+      "description": "Memory allocation, pooling, and smart pointers",
+      "directories": [
+        "allocator",
+        "arena",
+        "pool",
+        "cache"
+      ]
+    },
+    {
+      "name": "containers-collections",
+      "description": "Container data structures and algorithms",
+      "directories": [
+        "containers",
+        "intervals",
+        "lossy-trie",
+        "union-find",
+        "automaton-minimizer",
+        "sort-expr"
+      ]
+    },
+    {
+      "name": "threading-concurrency",
+      "description": "Thread management, locking, and synchronization",
+      "directories": [
+        "threads",
+        "lock",
+        "watchdog-thread"
+      ],
+      "note": "Excludes lock/test-* subdirs and lock/cov-* test utilities"
+    },
+    {
+      "name": "crypto-hashing",
+      "description": "Cryptographic utilities and hashing",
+      "directories": [
+        "hash",
+        "base64"
+      ]
+    },
+    {
+      "name": "error-handling",
+      "description": "Exception handling, error reporting, and assertions",
+      "directories": [
+        "exceptions",
+        "error-annotations",
+        "parse-errors"
+      ],
+      "note": "Excludes exceptions/backtrace-test"
+    },
+    {
+      "name": "logging-debug",
+      "description": "Logging, debugging, and diagnostic utilities",
+      "directories": [
+        "logging",
+        "debug",
+        "debug-heap"
+      ],
+      "note": "Excludes debug-heap/debug-heap-tests"
+    },
+    {
+      "name": "cfg-callgraph",
+      "description": "Control flow graph and call graph analysis",
+      "directories": [
+        "cfg",
+        "callgraph",
+        "callgraph-export"
+      ]
+    },
+    {
+      "name": "metrics-analysis",
+      "description": "Code metrics, analysis metrics, and function measurements",
+      "directories": [
+        "analysis-metrics",
+        "analysis-output",
+        "build-metrics",
+        "function-metrics",
+        "metrics",
+        "analyzable-lines",
+        "count-lines"
+      ]
+    },
+    {
+      "name": "build-infrastructure",
+      "description": "Build system, dependency management, and resource requirements",
+      "directories": [
+        "build",
+        "analysis-resource-requirements"
+      ]
+    },
+    {
+      "name": "version-management",
+      "description": "Version handling and comparison",
+      "directories": [
+        "version",
+        "comparable-version",
+        "external-version",
+        "internal-version"
+      ],
+      "note": "Excludes comparable-version/cmd-test-*, external-version/test-version-parsing"
+    },
+    {
+      "name": "internationalization",
+      "description": "Internationalization and localization support",
+      "directories": [
+        "i18n"
+      ]
+    },
+    {
+      "name": "regex-pattern-matching",
+      "description": "Regular expressions and pattern matching",
+      "directories": [
+        "regex",
+        "search-pattern",
+        "entity-pattern",
+        "wildcard",
+        "lexical-entity-map"
+      ]
+    },
+    {
+      "name": "script-utilities",
+      "description": "Script parsing, execution, and utilities",
+      "directories": [
+        "script",
+        "script-data",
+        "script-idir",
+        "script-license"
+      ],
+      "note": "Excludes script-idir/test* subdirs"
+    },
+    {
+      "name": "constraint-solving",
+      "description": "Constraint solving and satisfiability",
+      "directories": [
+        "constraint"
+      ]
+    },
+    {
+      "name": "graph-algorithms",
+      "description": "Graph search and algorithm libraries",
+      "directories": [
+        "graph-search",
+        "rta"
+      ]
+    },
+    {
+      "name": "code-identity",
+      "description": "Code base identification and merge keys",
+      "directories": [
+        "code-base-identity",
+        "new-merge-key",
+        "linkage-id"
+      ]
+    },
+    {
+      "name": "scm-integration",
+      "description": "Source control management integration",
+      "directories": [
+        "scm-annotations",
+        "scm-util",
+        "repo-relative"
+      ],
+      "note": "Excludes scm-annotations/unit-test, repo-relative/unit-test"
+    },
+    {
+      "name": "model-decompilation",
+      "description": "Model decompilation and bytecode transformation",
+      "directories": [
+        "model-decompilation",
+        "bytecode-decompilation",
+        "bytecode-dump",
+        "bytecode-to-ast"
+      ]
+    },
+    {
+      "name": "compliance-config",
+      "description": "Compliance standard configuration and properties",
+      "directories": [
+        "compliance-config",
+        "checker-properties",
+        "misra-common"
+      ]
+    },
+    {
+      "name": "options-configuration",
+      "description": "Command-line options and configuration management",
+      "directories": [
+        "options",
+        "literal-flags"
+      ]
+    },
+    {
+      "name": "message-handling",
+      "description": "Message formatting and display",
+      "directories": [
+        "message",
+        "defect-extra"
+      ]
+    },
+    {
+      "name": "reporting-output",
+      "description": "Report generation and output formatting",
+      "directories": [
+        "desktop-report",
+        "import-results",
+        "import-sigma-results",
+        "sourcecode-dump"
+      ]
+    },
+    {
+      "name": "web-integration",
+      "description": "Web API integration and CIM connectivity",
+      "directories": [
+        "cim-webapi",
+        "ciem-cmdline-utils",
+        "polaris-cache",
+        "summary-server-data"
+      ]
+    },
+    {
+      "name": "sigma-integration",
+      "description": "Sigma hybrid frontend integration",
+      "directories": [
+        "sigma-integration",
+        "sigma-name"
+      ]
+    },
+    {
+      "name": "framework-analysis",
+      "description": "Framework and library pattern analysis",
+      "directories": [
+        "framework-analyzer"
+      ]
+    },
+    {
+      "name": "flatten-utilities",
+      "description": "AST and code flattening utilities",
+      "directories": [
+        "flatten"
+      ]
+    },
+    {
+      "name": "system-utilities",
+      "description": "System-level utilities and platform abstraction",
+      "directories": [
+        "system",
+        "time",
+        "task-info",
+        "cstream",
+        "varwidth"
+      ],
+      "note": "Excludes system/cmd-test-win, system/cov-cygwin-test, system/test-DR46626"
+    },
+    {
+      "name": "common-utilities",
+      "description": "Common utility functions and helpers",
+      "directories": [
+        "common-prefix-finder",
+        "bits",
+        "arithmetic",
+        "scan-transparency",
+        "priority-filter",
+        "progress-file"
+      ]
+    },
+    {
+      "name": "frontend-common",
+      "description": "Common frontend utilities",
+      "directories": [
+        "frontend",
+        "cpp-frontend",
+        "capture-shared",
+        "coverity-annotations",
+        "coverity-conf"
+      ]
+    },
+    {
+      "name": "path-manipulation",
+      "description": "Path and directory handling",
+      "directories": [
+        "jpath"
+      ]
+    },
+    {
+      "name": "fxcop-integration",
+      "description": "FxCop XML integration",
+      "directories": [
+        "fxcop-xml"
+      ]
+    },
+    {
+      "name": "interpreter",
+      "description": "Script/expression interpreter",
+      "directories": [
+        "interp",
+        "objparse"
+      ],
+      "note": "Excludes interp/test-interp-multiple-main, objparse/unit-test"
+    },
+    {
+      "name": "unmangle",
+      "description": "Symbol unmangling utilities",
+      "directories": [
+        "unmangle"
+      ]
+    },
+    {
+      "name": "skeleton",
+      "description": "Code generation skeletons and templates",
+      "directories": [
+        "skeleton"
+      ]
+    },
+    {
+      "name": "cic",
+      "description": "CIC (Coverity Integrity Center) utilities",
+      "directories": [
+        "cic"
+      ]
+    }
+  ],
+  "metadata": {
+    "base_path": "/data00/songtao/prevent/libs",
+    "total_modules": 46,
+    "total_directories": 175,
+    "excludes": [
+      "All directories matching test-*",
+      "All directories matching *-test",
+      "All directories matching *-tests",
+      "Unit test directories: analysislibs-unit-tests, corelibs-unit-tests, emitlibs-unit-tests",
+      "Specific test subdirectories as noted per module",
+      "cppunit_main (test framework)",
+      "test-util (test utilities)",
+      "unit-test-common (test utilities)",
+      "unit-test-emit-helper (test utilities)"
+    ],
+    "notes": [
+      "All directory paths are relative to /data00/songtao/prevent/libs",
+      "Modules are grouped by functional purpose for better organization",
+      "Test and unit test directories are explicitly excluded",
+      "Header-only libraries and utility files at root level are included in relevant modules"
+    ]
+  }
+}
