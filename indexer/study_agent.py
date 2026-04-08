@@ -3934,12 +3934,11 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
         for sym, count in top5:
             print(f"  {sym}: called from {count} files")
 
-        # Query R2R for doc mentions (only if RAG is available)
-        if rag:
-            doc_mentions = _lookup_doc_mentions(list(caller_freq.keys()))
-            if doc_mentions:
-                print(f"[Caller frequency] Found doc mentions for "
-                      f"{len(doc_mentions)} functions")
+        # Query R2R for doc mentions (degrades gracefully if RAG unavailable)
+        doc_mentions = _lookup_doc_mentions(list(caller_freq.keys()))
+        if doc_mentions:
+            print(f"[Caller frequency] Found doc mentions for "
+                  f"{len(doc_mentions)} functions")
     else:
         print(f"\n[Caller frequency] No frequently-called functions detected ({elapsed:.1f}s)")
 
