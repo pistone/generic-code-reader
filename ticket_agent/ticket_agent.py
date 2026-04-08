@@ -365,11 +365,13 @@ def extract_knowledge(model: str, context: str,
 # ---------------------------------------------------------------------------
 
 LESSON_SYSTEM = (
-    "You generate generalizable lessons from resolved engineering tickets. "
-    "A lesson is a reusable how-to or pattern that helps a future developer "
-    "working in this area of the codebase — not a summary of the bug itself. "
-    "Be specific: name the classes, patterns, or conventions involved. "
-    "Output ONLY the lesson text (plain markdown, no JSON, no preamble)."
+    "You write detailed how-to lessons from resolved engineering tickets. "
+    "A lesson reads like a recipe: it tells a future developer exactly what "
+    "steps, files, classes, and conventions are involved in making a particular "
+    "type of change in this codebase. "
+    "Be concrete and specific — name actual files, classes, traits, modules, "
+    "and patterns from the solution. Avoid vague advice. "
+    "Output ONLY the lesson in plain markdown (no JSON, no preamble, no ticket summary)."
 )
 
 LESSON_PROMPT_TEMPLATE = """Ticket: {key} — {title}
@@ -378,13 +380,27 @@ Problem summary: {summary}
 
 Solution: {solution}
 
-Write a lesson learned that a future developer can apply. Focus on:
-- What pattern or convention this reveals (how to do X in this codebase)
-- What to watch out for (pitfalls, assumptions the code makes)
-- Any architectural constraint the fix exposed
+Write a how-to lesson for a future developer who needs to make a similar change.
 
-Write 2-4 sentences of plain prose. Be specific — use actual class/function
-names from the solution if available. Do NOT summarize the bug; teach the lesson."""
+Structure your lesson as follows:
+
+**To <do the thing described by this ticket> in this codebase:**
+
+1. Start with a one-sentence description of what kind of change this is
+   (e.g. "To add a new Rust checker", "To register a new device driver",
+   "To extend the policy engine with a new rule").
+
+2. List the concrete steps the change involves — each step should name the
+   specific file, class, trait, function, or config that needs to change and
+   what needs to happen there. Aim for 4-8 steps.
+
+3. Call out any non-obvious pitfalls, ordering constraints, or conventions
+   the solution revealed (e.g. "registration must happen before X", "the
+   base class requires overriding Y or it silently no-ops").
+
+Use the actual names from the solution. Do NOT restate the bug or ticket summary.
+Write for someone who already understands the codebase but has never made this
+specific type of change before."""
 
 
 def generate_lesson(model: str, ticket: dict, extraction: dict,
@@ -407,7 +423,7 @@ def generate_lesson(model: str, ticket: dict, extraction: dict,
     )
     try:
         lesson = llm_call(model, LESSON_SYSTEM, prompt,
-                          max_tokens=300, tracker=tracker, phase="Lessons")
+                          max_tokens=700, tracker=tracker, phase="Lessons")
         lesson = lesson.strip()
         if len(lesson) < 30:
             return None
