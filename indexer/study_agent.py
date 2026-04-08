@@ -4554,26 +4554,26 @@ def main():
     if not args.summarize:
         # Check if an existing module_map has review errors → focused re-run;
         # otherwise run fresh Pass 1 and merge new modules into the existing map.
-        _focused = False
         _existing_map: Optional["ModuleMap"] = None
         if module_map_path.exists():
             try:
                 _existing_map = ModuleMap(**json.loads(module_map_path.read_text()))
-                _error_issues = [i for i in _existing_map.review_issues
-                                 if i.get("severity") == "error"]
-                if _error_issues:
-                    print(f"\n[Pass 1] Existing module_map has {len(_error_issues)} error issue(s) "
-                          f"→ running focused refinement instead of full Pass 1")
-                    module_map = run_pass1_focused(
-                        args.model, _existing_map, codebase, files, args.language,
-                        tracker=tracker, codebases=codebases,
-                    )
-                    _focused = True
             except Exception as _e:
                 print(f"  [warn] Could not load existing module_map ({_e}) — running full Pass 1")
-                _existing_map = None
 
-        if not _focused:
+        _error_issues = (
+            [i for i in _existing_map.review_issues if i.get("severity") == "error"]
+            if _existing_map else []
+        )
+
+        if _error_issues:
+            print(f"\n[Pass 1] Existing module_map has {len(_error_issues)} error issue(s) "
+                  f"→ running focused refinement instead of full Pass 1")
+            module_map = run_pass1_focused(
+                args.model, _existing_map, codebase, files, args.language,
+                tracker=tracker, codebases=codebases,
+            )
+        else:
             docs_context = None
             if args.docs:
                 parts = []
@@ -4596,15 +4596,21 @@ def main():
             module_map = run_pass1(args.model, codebase, files, args.language, docs_context,
                                    tracker=tracker, codebases=codebases)
 
-            # Merge into existing map — new modules are added, existing ones kept.
-            if _existing_map is not None:
-                existing_names = {m.name for m in _existing_map.modules}
-                added = [m for m in module_map.modules if m.name not in existing_names]
-                _existing_map.modules.extend(added)
-                _existing_map.review_issues = []  # stale after merge — re-review if needed
-                module_map = _existing_map
-                print(f"\n[Pass 1] Merged {len(added)} new module(s) into existing map "
+        # Always merge back with the existing map so no modules are lost.
+        # For focused refinement: run_pass1_focused should include all modules, but
+        # any the LLM accidentally dropped are re-added from the original.
+        # For fresh Pass 1: modules with new names are added to the existing set.
+        if _existing_map is not None:
+            new_names = {m.name for m in module_map.modules}
+            preserved = [m for m in _existing_map.modules if m.name not in new_names]
+            if preserved:
+                module_map.modules.extend(preserved)
+                print(f"  [Pass 1] Preserved {len(preserved)} existing module(s) not touched by this run.")
+            added = len(module_map.modules) - len(_existing_map.modules)
+            if added > 0:
+                print(f"  [Pass 1] Added {added} new module(s) "
                       f"({len(module_map.modules)} total). Run --review to re-check.")
+            module_map.review_issues = []  # stale after any change
 
         module_map_path.write_text(json.dumps(module_map.model_dump(), indent=2))
         print(f"\n[Pass 1] Written to {module_map_path}")
