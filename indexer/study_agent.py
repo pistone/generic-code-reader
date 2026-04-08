@@ -30,7 +30,7 @@ Usage:
   OPENAI_API_KEY=sk-... python study_agent.py --codebase /path/to/src
 
   # Skip Pass 1 if module_map.json already exists
-  python study_agent.py --codebase /path/to/src --pass2-only
+  python study_agent.py --codebase /path/to/src --summarize
 """
 
 import argparse
@@ -2272,7 +2272,7 @@ def run_pass1(model: str, codebase: Path, files: list[Path],
         print(f"  {red('[error]')} {i['module']}: {i['description']}")
     if errors:
         print(f"\n  {bold(str(len(errors)))} issue(s) saved to module_map.json. "
-              f"Re-run with --pass1-only to fix them.")
+              f"Re-run with --discover to fix them.")
     module_map.review_issues = issues
 
     return module_map
@@ -2310,7 +2310,7 @@ def review_module_map(
 
     Returns (issues, overall_comment).
     issues: list of {"module", "issue_type", "description", "severity"}
-      severity: "error" → re-run with --pass1-only to fix
+      severity: "error" → re-run with --discover to fix
                 "warn"  → advisory, noted but not blocking
 
     issue_type values:
@@ -2622,7 +2622,7 @@ def run_pass1_focused(
     for i in remaining_errors:
         print(f"  {red('[error]')} {i['module']}: {i['description']}")
     if remaining_errors:
-        print(f"  {len(remaining_errors)} issue(s) remain. Re-run --pass1-only to continue refining.")
+        print(f"  {len(remaining_errors)} issue(s) remain. Re-run --discover to continue refining.")
     else:
         print(f"  {green('Module map looks good.')} No more errors.")
 
