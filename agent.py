@@ -214,10 +214,15 @@ TOOLS: list[dict] = [
     {
         "name": "download_confluence",
         "description": (
-            "Download pages from a Confluence space as Markdown files and optionally "
-            "index them into R2R. "
+            "Download pages from a Confluence space as Markdown files with rich metadata "
+            "(page ID, URL, breadcrumb, version, last modified, author, labels). "
+            "Incremental by default — skips pages whose version hasn't changed. "
             "Requires CONFLUENCE_URL, CONFLUENCE_EMAIL, CONFLUENCE_TOKEN env vars. "
-            "Use also_index=true to combine download + indexing in one step."
+            "NOTE: All pages are downloaded — Confluence spaces are typically small enough "
+            "that downloading everything is practical. Use include_pattern or exclude_pattern "
+            "for coarse title-based filtering if you know certain sections are irrelevant "
+            "(e.g. exclude_pattern='Meeting Notes|OKR|Hiring'). "
+            "Relevance decisions are better made by you (the agent) after seeing the page list."
         ),
         "input_schema": {
             "type": "object",
@@ -237,7 +242,7 @@ TOOLS: list[dict] = [
                 },
                 "exclude_pattern": {
                     "type": "string",
-                    "description": "Regex: exclude pages whose title matches.",
+                    "description": "Regex: exclude pages whose title matches (e.g. 'Meeting Notes|OKR').",
                 },
                 "max_pages": {
                     "type": "integer",
@@ -247,6 +252,12 @@ TOOLS: list[dict] = [
                 "also_index": {
                     "type": "boolean",
                     "description": "Index downloaded pages into R2R immediately.",
+                    "default": True,
+                },
+                "incremental": {
+                    "type": "boolean",
+                    "description": "Skip pages whose Confluence version hasn't changed since "
+                                   "last download. Default true.",
                     "default": True,
                 },
             },
