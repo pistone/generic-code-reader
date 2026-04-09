@@ -149,16 +149,18 @@ Claude (the orchestrating agent) decides the sequence:
 
 ---
 
-## Module Discovery: Claude in One Shot
+## Module Discovery: Claude Understands Your Codebase
 
-**Old approach** — LLM exploration loop:
-- 30+ tool calls, explores interactively, can rush or miss directories
-- Slow, expensive, unpredictable
+The system asks Claude to read the directory tree, package manifests, READMEs,
+and key index files — then identify the meaningful modules in one shot.
 
-**New approach** — single Claude call:
-- Pre-gather: filtered directory tree + manifests (`Cargo.toml`, `package.json`, …) + READMEs + index files (`__init__.py`, `lib.rs`, …)
-- One call: "here's the full picture — identify the modules"
-- Result: better modules, 10× faster, nothing missed
+Claude is surprisingly good at this. Given the right context it produces
+the same breakdown a senior engineer would: not just top-level directories,
+but the actual subsystems and their responsibilities.
+
+Each module gets a set of domain-specific questions that guide the summarisation —
+_"what triggers a retry?", "what invariants does the cache maintain?"_ —
+so summaries are focused on what engineers actually ask about.
 
 ---
 
@@ -279,4 +281,4 @@ python agent.py "Index the knowledge base for /path/to/src"
 # search_codebase is ready
 ```
 
-Repo: **github.com/pistone/generic-code-reader**
+Questions? Happy to walk through any part in more detail.
