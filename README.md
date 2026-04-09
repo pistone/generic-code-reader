@@ -217,6 +217,76 @@ python reviewer/reviewer_agent.py --codebase /path/to/your/src
 python reviewer/reviewer_agent.py --codebase /path/to/your/src --watch
 ```
 
+## Team Setup
+
+Share the KB across your team — one R2R instance, many users.
+
+### 1. Run R2R on a shared server
+
+```bash
+# On the server (e.g. a team VM or dev box)
+docker compose -f r2r/compose.yaml up -d
+```
+
+R2R listens on port 7272. Make sure it's reachable from teammates' machines (internal network or VPN).
+
+### 2. Build the KB once
+
+```bash
+# On the server, or from any machine with access
+R2R_URL=http://your-server:7272 python agent.py "Index the KB for /path/to/src"
+```
+
+### 3. Each teammate: clone repo + configure
+
+```bash
+git clone <repo-url> && cd generic-code-reader
+python -m venv .venv && source .venv/bin/activate && pip install -r requirements.txt
+```
+
+Edit `.mcp.json` to point at the shared server:
+
+```json
+{
+  "mcpServers": {
+    "domain-kb": {
+      "command": ".venv/bin/python",
+      "args": ["mcp_server/server.py"],
+      "env": {
+        "R2R_URL": "http://your-server:7272",
+        "KB_SEARCH_LIMIT": "5"
+      }
+    }
+  }
+}
+```
+
+Open Claude Code in the repo directory — `search_codebase` is immediately available, hitting the shared KB.
+
+### 4. Shared staging queue (optional)
+
+`suggest_index_item()` writes to `mcp_server/staging_queue.json` locally by default. For a team, point everyone at a shared path so suggestions from any teammate are reviewed centrally:
+
+```json
+"env": {
+  "R2R_URL": "http://your-server:7272",
+  "STAGING_FILE": "/shared/path/staging_queue.json"
+}
+```
+
+Run the reviewer on the server (or any machine with access to the shared path):
+
+```bash
+STAGING_FILE=/shared/path/staging_queue.json \
+python reviewer/reviewer_agent.py --codebase /path/to/src --watch
+```
+
+Approved suggestions are promoted into R2R and immediately available to all teammates.
+
+### Security note
+
+R2R has no authentication by default. On an internal network this is usually fine. For external access, put R2R behind a reverse proxy (nginx/Caddy) with basic auth or restrict to VPN only.
+
 ## Testing
 
 ```bash

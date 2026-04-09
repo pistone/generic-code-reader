@@ -45,7 +45,8 @@ MAX_FILE_CHARS  = 3000  # max chars to read per cited source file
 KB_SEARCH_LIMIT = 5     # how many similar KB entries to fetch for dup check
 
 BASE_DIR       = Path(__file__).parent
-STAGING_FILE   = BASE_DIR.parent / "mcp_server" / "staging_queue.json"
+_default_staging = BASE_DIR.parent / "mcp_server" / "staging_queue.json"
+STAGING_FILE   = Path(os.environ.get("STAGING_FILE", str(_default_staging)))
 REJECTED_FILE  = BASE_DIR / "rejected_queue.json"
 
 

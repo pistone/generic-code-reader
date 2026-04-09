@@ -115,6 +115,8 @@ docker compose -f r2r/compose.yaml up -d
 ### MCP server
 - R2R must be running with indexed content
 - Registered automatically via `.mcp.json`
+- For a **shared team KB**: set `R2R_URL=http://your-server:7272` in `.mcp.json` env — all teammates search the same R2R instance. See README "Team Setup" for full instructions.
+- `STAGING_FILE` env var overrides where `suggest_index_item()` writes — set to a shared path so the reviewer can process suggestions from all teammates centrally.
 
 ---
 

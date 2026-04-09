@@ -29,8 +29,12 @@ except (ValueError, TypeError):
     SEARCH_LIMIT = 5
 
 BASE_DIR      = Path(__file__).parent
-STAGING_FILE  = BASE_DIR / "staging_queue.json"
 LOG_FILE      = BASE_DIR / "query_log.jsonl"
+
+# STAGING_FILE: override with STAGING_FILE env var for team deployments.
+# Point all teammates at the same shared path (e.g. a network drive or
+# the server's local path when running the reviewer centrally).
+STAGING_FILE  = Path(os.getenv("STAGING_FILE", str(BASE_DIR / "staging_queue.json")))
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
