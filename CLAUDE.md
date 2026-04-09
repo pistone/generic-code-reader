@@ -1,294 +1,213 @@
-# Generic Code Reader — Architecture & Design
+# Generic Code Reader — Agent Guide
 
 ## What This Is
 
-A self-improving domain knowledge base for codebases. The study agent
-analyzes source code and generates domain-aware summaries stored in a
-vector database (R2R). An MCP server exposes these to Claude Code.
-When Claude can't find an answer, it researches manually and suggests
-new entries — a reviewer agent verifies and promotes them automatically.
+A self-improving knowledge base for codebases. Source code is analyzed by an LLM, summaries are stored in R2R (vector DB), and an MCP server exposes them to Claude Code. When Claude can't find an answer, it suggests new entries — a reviewer agent verifies and promotes them.
 
-The system is generic: given any codebase and optional design docs, it
-produces a knowledge base tailored to that domain's vocabulary.
-
-**See also**: `README.md` for setup/operations, `INTERNALS.md` for
-implementation details.
+**See also**: `README.md` for setup/operations, `INTERNALS.md` for implementation details.
 
 ---
 
-## ⚠ The KB is empty until you populate it — required build order
+## KB is empty until you populate it
 
-The MCP server and R2R database start empty. Before any search queries
-will return useful results, you MUST run the population pipeline in order:
+R2R starts empty. Before any `search_codebase` queries return useful results, run the population pipeline.
 
+---
+
+## Primary workflow: agent.py
+
+`agent.py` is a Claude agent that orchestrates the full pipeline. Use it unless you need step-by-step control.
+
+```bash
+# Start R2R first
+docker compose -f r2r/compose.yaml up -d
+
+# Index a codebase
+python agent.py "Index the knowledge base for /path/to/src"
+
+# With docs and tickets
+python agent.py "Index docs at /path/to/docs, index codebase at /path/to/src, fetch Jira tickets for project PROJ"
+
+# Use a hand-crafted module definition (skips auto-discovery)
+python agent.py "Import modules from indexer/analysis_modules.json and summarize /path/to/src"
+
+# Interactive mode
+python agent.py --interactive
 ```
-# 0. Start R2R (once)
-cd r2r && docker compose up -d
 
-# 1. (Optional) Index design docs and runbooks
+`agent.py` always requires `ANTHROPIC_API_KEY` (for the orchestrating agent itself). Summarization uses `LLM_MODEL` (default: `openai/gpt-4o`).
+
+### Tools available to agent.py
+
+| Tool | What it does |
+|------|-------------|
+| `discover_modules` | Claude reads the dir tree, manifests, and READMEs in one shot → `module_map.json` |
+| `import_modules` | Loads a hand-crafted JSON (e.g. `indexer/analysis_modules.json`) → `module_map.json` |
+| `summarize_codebase` | Pass 2: chunk + summarize files, index into R2R. Requires `module_map.json`. |
+| `index_docs` | Parse + summarize + index `.md`/`.html`/`.txt` docs into R2R |
+| `download_confluence` | Download Confluence space pages, optionally index |
+| `fetch_tickets` | Fetch resolved Jira tickets → `ticket_agent/tickets/*.json` |
+| `process_tickets` | Extract lessons from tickets + MR diffs, index into R2R |
+| `search_kb` | Verify what's indexed or answer questions about the codebase |
+
+**`discover_modules` vs `import_modules`**: use `discover_modules` by default — Claude analyzes the codebase in a single shot. Use `import_modules` when the user has already provided a `analysis_modules.json` with hand-crafted module definitions.
+
+### Recommended tool order
+
+1. `index_docs` / `download_confluence` — doc context helps code summarization
+2. `fetch_tickets` + `process_tickets` — engineering lessons from tickets
+3. `discover_modules` or `import_modules` — identify module structure
+4. `summarize_codebase` — most expensive, run last
+
+---
+
+## Fallback: CLI scripts
+
+Use the CLI scripts when you need fine-grained phase control or debugging:
+
+```bash
+# Prerequisites check
+python preflight.py   # R2R health + LLM connectivity
+
+# Module discovery (Pass 1)
+python indexer/study_agent.py --codebase /path/to/src --discover
+python indexer/study_agent.py --codebase /path/to/src --review   # re-review existing map
+
+# Summarization (Pass 2)
+python indexer/study_agent.py --codebase /path/to/src --summarize
+python indexer/study_agent.py --codebase /path/to/src --refine   # fix vague summaries (~5% cost)
+python indexer/study_agent.py --codebase /path/to/src --improve  # rewrite weak summaries
+python indexer/study_agent.py --codebase /path/to/src --reindex  # re-index without re-summarizing
+
+# Docs
 python -m doc_agent.doc_agent --docs /path/to/docs
+python -m doc_agent.doc_agent --docs /path/to/docs --incremental
 
-# 2. REQUIRED — Analyze the codebase and index summaries into R2R
-#    This is the primary KB population step. Without it the KB has nothing.
-python indexer/study_agent.py --codebase /path/to/src
-
-# 3. (Optional) Fetch and process Jira tickets — full 3-step pipeline:
-python -m ticket_agent.fetch_tickets --project PROJ          # fetch
-python -m ticket_agent.ticket_agent --tickets ticket_agent/tickets/  # extract
-python -m doc_agent.doc_agent --docs ticket_agent/lessons    # index lessons
-```
-
-**Do NOT skip to "use the knowledge base" without running at least step 2.**
-An empty KB will return no results for any query.
-
----
-
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────┐
-│  STUDY PHASE (runs once, or incrementally on changes)   │
-│                                                         │
-│  Pass 1: Module Discovery                               │
-│    - LLM tool-calling loop explores directory tree      │
-│    - Produces: module_map.json (modules + questions)    │
-│                                                         │
-│  Pass 2: Summarization                                  │
-│    - File/class/function context → chunk summaries      │
-│    - Each chunk classified: category + search value     │
-│    - Call graph inversion + function cards (no LLM)     │
-│    - Produces: summaries.json, call_graph.json          │
-│                                                         │
-│  Indexer                                                │
-│    - Dual-indexes: summary doc + raw code doc           │
-│    - Low-value chunks (boilerplate) skip indexing       │
-└─────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────┐
-│  RUNTIME (always on, per developer machine)             │
-│                                                         │
-│  MCP Server (FastMCP)                                   │
-│    search_codebase(query)                               │
-│    suggest_index_item(topic, summary, ...)              │
-│    kb_status() / list_modules()                         │
-│                                                         │
-│  Claude Code ←→ MCP Server ←→ R2R (vector DB)          │
-└─────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────┐
-│  REVIEWER → verifies suggestions, indexes or rejects    │
-│  AUDITOR  → detects doc↔code conflicts (report only)    │
-└─────────────────────────────────────────────────────────┘
+# Ticket pipeline (3 mandatory steps in order)
+python -m ticket_agent.fetch_tickets --project PROJ
+python -m ticket_agent.ticket_agent --tickets ticket_agent/tickets/
+python -m doc_agent.doc_agent --docs ticket_agent/lessons         # index lessons into R2R
 ```
 
 ---
 
-## Prerequisites — What Each Tool Needs Before Running
+## Prerequisites checklist
 
-Use this section as a checklist before invoking any tool.
-
-### Always required (every tool)
-| Requirement | How to check | Fix |
+### Always required
+| Requirement | Check | Fix |
 |---|---|---|
 | Python venv active | `which python` → `.venv/bin/python` | `source .venv/bin/activate` |
-| `.env` sourced | `echo $OPENAI_API_KEY` (or your provider) | `source .env` |
-| LLM API key set | `echo $LLM_MODEL` (default: `openai/gpt-4o`) | set key in `.env` |
+| `.env` sourced | `echo $OPENAI_API_KEY` | `source .env` |
+| LLM key set | `echo $LLM_MODEL` (default: `openai/gpt-4o`) | set key in `.env` |
 
-### R2R vector database (required by study_agent, doc_agent, ticket_agent, mcp_server)
+### R2R (required by all indexing tools and mcp_server)
 ```bash
 curl -s http://localhost:7272/v3/health   # must return {"results":{"response":"ok"}}
 # If not running:
-cd r2r && docker compose up -d
+docker compose -f r2r/compose.yaml up -d
 ```
 
-### `indexer/study_agent.py` — codebase analysis
-- R2R running (indexes results at the end of Pass 2)
-- `--codebase /path/to/src` pointing to a readable directory
-- Recommended: GPT-4o or Claude Sonnet or better (weaker models rush Pass 1)
+### Ticket pipeline
+- `JIRA_URL`, `JIRA_EMAIL`, `JIRA_TOKEN` — required for `fetch_tickets`
+- `GITHUB_TOKEN` or `GITLAB_TOKEN` — required for MR diff fetching in `process_tickets`
+- Verify identity before a long run: `python -m ticket_agent.fetch_tickets --project PROJ --debug`
 
-### `doc_agent/doc_agent.py` — document ingestion
-- R2R running
-- `--docs /path/to/docs` pointing to a directory with `.md`, `.pdf`, `.txt`, etc.
+### MCP server
+- R2R must be running with indexed content
+- Registered automatically via `.mcp.json`
 
-### `ticket_agent/fetch_tickets.py` — Jira ticket fetch
-- No R2R needed (writes plain JSON files only)
-- No LLM needed
-- Required env vars:
-  - `JIRA_URL` — e.g. `https://yourco.atlassian.net`
-  - `JIRA_EMAIL` — Atlassian account email that **owns** the API token (must match — wrong email = silent empty results)
-  - `JIRA_TOKEN` — API token from https://id.atlassian.com/manage-profile/security/api-tokens
-- Verify identity before a long run: `python -m ticket_agent.fetch_tickets --project PROJ --debug` prints the authenticated user
+---
 
-### Ticket pipeline — run ALL three steps in order
-
-The ticket workflow is a mandatory three-step pipeline. Skipping any step
-leaves knowledge out of the KB:
+## Architecture diagram
 
 ```
-Step 1: fetch_tickets  →  Step 2: ticket_agent  →  Step 3: doc_agent on lessons
-```
-
-```bash
-# Step 1: Fetch tickets from Jira → ticket_agent/tickets/*.json
-python -m ticket_agent.fetch_tickets --project PROJ
-
-# Step 2: Extract knowledge + generate lessons → indexes ticket summaries into R2R
-#         Also writes how-to lesson .md files to ticket_agent/lessons/
-python -m ticket_agent.ticket_agent --tickets ticket_agent/tickets/
-
-# Step 3: REQUIRED — index the generated lessons into R2R as rich searchable documents
-#         Without this step, how-to recipes from tickets are NOT in the knowledge base.
-python -m doc_agent.doc_agent --docs ticket_agent/lessons
-```
-
-**Why Step 3 is required**: `ticket_agent` writes lesson text to `ticket_agent/lessons/*.md`
-and indexes a plain-text copy into R2R. `doc_agent` re-indexes those same lessons with
-richer chunking and classification, making them properly searchable as how-to guides.
-Skipping Step 3 means lessons exist as files but are not fully indexed.
-
-#### `ticket_agent/ticket_agent.py` prerequisites
-- R2R running — required for indexing. If R2R is unreachable the agent warns
-  and asks to confirm before proceeding; extraction results are always saved to
-  `ticket_summaries.json` so `--reindex` can recover once R2R is up.
-- LLM API key set
-- Ticket JSON files on disk: run `fetch_tickets.py` first (Step 1)
-- MR/PR token — **required** (MR diffs are the primary source of solution context):
-  - `GITHUB_TOKEN` — `read:repo` scope, for GitHub PRs
-  - `GITLAB_TOKEN` + `GITLAB_URL` — for GitLab MRs (default URL: https://gitlab.com)
-  - At least one must be set or the agent exits with an error
-  - Use `--no-mr` only if tokens are genuinely unavailable or tickets have no linked MRs
-- Resumable: if interrupted, re-run the same command — already-processed tickets are skipped via hash manifest
-
-### `mcp_server/server.py` — MCP search server
-- R2R running with indexed content (run study_agent + doc_agent first)
-- No LLM needed at runtime (search is embedding-based)
-- Registered automatically via `.mcp.json` when opening Claude Code in this directory
-
-### `reviewer/reviewer_agent.py` — suggestion reviewer
-- R2R running
-- LLM API key set
-- Runs continuously; triggered by `suggest_index_item()` calls from the MCP server
-
-### Quick environment sanity check
-```bash
-python preflight.py    # checks R2R health, LLM connectivity, embeddings in one shot
+┌──────────────────────────────────────────────────────────┐
+│  POPULATION (agent.py or CLI)                            │
+│                                                          │
+│  discover_modules / import_modules → module_map.json     │
+│  summarize_codebase → summaries.json → R2R               │
+│  index_docs / process_tickets → R2R                      │
+└──────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│  RUNTIME (always on)                                     │
+│                                                          │
+│  MCP Server: search_codebase(), suggest_index_item()     │
+│  Claude Code ←→ MCP Server ←→ R2R                        │
+└──────────────────────────────────────────────────────────┘
+                         │
+                         ▼
+┌──────────────────────────────────────────────────────────┐
+│  REVIEWER → verifies suggestions, indexes or rejects     │
+│  AUDITOR  → detects doc↔code conflicts (report only)     │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Key Design Decisions
+## Key design decisions
 
-### 1. LLM-generated summaries, not raw chunks
+**LLM-generated summaries, not raw chunks** — raw code embeds poorly; domain-vocabulary summaries retrieve much better. Hybrid storage: summary doc (for search quality) + raw source (for exact identifier matches).
 
-Raw code chunks embed poorly. LLM summaries using domain vocabulary
-embed and retrieve much better for natural language queries.
+**Chunk classification** — each chunk tagged with category (`algorithm`, `contract`, `glue`, `error_handling`, `data_model`, `boilerplate`) and search value (`high`, `medium`, `low`). `boilerplate` + `low` chunks skip R2R indexing.
 
-**Hybrid storage**: index the summary (for search quality) + raw source
-code as a separate document (for exact identifier matches).
+**`discover_modules` is single-shot** — Claude reads the full dir tree, manifests, and READMEs in one call and outputs `module_map.json`. The old exploration loop (`study_agent.py --discover`) is still available but secondary.
 
-### 2. Chunk classification
-
-Each chunk is tagged by the LLM with:
-- **Category**: `algorithm`, `contract`, `glue`, `error_handling`,
-  `data_model`, `boilerplate`
-- **Search value**: `high`, `medium`, `low`
-
-`boilerplate` + `low` chunks skip R2R indexing. Classification is stored
-as R2R metadata for filtered search.
-
-### 3. Doc agent for document ingestion
-
-Runs **before** study agent so code summarization can pull doc knowledge
-via RAG. Each doc chunk classified by `source_kind`: specification,
-rationale, tutorial, operational, reference, overview.
-
-### 4. MCP server
-
-Two main tools + two introspection tools:
-- `search_codebase(query)` — hybrid semantic search across all sources
-  (code, docs, tickets). Cross-source linking hints when related
-  knowledge exists in other source types.
-- `suggest_index_item(...)` — queues new entries for reviewer
-- `kb_status()` — R2R health + KB statistics
-- `list_modules()` — indexed module names and descriptions
-
-### 5. Crash safety and resumability
-
-- Summaries saved incrementally every 10 chunks
-- Content hash verification prevents stale cache reuse on resume
-- Quota exhaustion halts all agents gracefully, saves progress
-- `--incremental` uses SHA256 file manifest to skip unchanged files
-
-### 6. Token tracking
-
-All agents track prompt/completion tokens via shared `TokenTracker`.
-Costs logged to `cost_log.jsonl`. Dashboard (`dashboard.py`) shows
-token savings from KB vs raw file reads.
+**Crash safety** — summaries saved every 10 chunks; content hashes prevent stale cache reuse; `--incremental` uses SHA256 manifest.
 
 ---
 
-## File Structure
+## File structure
 
 ```
 generic-code-reader/
-├── CLAUDE.md              ← this file (architecture)
-├── README.md              ← setup, operations, troubleshooting
-├── INTERNALS.md           ← implementation details
-├── run.py                 ← one-command orchestrator
-├── status.py              ← KB health dashboard
-├── dashboard.py           ← token savings dashboard
-├── preflight.py           ← prerequisite checker
-├── .mcp.json              ← MCP server registration
+├── agent.py               ← PRIMARY: orchestrating agent
+├── tools/
+│   ├── codebase.py        ← discover_modules, import_modules, summarize_codebase
+│   ├── docs.py            ← index_docs
+│   ├── tickets.py         ← fetch_tickets, process_tickets
+│   └── confluence.py      ← download_confluence
 ├── indexer/
-│   └── study_agent.py     ← multi-pass codebase analysis
+│   ├── study_agent.py     ← CLI: Pass 1 + Pass 2
+│   └── analysis_modules.json  ← example hand-crafted module definition
 ├── doc_agent/
-│   ├── doc_agent.py       ← document ingestion pipeline
+│   ├── doc_agent.py       ← CLI: document ingestion
 │   ├── sources.py         ← pluggable source adapters
 │   └── parsers.py         ← file-type parsers
-├── explorer_agent/
-│   └── explorer_agent.py  ← autonomous goal-driven exploration
-├── mcp_server/
-│   └── server.py          ← MCP server (search + suggest)
-├── reviewer/
-│   └── reviewer_agent.py  ← verifies and promotes suggestions
-├── auditor/
-│   └── auditor.py         ← doc↔code conflict detection
+├── mcp_server/server.py   ← MCP: search_codebase, suggest_index_item, kb_status, list_modules
+├── reviewer/reviewer_agent.py  ← verify + promote suggestions
+├── auditor/auditor.py     ← doc↔code conflict detection
 ├── ticket_agent/
-│   ├── fetch_tickets.py   ← fetch from Jira API → tickets/*.json
+│   ├── fetch_tickets.py   ← fetch from Jira → tickets/*.json
 │   ├── ticket_agent.py    ← knowledge extraction + MR diff fetching
-│   ├── tickets/           ← persistent ticket store (gitignored, one file per ticket)
-│   └── lessons/           ← generated lesson .md files (committed, indexable by doc_agent)
-├── eval/
-│   └── eval_kb.py         ← KB effectiveness evaluation
+│   ├── tickets/           ← persistent ticket store (gitignored)
+│   └── lessons/           ← generated lesson .md files (committed)
+├── explorer_agent/explorer_agent.py  ← targeted deep exploration
+├── eval/eval_kb.py        ← KB effectiveness evaluation
 ├── codebase_shared/
-│   ├── utils.py           ← shared LLM calls, rate limiter, token tracker
-│   ├── r2r_indexer.py     ← standalone concurrent R2R indexer
-│   └── colors.py          ← terminal color helpers
+│   ├── utils.py           ← LLM calls, rate limiter, token tracker
+│   ├── r2r_indexer.py     ← concurrent R2R indexer
+│   └── colors.py
+├── run.py                 ← legacy one-command orchestrator
+├── status.py / dashboard.py / preflight.py
 └── r2r/
-    ├── r2r.toml           ← R2R config (embedding, FTS)
-    └── compose.yaml       ← Docker compose for R2R + Postgres
+    ├── r2r.toml           ← embedding config
+    └── compose.yaml
 ```
 
 Runtime artifacts (gitignored):
-- `indexer/module_map.json` — Pass 1 output
-- `indexer/summaries.json` — Pass 2 output
-- `indexer/context_cache.json` — cached context summaries
-- `indexer/call_graph.json` — calls/called_by graph
-- `indexer/file_hashes.json` — incremental change manifest
+- `indexer/module_map.json` — module discovery output
+- `indexer/summaries.json` — summarization output
+- `indexer/context_cache.json`, `call_graph.json`, `file_hashes.json`
 - `*/cost_log.jsonl` — token usage logs
-- `mcp_server/query_log.jsonl` — search query + answer log
-- `ticket_agent/ticket_hashes.json` — incremental manifest
-- `ticket_agent/ticket_summaries.json` — saved extraction results
+- `mcp_server/query_log.jsonl` — search query log
+- `ticket_agent/ticket_hashes.json`, `ticket_summaries.json`
 
 ---
 
 ## Dependencies
 
-All LLM calls go through `litellm` — works with OpenAI, Anthropic,
-Ollama, Groq, or any OpenAI-compatible endpoint. Set `LLM_MODEL` to
-the litellm model string.
+All LLM calls go through `litellm` — works with OpenAI, Anthropic, Ollama, Groq, or any OpenAI-compatible endpoint. Set `LLM_MODEL` to the litellm model string (e.g. `openai/gpt-4o`, `anthropic/claude-opus-4-5`, `ollama/llama3.1`).
 
-R2R runs as Docker containers (postgres + R2R server) on port 7272.
-Config in `r2r/r2r.toml`.
+R2R runs as Docker containers on port 7272. Config in `r2r/r2r.toml`.
