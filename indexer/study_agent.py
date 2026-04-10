@@ -1204,6 +1204,9 @@ If you can't determine a field, use an empty list or "unknown"."""
             "module": mod_name,
             "chunk_type": "function_card",
             "chunk_index": -3,  # Negative to distinguish from real chunks
+            "chunk_category": "contract",
+            "search_value": "high",
+            "skip_index": False,
             "function_card": card_data,  # Structured data for programmatic use
         })
 
@@ -4270,6 +4273,9 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                 "module": mod.name,
                 "chunk_type": "file_overview",
                 "chunk_index": -1,
+                "chunk_category": "overview",
+                "search_value": "medium",
+                "skip_index": False,
             })
             overview_count += 1
 
@@ -4288,6 +4294,9 @@ async def run_pass2(model: str, codebase: Path, module_map: ModuleMap,
                 "module": mod_name,
                 "chunk_type": "class_overview",
                 "chunk_index": -2,
+                "chunk_category": "overview",
+                "search_value": "medium",
+                "skip_index": False,
             })
             overview_count += 1
 
@@ -4691,8 +4700,14 @@ def main():
         ))
         summaries_path.write_text(json.dumps(summaries, indent=2))
         print(f"[Review-only] Done. Edit rate: {edit_rate:.1%}")
-        print(f"  Run with --reindex to push updated summaries to R2R.")
-        tracker.print_summary()
+        # Auto-index into R2R if available
+        try:
+            index_summaries_to_r2r(summaries)
+            print(f"[Index] Updated summaries pushed to R2R.")
+        except Exception as e:
+            print(f"  R2R not available ({e}). Run --reindex to push changes.")
+        if tracker.phases:
+            print(tracker.summary())
         return
 
     # ── Import modules from definition files ─────────────────────────────────────
@@ -4921,7 +4936,8 @@ def main():
     elapsed = time.time() - _start_time
 
     n_modules = len(module_map.modules) if module_map else 0
-    cost_str = f"~${total_tokens / 1_000_000 * rate_per_mtok:.2f}" if total_tokens else "n/a"
+    cost_str = (f"~${total_tokens / 1_000_000 * rate_per_mtok:.2f}"
+                if total_tokens and rate_per_mtok else "n/a")
     if elapsed > 3600:
         time_str = f"{elapsed / 3600:.1f}h"
     elif elapsed > 60:

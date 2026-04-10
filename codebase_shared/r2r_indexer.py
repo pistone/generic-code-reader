@@ -43,7 +43,11 @@ def _create_or_replace(client: R2RClient, raw_text: str,
         err = str(e)
         if "already exists" not in err.lower():
             raise
-        match = re.search(r"document\s+([0-9a-f-]{36})", err, re.IGNORECASE)
+        # Extract UUID from any R2R error format (quoted, prefixed, etc.)
+        match = re.search(
+            r"['\"]?([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})['\"]?",
+            err, re.IGNORECASE,
+        )
         if match:
             try:
                 client.documents.delete(match.group(1))
@@ -85,6 +89,10 @@ def _index_one_code_entry(client: R2RClient,
     if entry.get("skip_index"):
         return (src_file, None, None)
 
+    summary_text = entry.get("summary")
+    if not summary_text:
+        return (src_file, None, None)
+
     chunk_type = entry.get("chunk_type", "function_summary")
     source_kind = "reference"
     if chunk_type == "function_card":
@@ -112,7 +120,7 @@ def _index_one_code_entry(client: R2RClient,
         if search_val:
             metadata["search_value"] = search_val
 
-        doc_id = _create_or_replace(client, entry["summary"], metadata)
+        doc_id = _create_or_replace(client, summary_text, metadata)
     except Exception as e:
         print(f"  [warn] {src_file}: summary index failed: {e}")
 
@@ -137,19 +145,26 @@ def index_entries(summaries: list[dict], index_workers: int = 8) -> None:
     Mutates each entry dict to add 'doc_id' and 'code_doc_id' fields.
     Entries with skip_index=True are skipped.
     """
-    client = get_client()
     skip_count = sum(1 for e in summaries if e.get("skip_index"))
+    no_summary = sum(1 for e in summaries
+                     if not e.get("skip_index") and not e.get("summary"))
     n = len(summaries)
-    if skip_count:
-        print(f"\n[Index] Indexing {n - skip_count} summaries into R2R "
-              f"({skip_count} low-value skipped, {index_workers} workers)...")
+    if skip_count or no_summary:
+        skipped_parts = []
+        if skip_count:
+            skipped_parts.append(f"{skip_count} low-value skipped")
+        if no_summary:
+            skipped_parts.append(f"{no_summary} missing summary")
+        print(f"\n[Index] Indexing {n - skip_count - no_summary} summaries into R2R "
+              f"({', '.join(skipped_parts)}, {index_workers} workers)...")
     else:
         print(f"\n[Index] Indexing {n} summaries + raw code into R2R "
               f"({index_workers} workers)...")
 
+    # Each worker gets its own R2RClient — httpx clients are not thread-safe
     with ThreadPoolExecutor(max_workers=index_workers) as pool:
         future_to_idx = {
-            pool.submit(_index_one_code_entry, client, entry): i
+            pool.submit(_index_one_code_entry, get_client(), entry): i
             for i, entry in enumerate(summaries)
         }
         done = 0
@@ -167,12 +182,17 @@ def index_entries(summaries: list[dict], index_workers: int = 8) -> None:
             if done % 100 == 0:
                 print(f"  [{done}/{n}] indexed...")
 
+    indexable = sum(1 for e in summaries
+                    if not e.get("skip_index") and e.get("summary"))
     succeeded = sum(1 for e in summaries if e.get("doc_id"))
-    failed = n - succeeded
+    failed = indexable - succeeded
     if failed > 0:
-        print(f"[Index] Done: {succeeded}/{n} indexed ({failed} failed)")
+        print(f"[Index] Done: {succeeded}/{indexable} indexed ({failed} failed)")
+        if indexable > 0 and failed / indexable > 0.1:
+            print(f"  ⚠ High failure rate ({failed}/{indexable}). "
+                  f"Check R2R health: curl {R2R_URL}/v3/health")
     else:
-        print(f"[Index] Done: {succeeded}/{n} indexed")
+        print(f"[Index] Done: {succeeded}/{indexable} indexed")
 
 
 # ── Doc chunk indexing ───────────────────────────────────────────────────────
@@ -201,15 +221,15 @@ def index_doc_chunks(chunks: list[dict], last_modified: str = "",
 
     Returns list of successfully created document IDs.
     """
-    client = get_client()
     n = len(chunks)
     print(f"[Index] Indexing {n} doc chunks into R2R ({index_workers} workers)...")
 
     doc_ids: list[Optional[str]] = [None] * n
 
+    # Each worker gets its own R2RClient — httpx clients are not thread-safe
     with ThreadPoolExecutor(max_workers=index_workers) as pool:
         future_to_idx = {
-            pool.submit(_index_one_doc_chunk, client, chunk, last_modified): i
+            pool.submit(_index_one_doc_chunk, get_client(), chunk, last_modified): i
             for i, chunk in enumerate(chunks)
         }
         done = 0
