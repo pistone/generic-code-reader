@@ -73,13 +73,13 @@ def purge_docs(doc_ids: list[str]) -> None:
 
 # ── Code summary indexing ────────────────────────────────────────────────────
 
-def _index_one_code_entry(client: R2RClient,
-                          entry: dict) -> tuple[str, Optional[str],
+def _index_one_code_entry(entry: dict) -> tuple[str, Optional[str],
                                                 Optional[str]]:
     """Index one code summary + raw_code into R2R.
 
     Returns (source_file, doc_id, code_doc_id).
     Entries with skip_index=True are skipped.
+    Creates its own R2RClient (httpx clients are not thread-safe).
     """
     src_file = entry.get("source_file", "")
     module = entry.get("module", "")
@@ -93,6 +93,7 @@ def _index_one_code_entry(client: R2RClient,
     if not summary_text:
         return (src_file, None, None)
 
+    client = get_client()
     chunk_type = entry.get("chunk_type", "function_summary")
     source_kind = "reference"
     if chunk_type == "function_card":
@@ -161,13 +162,16 @@ def index_entries(summaries: list[dict], index_workers: int = 8) -> None:
         print(f"\n[Index] Indexing {n} summaries + raw code into R2R "
               f"({index_workers} workers)...")
 
-    # Each worker gets its own R2RClient — httpx clients are not thread-safe
+    # Each worker creates its own R2RClient inside the function
+    # (httpx clients are not thread-safe)
     with ThreadPoolExecutor(max_workers=index_workers) as pool:
         future_to_idx = {
-            pool.submit(_index_one_code_entry, get_client(), entry): i
+            pool.submit(_index_one_code_entry, entry): i
             for i, entry in enumerate(summaries)
         }
         done = 0
+        # Print progress every 25 entries (or every 5% for large sets)
+        progress_interval = max(1, min(25, n // 20))
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
             try:
@@ -179,8 +183,8 @@ def index_entries(summaries: list[dict], index_workers: int = 8) -> None:
             except Exception as e:
                 print(f"  [warn] index failed for entry {idx}: {e}")
             done += 1
-            if done % 100 == 0:
-                print(f"  [{done}/{n}] indexed...")
+            if done % progress_interval == 0 or done == n:
+                print(f"  [{done}/{n}] indexed...", flush=True)
 
     indexable = sum(1 for e in summaries
                     if not e.get("skip_index") and e.get("summary"))
@@ -197,14 +201,21 @@ def index_entries(summaries: list[dict], index_workers: int = 8) -> None:
 
 # ── Doc chunk indexing ───────────────────────────────────────────────────────
 
-def _index_one_doc_chunk(client: R2RClient, chunk: dict,
+def _index_one_doc_chunk(chunk: dict,
                          last_modified: str) -> Optional[str]:
-    """Index a single doc chunk into R2R. Returns doc_id or None."""
-    index_text = chunk.get("summary") or chunk["text"]
+    """Index a single doc chunk into R2R. Returns doc_id or None.
+
+    Creates its own R2RClient (httpx clients are not thread-safe).
+    """
+    index_text = chunk.get("summary") or chunk.get("text", "")
+    if not index_text:
+        return None
+
+    client = get_client()
     source_kind = chunk.get("source_kind", "")
 
     metadata = {
-        "source_file":   chunk["source_file"],
+        "source_file":   chunk.get("source_file", ""),
         "module":        "documentation",
         "chunk_type":    "doc_summary",
         "doc_title":     chunk.get("doc_title", ""),
@@ -226,13 +237,14 @@ def index_doc_chunks(chunks: list[dict], last_modified: str = "",
 
     doc_ids: list[Optional[str]] = [None] * n
 
-    # Each worker gets its own R2RClient — httpx clients are not thread-safe
+    # Each worker creates its own R2RClient inside the function
     with ThreadPoolExecutor(max_workers=index_workers) as pool:
         future_to_idx = {
-            pool.submit(_index_one_doc_chunk, get_client(), chunk, last_modified): i
+            pool.submit(_index_one_doc_chunk, chunk, last_modified): i
             for i, chunk in enumerate(chunks)
         }
         done = 0
+        progress_interval = max(1, min(25, n // 20))
         for future in as_completed(future_to_idx):
             idx = future_to_idx[future]
             try:
@@ -240,8 +252,8 @@ def index_doc_chunks(chunks: list[dict], last_modified: str = "",
             except Exception as e:
                 print(f"  [warn] chunk {idx}: index failed: {e}")
             done += 1
-            if done % 100 == 0:
-                print(f"  [{done}/{n}] indexed...")
+            if done % progress_interval == 0 or done == n:
+                print(f"  [{done}/{n}] indexed...", flush=True)
 
     succeeded = sum(1 for d in doc_ids if d)
     print(f"[Index] Done: {succeeded}/{n} doc chunks indexed")
