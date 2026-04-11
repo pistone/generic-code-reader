@@ -18,6 +18,7 @@ import json
 import os
 import re
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
@@ -26,9 +27,16 @@ from r2r import R2RClient
 
 R2R_URL = os.getenv("R2R_URL", "http://localhost:7272")
 
+# Thread-local storage: one R2RClient per thread (httpx is not thread-safe,
+# but reusing within the same thread avoids "too many open files").
+_thread_local = threading.local()
+
 
 def get_client() -> R2RClient:
-    return R2RClient(R2R_URL)
+    """Return a per-thread R2RClient, creating one if needed."""
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = R2RClient(R2R_URL)
+    return _thread_local.client
 
 
 # ── Low-level helpers ────────────────────────────────────────────────────────
@@ -93,7 +101,7 @@ def _index_one_code_entry(entry: dict) -> tuple[str, Optional[str],
     if not summary_text:
         return (src_file, None, None)
 
-    client = get_client()
+    client = get_client()  # per-thread, reused across entries
     chunk_type = entry.get("chunk_type", "function_summary")
     source_kind = "reference"
     if chunk_type == "function_card":
@@ -211,7 +219,7 @@ def _index_one_doc_chunk(chunk: dict,
     if not index_text:
         return None
 
-    client = get_client()
+    client = get_client()  # per-thread, reused across entries
     source_kind = chunk.get("source_kind", "")
 
     metadata = {
