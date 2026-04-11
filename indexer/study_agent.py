@@ -4458,6 +4458,8 @@ def main():
                         help="Print detailed progress (tool calls, reference resolution)")
     parser.add_argument("--quiet", action="store_true",
                         help="Suppress per-chunk progress, show only phase summaries")
+    parser.add_argument("--index-workers", type=int, default=24,
+                        help="Number of concurrent R2R indexing workers (default: 24)")
     args = parser.parse_args()
 
     # Resolve multiple --codebase paths
@@ -4680,8 +4682,11 @@ def main():
             print(f"Error: {summaries_path} not found. Run Pass 2 first.")
             sys.exit(1)
         summaries = json.loads(summaries_path.read_text())
-        print(f"[Reindex] Indexing {len(summaries)} summaries from {summaries_path}")
-        index_summaries_to_r2r(summaries)
+        print(f"[Reindex] Indexing {len(summaries)} summaries from {summaries_path} "
+              f"({args.index_workers} workers)")
+        index_summaries_to_r2r(summaries, index_workers=args.index_workers)
+        # Write back doc_ids
+        summaries_path.write_text(json.dumps(summaries, indent=2))
         print("[Reindex] Done.")
         return
 
@@ -4702,7 +4707,7 @@ def main():
         print(f"[Review-only] Done. Edit rate: {edit_rate:.1%}")
         # Auto-index into R2R if available
         try:
-            index_summaries_to_r2r(summaries)
+            index_summaries_to_r2r(summaries, index_workers=args.index_workers)
             print(f"[Index] Updated summaries pushed to R2R.")
         except Exception as e:
             print(f"  R2R not available ({e}). Run --reindex to push changes.")
@@ -4919,7 +4924,7 @@ def main():
     # Always index into R2R
     if summaries:
         print(f"\n[Index] Indexing {len(summaries)} summaries into R2R...")
-        index_summaries_to_r2r(summaries)
+        index_summaries_to_r2r(summaries, index_workers=args.index_workers)
 
     # ── Token usage + cost log ─────────────────────────────────────────────────
     total_tokens = 0

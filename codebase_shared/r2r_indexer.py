@@ -148,7 +148,7 @@ def _index_one_code_entry(entry: dict) -> tuple[str, Optional[str],
     return (src_file, doc_id, code_doc_id)
 
 
-def index_entries(summaries: list[dict], index_workers: int = 8) -> None:
+def index_entries(summaries: list[dict], index_workers: int = 24) -> None:
     """Index code summaries into R2R with concurrent workers.
 
     Mutates each entry dict to add 'doc_id' and 'code_doc_id' fields.
@@ -235,7 +235,7 @@ def _index_one_doc_chunk(chunk: dict,
 
 
 def index_doc_chunks(chunks: list[dict], last_modified: str = "",
-                     index_workers: int = 8) -> list[str]:
+                     index_workers: int = 24) -> list[str]:
     """Index doc chunks into R2R with concurrent workers.
 
     Returns list of successfully created document IDs.
