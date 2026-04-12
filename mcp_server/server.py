@@ -233,7 +233,7 @@ def _cross_source_check(client: R2RClient, query: str,
 
 
 @mcp.tool()
-def suggest_index_item(
+def add_to_kb(
     topic: str,
     summary: str,
     source_files: list[str],
@@ -241,11 +241,11 @@ def suggest_index_item(
     raw_code: str = "",
 ) -> str:
     """
-    Suggest a new entry for the domain knowledge base.
+    Add a new entry to the domain knowledge base.
 
-    Call this when you've manually researched something that wasn't in the
-    KB and found the answer. Your suggestion will be reviewed and, if
-    approved, will be available to the whole team instantly.
+    Call this when you've researched something that wasn't in the KB and
+    found the answer. The entry is indexed immediately and available to
+    the whole team right away.
 
     Args:
         topic:        Short label for the entry (e.g. "null deref checker — pointer arithmetic")
@@ -257,24 +257,65 @@ def suggest_index_item(
                       This gets stored alongside the summary so future searches
                       return ground truth, not just the summary.
     """
-    queue = _load_staging()
+    client = get_client()
+
+    # Primary source file for metadata (first in list, or "unknown")
+    src_file = source_files[0] if source_files else "unknown"
+    ts = datetime.now(timezone.utc).isoformat()
+
+    # Index the summary immediately into R2R
+    doc_id = ""
+    code_doc_id = ""
+    try:
+        resp = client.documents.create(
+            raw_text=f"[{topic}] {summary}",
+            metadata={
+                "source_file": src_file,
+                "module":      "user_contributed",
+                "chunk_type":  "function_summary",
+                "source_type": "code",
+                "source_kind": "reference",
+                "origin":      "suggestion",
+            },
+        )
+        doc_id = str(resp.results.document_id)
+    except Exception as e:
+        return f"⚠ Failed to index: {e}\nIs R2R running? Check: curl {R2R_URL}/v3/health"
+
+    # Index raw code as a separate searchable chunk
+    if raw_code and len(raw_code.strip()) > 30:
+        try:
+            resp = client.documents.create(
+                raw_text=raw_code,
+                metadata={
+                    "source_file": src_file,
+                    "module":      "user_contributed",
+                    "chunk_type":  "raw_code",
+                    "source_type": "code",
+                    "origin":      "suggestion",
+                },
+            )
+            code_doc_id = str(resp.results.document_id)
+        except Exception:
+            pass  # non-fatal
+
+    # Log to staging for audit trail (not a review queue)
     entry = {
         "topic":        topic,
         "summary":      summary,
         "source_files": source_files,
         "raw_code":     raw_code,
         "reasoning":    reasoning,
-        "status":       "pending",
-        "timestamp":    datetime.now(timezone.utc).isoformat(),
+        "doc_id":       doc_id,
+        "code_doc_id":  code_doc_id,
+        "status":       "indexed",
+        "timestamp":    ts,
     }
+    queue = _load_staging()
     queue.append(entry)
     _save_staging(queue)
 
-    return (
-        f"Suggestion queued (#{len(queue)} in staging). "
-        "Run `python reviewer/reviewer_agent.py --codebase /path/to/src` to review, "
-        "or use `--watch` for continuous review."
-    )
+    return f"✓ Indexed into KB (doc_id: {doc_id}). Available to the team now."
 
 
 @mcp.tool()
