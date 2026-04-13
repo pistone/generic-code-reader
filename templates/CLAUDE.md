@@ -20,6 +20,10 @@ returns targeted summaries in ~500 tokens instead of reading dozens of files.
 3. **Need more detail?** → `Read` the specific source files mentioned in the results
 4. **Found something new?** → call `add_to_kb` so future queries benefit
 
+## Important
+
+- To read source files referenced in search results, use the `Read` tool directly — do NOT use `readMcpResource`. The KB server provides search only, not file access.
+
 ## Tips
 
 - Use domain terms in queries, not generic language. "authentication middleware" finds more than "how do users log in".
