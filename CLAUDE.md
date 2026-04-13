@@ -137,7 +137,7 @@ docker compose -f r2r/compose.yaml up -d
 │  RUNTIME (always on)                                     │
 │                                                          │
 │  MCP Server: search_codebase(), add_to_kb()               │
-│  Claude Code ←→ MCP Server ←→ R2R                        │
+│  Claude Code ←→ MCP Server ←→ R2R or local ChromaDB      │
 └──────────────────────────────────────────────────────────┘
                          │
                          ▼
@@ -178,7 +178,8 @@ generic-code-reader/
 │   ├── doc_agent.py       ← CLI: document ingestion
 │   ├── sources.py         ← pluggable source adapters
 │   └── parsers.py         ← file-type parsers
-├── mcp_server/server.py   ← MCP: search_codebase, add_to_kb, kb_status, list_modules
+├── mcp_server/server.py   ← MCP: search_codebase, add_to_kb, kb_status, list_modules (R2R or local)
+├── load_kb.py             ← Load JSON files into local ChromaDB (no Docker alternative)
 ├── reviewer/reviewer_agent.py  ← verify + promote suggestions
 ├── auditor/auditor.py     ← doc↔code conflict detection
 ├── ticket_agent/

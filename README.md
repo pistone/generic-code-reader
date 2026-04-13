@@ -1,6 +1,6 @@
 # Generic Code Reader
 
-A self-improving knowledge base for codebases. Pre-analyzes source code with an LLM, stores summaries in R2R (vector DB), and exposes them as an MCP server for Claude Code.
+A self-improving knowledge base for codebases. Pre-analyzes source code with an LLM, stores summaries in a vector DB (R2R or local ChromaDB), and exposes them as an MCP server for Claude Code.
 
 ## Quick Start
 
@@ -26,13 +26,15 @@ doc_agent/doc_agent.py          → CLI: ingest design docs, runbooks, wiki page
 ticket_agent/fetch_tickets.py   → CLI: fetch Jira tickets → JSON files
 ticket_agent/ticket_agent.py    → CLI: extract knowledge from tickets
 auditor/auditor.py              → detect doc↔code conflicts
-mcp_server/server.py            → MCP server: search_codebase + suggest_index_item
-reviewer/reviewer_agent.py      → verify runtime suggestions before promoting to KB
+mcp_server/server.py            → MCP server: search_codebase + add_to_kb (R2R or local ChromaDB)
+reviewer/reviewer_agent.py      → verify runtime suggestions (optional review gate)
 codebase_shared/r2r_indexer.py  → concurrent R2R indexer (shared by all agents)
+codebase_shared/local_kb.py     → ChromaDB local backend (no Docker needed)
+load_kb.py                      → Load JSON files into local ChromaDB
 codebase_shared/utils.py        → TokenTracker, llm_call, AsyncRateLimiter
 ```
 
-The self-improving loop: when Claude can't find an answer in the KB, it researches manually and calls `suggest_index_item()`. The reviewer agent verifies the suggestion and promotes it into R2R.
+When Claude can't find an answer in the KB, it researches manually and calls `add_to_kb()` — the entry is indexed immediately and available to the whole team.
 
 ## Prerequisites
 
@@ -51,6 +53,8 @@ The tool reads env vars from your shell — if they're already set (e.g. from `.
 | `LLM_MODEL` | No | `openai/gpt-4o` |
 | `R2R_URL` | No | `http://localhost:7272` |
 | `VOYAGE_API_KEY` | No | — (for R2R embeddings) |
+| `KB_BACKEND` | No | `r2r` (`r2r` or `local` for ChromaDB) |
+| `LOCAL_KB_DIR` | No | `chroma_db` (path to ChromaDB directory) |
 | `KB_SEARCH_LIMIT` | No | `5` (MCP server results per search) |
 | `GITHUB_TOKEN` | ticket pipeline* | — (`read:repo` scope) |
 | `GITLAB_TOKEN` | ticket pipeline* | — |
@@ -208,13 +212,13 @@ python eval/eval_kb.py compare \
 python eval/eval_kb.py blind --questions eval/test_questions.jsonl
 ```
 
-## Reviewer Agent
+## Reviewer Agent (Optional)
 
-When Claude Code calls `suggest_index_item()`, suggestions land in `mcp_server/staging_queue.json`. Run the reviewer to promote them:
+`add_to_kb()` indexes entries immediately. The reviewer agent is an optional quality gate for teams that want LLM-based verification of user contributions:
 
 ```bash
 python reviewer/reviewer_agent.py --codebase /path/to/your/src
-python reviewer/reviewer_agent.py --codebase /path/to/your/src --watch
+python reviewer/reviewer_agent.py --codebase /path/to/your/src --watch   # poll every 30s
 ```
 
 ## Team Setup
@@ -286,6 +290,62 @@ Approved suggestions are promoted into R2R and immediately available to all team
 ### Security note
 
 R2R has no authentication by default. On an internal network this is usually fine. For external access, put R2R behind a reverse proxy (nginx/Caddy) with basic auth or restrict to VPN only.
+
+## Local Backend (No Docker)
+
+If Docker/R2R is impractical, use the local ChromaDB backend instead. No server needed — just `pip install chromadb`.
+
+### 1. Build the KB as usual (produces JSON files)
+
+```bash
+python indexer/study_agent.py --codebase /path/to/src --discover
+python indexer/study_agent.py --codebase /path/to/src --summarize
+# summaries.json is written but R2R indexing can be skipped
+```
+
+### 2. Load into local ChromaDB
+
+```bash
+python load_kb.py                           # reads from indexer/, doc_agent/, ticket_agent/
+python load_kb.py --kb-dir /path/to/kb      # or from a shared directory/repo
+python load_kb.py --clean                   # full reload (clear first)
+```
+
+### 3. Configure MCP server for local backend
+
+In the target codebase's `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "domain-kb": {
+      "command": "/path/to/generic-code-reader/.venv/bin/python",
+      "args": ["/path/to/generic-code-reader/mcp_server/server.py"],
+      "env": {
+        "KB_BACKEND": "local",
+        "LOCAL_KB_DIR": "/path/to/chroma_db"
+      }
+    }
+  }
+}
+```
+
+### Team sharing via git
+
+Commit the JSON files to a shared repo:
+
+```
+kb/
+├── summaries.json
+├── doc_summaries.json
+├── ticket_summaries.json
+├── user_contributed.jsonl    ← append-only, from add_to_kb
+└── module_map.json
+```
+
+Each teammate: `git pull && python load_kb.py --kb-dir kb/ --clean`
+
+User contributions from `add_to_kb()` are logged to `user_contributed.jsonl` (one JSON object per line, git-friendly). Commit and push periodically so teammates pick them up.
 
 ## Testing
 
