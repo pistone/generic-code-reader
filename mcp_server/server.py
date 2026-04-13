@@ -1,9 +1,15 @@
 """
 Domain KB — MCP Server
 
-Exposes two tools to Claude Code:
+Exposes tools to Claude Code:
   search_codebase(query)          — semantic search over the knowledge base
-  suggest_index_item(...)         — queue a new KB entry for review
+  add_to_kb(...)                  — index a new entry immediately
+  kb_status()                     — health check and stats
+  list_modules()                  — show indexed modules
+
+Supports two backends (set KB_BACKEND env var):
+  r2r   — R2R vector DB (default, needs Docker)
+  local — ChromaDB local file DB (no server needed)
 
 Logs every search query to mcp_server/query_log.jsonl for experiment
 measurement (query, tokens returned, timestamp).
@@ -14,15 +20,18 @@ Start with:
 
 import json
 import os
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
-from r2r import R2RClient
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
+KB_BACKEND    = os.getenv("KB_BACKEND", "r2r")  # "r2r" or "local"
 R2R_URL       = os.getenv("R2R_URL", "http://localhost:7272")
+LOCAL_KB_DIR  = os.getenv("LOCAL_KB_DIR", str(Path(__file__).parent.parent / "chroma_db"))
+
 try:
     SEARCH_LIMIT = int(os.getenv("KB_SEARCH_LIMIT", "5"))
 except (ValueError, TypeError):
@@ -32,13 +41,27 @@ BASE_DIR      = Path(__file__).parent
 LOG_FILE      = BASE_DIR / "query_log.jsonl"
 
 # STAGING_FILE: override with STAGING_FILE env var for team deployments.
-# Point all teammates at the same shared path (e.g. a network drive or
-# the server's local path when running the reviewer centrally).
 STAGING_FILE  = Path(os.getenv("STAGING_FILE", str(BASE_DIR / "staging_queue.json")))
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# User-contributed entries (append-only JSONL, git-friendly)
+USER_KB_FILE  = Path(os.getenv("USER_KB_FILE", str(BASE_DIR / "user_contributed.jsonl")))
 
-def get_client() -> R2RClient:
+# ── Backend abstraction ──────────────────────────────────────────────────────
+
+_local_kb = None  # lazy-init
+
+
+def _get_local_kb():
+    global _local_kb
+    if _local_kb is None:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from codebase_shared.local_kb import LocalKB
+        _local_kb = LocalKB(LOCAL_KB_DIR)
+    return _local_kb
+
+
+def get_r2r_client():
+    from r2r import R2RClient
     return R2RClient(R2R_URL)
 
 
@@ -150,28 +173,19 @@ def search_codebase(query: str) -> str:
         query:  Natural language description of what you're looking for.
                 E.g. "how does the null dereference checker handle pointer arithmetic"
     """
-    client = get_client()
-
-    search_settings: dict = {
-        "limit": SEARCH_LIMIT,
-        "use_hybrid_search": True,
-    }
-
     try:
-        results = client.retrieval.search(
-            query=query,
-            search_settings=search_settings,
-        )
-        hits = results.results.chunk_search_results
+        if KB_BACKEND == "local":
+            hits = _search_local(query, SEARCH_LIMIT)
+        else:
+            hits = _search_r2r(query, SEARCH_LIMIT)
     except Exception as e:
-        return f"⚠ Knowledge base search failed: {e}\nIs R2R running? Check: curl {R2R_URL}/v3/health"
+        backend_hint = (f"Check: curl {R2R_URL}/v3/health" if KB_BACKEND == "r2r"
+                        else f"Check: ls {LOCAL_KB_DIR}")
+        return f"⚠ Knowledge base search failed: {e}\n{backend_hint}"
 
     formatted = _format_results(hits)
 
     # --- Cross-source linking ---
-    # If we got results from only one source type, check if other sources
-    # have related knowledge and add a brief note
-    cross_note = ""
     if hits:
         source_types_seen = {
             (getattr(h, "metadata", None) or {}).get("source_type", "")
@@ -179,43 +193,62 @@ def search_codebase(query: str) -> str:
         }
         other_types = {"code", "doc", "ticket"} - source_types_seen
         if other_types and len(source_types_seen) == 1:
-            cross_note = _cross_source_check(client, query, other_types)
+            cross_note = _cross_source_check(query, other_types)
+            if cross_note:
+                formatted += "\n\n" + cross_note
 
-    full_output = formatted
-    if cross_note:
-        full_output += "\n\n" + cross_note
-    approx_tokens = len(full_output) // 4
+    approx_tokens = len(formatted) // 4
 
     result_files = []
     for h in hits:
-        meta = h.metadata or {}
+        meta = getattr(h, "metadata", None) or {}
         src = meta.get("source_file", "")
         if src and src not in result_files:
             result_files.append(src)
 
     _log_query(query, len(hits), approx_tokens,
-               answer=full_output, result_files=result_files)
+               answer=formatted, result_files=result_files)
 
-    return full_output
+    return formatted
 
 
-def _cross_source_check(client: R2RClient, query: str,
-                        source_types: set[str]) -> str:
+def _search_r2r(query: str, limit: int) -> list:
+    """Search via R2R backend."""
+    client = get_r2r_client()
+    results = client.retrieval.search(
+        query=query,
+        search_settings={"limit": limit, "use_hybrid_search": True},
+    )
+    return results.results.chunk_search_results
+
+
+def _search_local(query: str, limit: int) -> list:
+    """Search via local ChromaDB backend."""
+    kb = _get_local_kb()
+    return kb.search(query, limit=limit)
+
+
+def _cross_source_check(query: str, source_types: set[str]) -> str:
     """Check if other source types have related knowledge. Returns a note."""
     notes = []
     for st in source_types:
         try:
-            results = client.retrieval.search(
-                query=query,
-                search_settings={
-                    "limit": 1,
-                    "use_hybrid_search": True,
-                    "filters": {"source_type": {"$eq": st}},
-                },
-            )
-            hits = results.results.chunk_search_results
+            if KB_BACKEND == "local":
+                hits = _get_local_kb().search(query, limit=1, source_type=st)
+            else:
+                client = get_r2r_client()
+                results = client.retrieval.search(
+                    query=query,
+                    search_settings={
+                        "limit": 1,
+                        "use_hybrid_search": True,
+                        "filters": {"source_type": {"$eq": st}},
+                    },
+                )
+                hits = results.results.chunk_search_results
+
             if hits and getattr(hits[0], "score", 0) > 0.3:
-                meta = hits[0].metadata or {}
+                meta = getattr(hits[0], "metadata", None) or {}
                 source = meta.get("source_file", "?")
                 title = meta.get("doc_title", "")
                 label = {"code": "Code", "doc": "Documentation",
@@ -257,65 +290,82 @@ def add_to_kb(
                       This gets stored alongside the summary so future searches
                       return ground truth, not just the summary.
     """
-    client = get_client()
-
-    # Primary source file for metadata (first in list, or "unknown")
     src_file = source_files[0] if source_files else "unknown"
     ts = datetime.now(timezone.utc).isoformat()
+    full_text = f"[{topic}] {summary}"
 
-    # Index the summary immediately into R2R
     doc_id = ""
     code_doc_id = ""
+
     try:
-        resp = client.documents.create(
-            raw_text=f"[{topic}] {summary}",
-            metadata={
+        if KB_BACKEND == "local":
+            kb = _get_local_kb()
+            n = kb.add_entries([{
+                "summary":     full_text,
                 "source_file": src_file,
                 "module":      "user_contributed",
                 "chunk_type":  "function_summary",
-                "source_type": "code",
                 "source_kind": "reference",
-                "origin":      "suggestion",
-            },
-        )
-        doc_id = str(resp.results.document_id)
-    except Exception as e:
-        return f"⚠ Failed to index: {e}\nIs R2R running? Check: curl {R2R_URL}/v3/health"
-
-    # Index raw code as a separate searchable chunk
-    if raw_code and len(raw_code.strip()) > 30:
-        try:
-            resp = client.documents.create(
-                raw_text=raw_code,
-                metadata={
+            }], source_type="code")
+            doc_id = f"local:{n}"
+            if raw_code and len(raw_code.strip()) > 30:
+                kb.add_entries([{
+                    "summary":     raw_code,
                     "source_file": src_file,
                     "module":      "user_contributed",
                     "chunk_type":  "raw_code",
+                }], source_type="code")
+        else:
+            client = get_r2r_client()
+            resp = client.documents.create(
+                raw_text=full_text,
+                metadata={
+                    "source_file": src_file,
+                    "module":      "user_contributed",
+                    "chunk_type":  "function_summary",
                     "source_type": "code",
+                    "source_kind": "reference",
                     "origin":      "suggestion",
                 },
             )
-            code_doc_id = str(resp.results.document_id)
-        except Exception:
-            pass  # non-fatal
+            doc_id = str(resp.results.document_id)
+            if raw_code and len(raw_code.strip()) > 30:
+                try:
+                    resp = client.documents.create(
+                        raw_text=raw_code,
+                        metadata={
+                            "source_file": src_file,
+                            "module":      "user_contributed",
+                            "chunk_type":  "raw_code",
+                            "source_type": "code",
+                            "origin":      "suggestion",
+                        },
+                    )
+                    code_doc_id = str(resp.results.document_id)
+                except Exception:
+                    pass
+    except Exception as e:
+        return f"⚠ Failed to index: {e}"
 
-    # Log to staging for audit trail (not a review queue)
+    # Append to JSONL audit log (git-friendly, one line per entry)
     entry = {
-        "topic":        topic,
-        "summary":      summary,
-        "source_files": source_files,
-        "raw_code":     raw_code,
-        "reasoning":    reasoning,
-        "doc_id":       doc_id,
-        "code_doc_id":  code_doc_id,
-        "status":       "indexed",
-        "timestamp":    ts,
+        "topic": topic, "summary": summary, "source_files": source_files,
+        "raw_code": raw_code, "reasoning": reasoning,
+        "doc_id": doc_id, "code_doc_id": code_doc_id,
+        "status": "indexed", "timestamp": ts,
     }
+    try:
+        with USER_KB_FILE.open("a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception:
+        pass
+
+    # Also log to staging queue for backward compatibility
     queue = _load_staging()
     queue.append(entry)
     _save_staging(queue)
 
-    return f"✓ Indexed into KB (doc_id: {doc_id}). Available to the team now."
+    return f"✓ Indexed into KB. Available to the team now."
 
 
 @mcp.tool()
@@ -326,43 +376,50 @@ def kb_status() -> str:
     Use this to verify the KB is working before searching.
     """
     lines: list[str] = []
+    lines.append(f"Backend: {KB_BACKEND}")
 
-    # R2R health
-    try:
-        client = get_client()
-        health = "healthy"
-    except Exception as e:
-        health = f"error: {e}"
-    lines.append(f"R2R: {health} ({R2R_URL})")
+    if KB_BACKEND == "local":
+        try:
+            kb = _get_local_kb()
+            stats = kb.stats()
+            lines.append(f"Local DB: {LOCAL_KB_DIR}")
+            lines.append(f"  Total: {stats.get('total', 0)} entries")
+            for st in ("code", "doc", "ticket"):
+                lines.append(f"  {st}: {stats.get(st, 0)}")
+        except Exception as e:
+            lines.append(f"Local DB error: {e}")
+    else:
+        try:
+            client = get_r2r_client()
+            lines.append(f"R2R: healthy ({R2R_URL})")
+        except Exception as e:
+            lines.append(f"R2R: error ({e})")
 
-    # Count indexed documents by source type
-    try:
-        client = get_client()
-        # Use a broad search to estimate counts
-        for stype in ["code", "doc", "ticket"]:
-            try:
-                results = client.retrieval.search(
-                    query="*",
-                    search_settings={
-                        "limit": 1,
-                        "filters": {"source_type": {"$eq": stype}},
-                    },
-                )
-                hits = getattr(results, "results", results) if results else []
-                chunk_results = getattr(hits, "chunk_search_results", hits) if hits else []
-                count = "1+" if chunk_results else "0"
-                lines.append(f"  {stype}: {count} entries")
-            except Exception:
-                lines.append(f"  {stype}: unknown")
-    except Exception:
-        lines.append("  Could not query R2R for counts")
+        try:
+            client = get_r2r_client()
+            for stype in ["code", "doc", "ticket"]:
+                try:
+                    results = client.retrieval.search(
+                        query="*",
+                        search_settings={
+                            "limit": 1,
+                            "filters": {"source_type": {"$eq": stype}},
+                        },
+                    )
+                    hits = getattr(results, "results", results) if results else []
+                    chunk_results = getattr(hits, "chunk_search_results", hits) if hits else []
+                    count = "1+" if chunk_results else "0"
+                    lines.append(f"  {stype}: {count} entries")
+                except Exception:
+                    lines.append(f"  {stype}: unknown")
+        except Exception:
+            lines.append("  Could not query for counts")
 
-    # Pending suggestions
-    queue = _load_staging()
-    pending = sum(1 for e in queue if e.get("status") == "pending")
-    if pending:
-        lines.append(f"\nPending suggestions: {pending}")
-        lines.append("Run reviewer agent to process them.")
+    # User contributions
+    if USER_KB_FILE.exists():
+        n = sum(1 for _ in USER_KB_FILE.read_text().splitlines() if _.strip())
+        if n:
+            lines.append(f"\nUser contributions: {n}")
 
     return "\n".join(lines)
 
