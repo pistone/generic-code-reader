@@ -116,7 +116,8 @@ docker compose -f r2r/compose.yaml up -d
 - R2R must be running with indexed content
 - Registered automatically via `.mcp.json`
 - For a **shared team KB**: set `R2R_URL=http://your-server:7272` in `.mcp.json` env — all teammates search the same R2R instance. See README "Team Setup" for full instructions.
-- `STAGING_FILE` env var overrides where `suggest_index_item()` writes — set to a shared path so the reviewer can process suggestions from all teammates centrally.
+- `STAGING_FILE` env var overrides where `add_to_kb()` logs entries — set to a shared path for team audit trail.
+- **Target codebase setup**: copy `templates/CLAUDE.md` and `.mcp.json` into the target codebase directory.
 
 ---
 
@@ -135,7 +136,7 @@ docker compose -f r2r/compose.yaml up -d
 ┌──────────────────────────────────────────────────────────┐
 │  RUNTIME (always on)                                     │
 │                                                          │
-│  MCP Server: search_codebase(), suggest_index_item()     │
+│  MCP Server: search_codebase(), add_to_kb()               │
 │  Claude Code ←→ MCP Server ←→ R2R                        │
 └──────────────────────────────────────────────────────────┘
                          │
@@ -177,7 +178,7 @@ generic-code-reader/
 │   ├── doc_agent.py       ← CLI: document ingestion
 │   ├── sources.py         ← pluggable source adapters
 │   └── parsers.py         ← file-type parsers
-├── mcp_server/server.py   ← MCP: search_codebase, suggest_index_item, kb_status, list_modules
+├── mcp_server/server.py   ← MCP: search_codebase, add_to_kb, kb_status, list_modules
 ├── reviewer/reviewer_agent.py  ← verify + promote suggestions
 ├── auditor/auditor.py     ← doc↔code conflict detection
 ├── ticket_agent/
