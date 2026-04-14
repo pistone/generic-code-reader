@@ -2,160 +2,41 @@
 Domain KB — MCP Server
 
 Exposes tools to Claude Code:
-  search_codebase(query)          — semantic search over the knowledge base
-  add_to_kb(...)                  — index a new entry immediately
-  kb_status()                     — health check and stats
-  list_modules()                  — show indexed modules
+  search_codebase(query)   — semantic search over the knowledge base
+  add_to_kb(...)           — index a new entry immediately
+  kb_status()              — health check and stats
+  list_modules()           — show indexed modules
 
-Supports two backends (set KB_BACKEND env var):
+Backend is selected via KB_BACKEND env var:
   r2r   — R2R vector DB (default, needs Docker)
   local — ChromaDB local file DB (no server needed)
 
-Logs every search query to mcp_server/query_log.jsonl for experiment
-measurement (query, tokens returned, timestamp).
+For a local-only version with no R2R dependency, use server_local.py instead.
 
 Start with:
   /path/to/.venv/bin/python mcp_server/server.py
 """
 
-import json
 import os
-import sys
 from datetime import datetime, timezone
-from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
 
-# ── Config ────────────────────────────────────────────────────────────────────
+from mcp_server.common import (
+    SEARCH_LIMIT, format_results, log_query, log_user_entry,
+    get_module_map_text, user_contribution_count,
+)
 
-KB_BACKEND    = os.getenv("KB_BACKEND", "r2r")  # "r2r" or "local"
-R2R_URL       = os.getenv("R2R_URL", "http://localhost:7272")
-LOCAL_KB_DIR  = os.getenv("LOCAL_KB_DIR", str(Path(__file__).parent.parent / "chroma_db"))
+# ── Backend selection ────────────────────────────────────────────────────────
 
-try:
-    SEARCH_LIMIT = int(os.getenv("KB_SEARCH_LIMIT", "5"))
-except (ValueError, TypeError):
-    SEARCH_LIMIT = 5
+KB_BACKEND = os.getenv("KB_BACKEND", "r2r")
 
-BASE_DIR      = Path(__file__).parent
-LOG_FILE      = BASE_DIR / "query_log.jsonl"
+if KB_BACKEND == "local":
+    from mcp_server import backend_local as backend
+else:
+    from mcp_server import backend_r2r as backend
 
-# STAGING_FILE: override with STAGING_FILE env var for team deployments.
-STAGING_FILE  = Path(os.getenv("STAGING_FILE", str(BASE_DIR / "staging_queue.json")))
-
-# User-contributed entries (append-only JSONL, git-friendly)
-USER_KB_FILE  = Path(os.getenv("USER_KB_FILE", str(BASE_DIR / "user_contributed.jsonl")))
-
-# ── Backend abstraction ──────────────────────────────────────────────────────
-
-_local_kb = None  # lazy-init
-
-
-def _get_local_kb():
-    global _local_kb
-    if _local_kb is None:
-        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-        from codebase_shared.local_kb import LocalKB
-        _local_kb = LocalKB(LOCAL_KB_DIR)
-    return _local_kb
-
-
-def get_r2r_client():
-    from r2r import R2RClient
-    return R2RClient(R2R_URL)
-
-
-def _log_query(query: str, num_results: int, approx_tokens: int,
-               answer: str = "",
-               result_files: list[str] | None = None) -> None:
-    """Append one line to the query log for experiment measurement.
-
-    Logs both the question and the full answer so that queries can be
-    replayed against a different KB (or no KB) for A/B comparison.
-    """
-    try:
-        entry = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "query": query,
-            "num_results": num_results,
-            "approx_tokens": approx_tokens,
-            "result_files": result_files or [],
-            "answer": answer,
-        }
-        with LOG_FILE.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass  # logging is non-essential, don't crash the search
-
-
-def _format_results(hits: list) -> str:
-    """Format R2R search hits into a readable string for Claude."""
-    if not hits:
-        return "No results found in the knowledge base."
-
-    parts = []
-    for i, hit in enumerate(hits):
-        meta        = hit.metadata or {}
-        text        = hit.text or ""
-        source      = meta.get("source_file", "unknown")
-        module      = meta.get("module", "unknown")
-        chunk_type  = meta.get("chunk_type", "")
-        source_type = meta.get("source_type", "")
-        source_kind = meta.get("source_kind", "")
-        score       = getattr(hit, "score", 0)
-
-        # Build a type tag like [code/method] or [doc/rationale] or [ticket/root_cause]
-        type_parts = []
-        if source_type:
-            type_parts.append(source_type)
-        if source_kind:
-            type_parts.append(source_kind)
-        elif chunk_type:
-            type_parts.append(chunk_type)
-        type_tag = "/".join(type_parts) if type_parts else "unknown"
-
-        header = f"## Result {i+1}  [{type_tag}]  (score: {score:.3f})"
-        file_line = f"**File**: `{source}`  |  **Module**: `{module}`"
-
-        if chunk_type == "raw_code":
-            section = [header, file_line, "", "**Source code**:", f"```\n{text}\n```"]
-        else:
-            section = [header, file_line, "", "**Summary**:", text]
-
-        parts.append("\n".join(section))
-
-    return "\n\n---\n\n".join(parts)
-
-
-def _load_staging() -> list:
-    if STAGING_FILE.exists():
-        try:
-            data = json.loads(STAGING_FILE.read_text())
-            if isinstance(data, list):
-                return data
-        except (json.JSONDecodeError, Exception):
-            pass
-    return []
-
-
-def _save_staging(queue: list) -> None:
-    """Atomic write to prevent corruption from concurrent calls."""
-    import tempfile
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=STAGING_FILE.parent, suffix=".tmp")
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            json.dump(queue, f, indent=2)
-        os.replace(tmp_path, STAGING_FILE)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-# ── MCP Server ────────────────────────────────────────────────────────────────
+# ── MCP Server ───────────────────────────────────────────────────────────────
 
 mcp = FastMCP("domain-kb")
 
@@ -174,18 +55,13 @@ def search_codebase(query: str) -> str:
                 E.g. "how does the null dereference checker handle pointer arithmetic"
     """
     try:
-        if KB_BACKEND == "local":
-            hits = _search_local(query, SEARCH_LIMIT)
-        else:
-            hits = _search_r2r(query, SEARCH_LIMIT)
+        hits = backend.search(query, SEARCH_LIMIT)
     except Exception as e:
-        backend_hint = (f"Check: curl {R2R_URL}/v3/health" if KB_BACKEND == "r2r"
-                        else f"Check: ls {LOCAL_KB_DIR}")
-        return f"⚠ Knowledge base search failed: {e}\n{backend_hint}"
+        return f"⚠ Knowledge base search failed: {e}\n{backend.error_hint()}"
 
-    formatted = _format_results(hits)
+    formatted = format_results(hits)
 
-    # --- Cross-source linking ---
+    # Cross-source linking
     if hits:
         source_types_seen = {
             (getattr(h, "metadata", None) or {}).get("source_type", "")
@@ -198,7 +74,6 @@ def search_codebase(query: str) -> str:
                 formatted += "\n\n" + cross_note
 
     approx_tokens = len(formatted) // 4
-
     result_files = []
     for h in hits:
         meta = getattr(h, "metadata", None) or {}
@@ -206,47 +81,17 @@ def search_codebase(query: str) -> str:
         if src and src not in result_files:
             result_files.append(src)
 
-    _log_query(query, len(hits), approx_tokens,
-               answer=formatted, result_files=result_files)
-
+    log_query(query, len(hits), approx_tokens,
+              answer=formatted, result_files=result_files)
     return formatted
 
 
-def _search_r2r(query: str, limit: int) -> list:
-    """Search via R2R backend."""
-    client = get_r2r_client()
-    results = client.retrieval.search(
-        query=query,
-        search_settings={"limit": limit, "use_hybrid_search": True},
-    )
-    return results.results.chunk_search_results
-
-
-def _search_local(query: str, limit: int) -> list:
-    """Search via local ChromaDB backend."""
-    kb = _get_local_kb()
-    return kb.search(query, limit=limit)
-
-
 def _cross_source_check(query: str, source_types: set[str]) -> str:
-    """Check if other source types have related knowledge. Returns a note."""
+    """Check if other source types have related knowledge."""
     notes = []
     for st in source_types:
         try:
-            if KB_BACKEND == "local":
-                hits = _get_local_kb().search(query, limit=1, source_type=st)
-            else:
-                client = get_r2r_client()
-                results = client.retrieval.search(
-                    query=query,
-                    search_settings={
-                        "limit": 1,
-                        "use_hybrid_search": True,
-                        "filters": {"source_type": {"$eq": st}},
-                    },
-                )
-                hits = results.results.chunk_search_results
-
+            hits = backend.search_by_type(query, st, limit=1)
             if hits and getattr(hits[0], "score", 0) > 0.3:
                 meta = getattr(hits[0], "metadata", None) or {}
                 source = meta.get("source_file", "?")
@@ -259,7 +104,6 @@ def _cross_source_check(query: str, source_types: set[str]) -> str:
                 notes.append(f"- **{label}**: {ref}")
         except Exception:
             pass
-
     if notes:
         return "**Related knowledge in other sources:**\n" + "\n".join(notes)
     return ""
@@ -287,8 +131,6 @@ def add_to_kb(
         source_files: List of source file paths you read to find the answer.
         reasoning:    Why this is worth adding — what question does it answer?
         raw_code:     The key source code snippet that answers the question.
-                      This gets stored alongside the summary so future searches
-                      return ground truth, not just the summary.
     """
     src_file = source_files[0] if source_files else "unknown"
     ts = datetime.now(timezone.utc).isoformat()
@@ -298,74 +140,36 @@ def add_to_kb(
     code_doc_id = ""
 
     try:
-        if KB_BACKEND == "local":
-            kb = _get_local_kb()
-            n = kb.add_entries([{
-                "summary":     full_text,
-                "source_file": src_file,
-                "module":      "user_contributed",
-                "chunk_type":  "function_summary",
-                "source_kind": "reference",
-            }], source_type="code")
-            doc_id = f"local:{n}"
-            if raw_code and len(raw_code.strip()) > 30:
-                kb.add_entries([{
-                    "summary":     raw_code,
+        doc_id = backend.add_entry(full_text, {
+            "source_file": src_file,
+            "module":      "user_contributed",
+            "chunk_type":  "function_summary",
+            "source_type": "code",
+            "source_kind": "reference",
+            "origin":      "suggestion",
+        })
+        if raw_code and len(raw_code.strip()) > 30:
+            try:
+                code_doc_id = backend.add_entry(raw_code, {
                     "source_file": src_file,
                     "module":      "user_contributed",
                     "chunk_type":  "raw_code",
-                }], source_type="code")
-        else:
-            client = get_r2r_client()
-            resp = client.documents.create(
-                raw_text=full_text,
-                metadata={
-                    "source_file": src_file,
-                    "module":      "user_contributed",
-                    "chunk_type":  "function_summary",
                     "source_type": "code",
-                    "source_kind": "reference",
                     "origin":      "suggestion",
-                },
-            )
-            doc_id = str(resp.results.document_id)
-            if raw_code and len(raw_code.strip()) > 30:
-                try:
-                    resp = client.documents.create(
-                        raw_text=raw_code,
-                        metadata={
-                            "source_file": src_file,
-                            "module":      "user_contributed",
-                            "chunk_type":  "raw_code",
-                            "source_type": "code",
-                            "origin":      "suggestion",
-                        },
-                    )
-                    code_doc_id = str(resp.results.document_id)
-                except Exception:
-                    pass
+                })
+            except Exception:
+                pass
     except Exception as e:
         return f"⚠ Failed to index: {e}"
 
-    # Append to JSONL audit log (git-friendly, one line per entry)
-    entry = {
+    log_user_entry({
         "topic": topic, "summary": summary, "source_files": source_files,
         "raw_code": raw_code, "reasoning": reasoning,
         "doc_id": doc_id, "code_doc_id": code_doc_id,
         "status": "indexed", "timestamp": ts,
-    }
-    try:
-        with USER_KB_FILE.open("a") as f:
-            f.write(json.dumps(entry) + "\n")
-    except Exception:
-        pass
+    })
 
-    # Also log to staging queue for backward compatibility
-    queue = _load_staging()
-    queue.append(entry)
-    _save_staging(queue)
-
-    return f"✓ Indexed into KB. Available to the team now."
+    return "✓ Indexed into KB. Available to the team now."
 
 
 @mcp.tool()
@@ -375,51 +179,12 @@ def kb_status() -> str:
     Returns indexed content counts, service health, and pending suggestions.
     Use this to verify the KB is working before searching.
     """
-    lines: list[str] = []
-    lines.append(f"Backend: {KB_BACKEND}")
+    lines = [f"Backend: {KB_BACKEND}"]
+    lines.extend(backend.status())
 
-    if KB_BACKEND == "local":
-        try:
-            kb = _get_local_kb()
-            stats = kb.stats()
-            lines.append(f"Local DB: {LOCAL_KB_DIR}")
-            lines.append(f"  Total: {stats.get('total', 0)} entries")
-            for st in ("code", "doc", "ticket"):
-                lines.append(f"  {st}: {stats.get(st, 0)}")
-        except Exception as e:
-            lines.append(f"Local DB error: {e}")
-    else:
-        try:
-            client = get_r2r_client()
-            lines.append(f"R2R: healthy ({R2R_URL})")
-        except Exception as e:
-            lines.append(f"R2R: error ({e})")
-
-        try:
-            client = get_r2r_client()
-            for stype in ["code", "doc", "ticket"]:
-                try:
-                    results = client.retrieval.search(
-                        query="*",
-                        search_settings={
-                            "limit": 1,
-                            "filters": {"source_type": {"$eq": stype}},
-                        },
-                    )
-                    hits = getattr(results, "results", results) if results else []
-                    chunk_results = getattr(hits, "chunk_search_results", hits) if hits else []
-                    count = "1+" if chunk_results else "0"
-                    lines.append(f"  {stype}: {count} entries")
-                except Exception:
-                    lines.append(f"  {stype}: unknown")
-        except Exception:
-            lines.append("  Could not query for counts")
-
-    # User contributions
-    if USER_KB_FILE.exists():
-        n = sum(1 for _ in USER_KB_FILE.read_text().splitlines() if _.strip())
-        if n:
-            lines.append(f"\nUser contributions: {n}")
+    n = user_contribution_count()
+    if n:
+        lines.append(f"\nUser contributions: {n}")
 
     return "\n".join(lines)
 
@@ -431,36 +196,10 @@ def list_modules() -> str:
     Returns the module map from the last study_agent run, showing
     what areas of the codebase have been analyzed.
     """
-    module_map_path = Path(__file__).resolve().parent.parent / "indexer" / "module_map.json"
-    if not module_map_path.exists():
-        return "No module map found. Run study_agent first."
-
-    try:
-        data = json.loads(module_map_path.read_text())
-    except Exception as e:
-        return f"Could not read module map: {e}"
-
-    project = data.get("project", "Unknown")
-    desc = data.get("description", "")
-    modules = data.get("modules", [])
-
-    lines = [f"**{project}**: {desc}", f"{len(modules)} modules:\n"]
-    for mod in modules:
-        name = mod.get("name", "?")
-        mod_desc = mod.get("description", "")
-        files = mod.get("files", [])
-        questions = mod.get("questions", [])
-        lines.append(f"- **{name}** ({len(files)} files): {mod_desc}")
-        if questions:
-            for q in questions[:2]:
-                lines.append(f"  - {q}")
-            if len(questions) > 2:
-                lines.append(f"  - ...and {len(questions) - 2} more questions")
-
-    return "\n".join(lines)
+    return get_module_map_text()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     mcp.run()
