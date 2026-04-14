@@ -75,7 +75,6 @@ def main():
             "doc_summaries":  kb / "doc_summaries.json",
             "tickets":        kb / "ticket_summaries.json",
             "user":           kb / "user_contributed.jsonl",
-            "staging":        kb / "staging_queue.json",
         }
     else:
         sources = {
@@ -83,7 +82,6 @@ def main():
             "doc_summaries":  base / "doc_agent" / "doc_summaries.json",
             "tickets":        base / "ticket_agent" / "ticket_summaries.json",
             "user":           base / "mcp_server" / "user_contributed.jsonl",
-            "staging":        base / "mcp_server" / "staging_queue.json",
         }
 
     print(f"Loading KB into {args.db_dir}")
@@ -125,21 +123,14 @@ def main():
     else:
         print(f"[Tickets] No ticket summaries found at {sources['tickets']}")
 
-    # User contributed (JSONL)
+    # User contributed (JSONL) — canonical source for user additions.
+    # staging_queue.json is a subset (log_user_entry writes to both),
+    # so we only load the JSONL to avoid double-counting.
     user_entries = _load_jsonl(sources["user"])
     if user_entries:
         print(f"\n[User] Loading {len(user_entries)} entries from {sources['user'].name}")
         n = kb.add_user_entries(user_entries)
         print(f"[User] {n} entries indexed")
-        total += n
-
-    # Staging queue (user contributions that went through MCP)
-    staging = _load_json(sources["staging"])
-    indexed = [e for e in staging if e.get("status") == "indexed"]
-    if indexed:
-        print(f"\n[Staging] Loading {len(indexed)} indexed entries from {sources['staging'].name}")
-        n = kb.add_user_entries(indexed)
-        print(f"[Staging] {n} entries indexed")
         total += n
 
     print(f"\n{'='*50}")

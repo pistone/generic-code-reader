@@ -34,6 +34,7 @@ def add_entry(text: str, metadata: dict) -> str:
         "module":      metadata.get("module", ""),
         "chunk_type":  metadata.get("chunk_type", ""),
         "source_kind": metadata.get("source_kind", ""),
+        "doc_title":   metadata.get("doc_title", ""),
     }], source_type=metadata.get("source_type", "code"))
     return f"local:{n}"
 

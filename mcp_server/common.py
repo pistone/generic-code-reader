@@ -10,9 +10,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 BASE_DIR     = Path(__file__).parent
-LOG_FILE     = BASE_DIR / "query_log.jsonl"
-STAGING_FILE = Path(os.getenv("STAGING_FILE", str(BASE_DIR / "staging_queue.json")))
-USER_KB_FILE = Path(os.getenv("USER_KB_FILE", str(BASE_DIR / "user_contributed.jsonl")))
+# When LOCAL_KB_DIR is set (local workflow), store data files there
+# so they live next to the ChromaDB and not inside the package dir.
+_data_dir    = Path(os.getenv("LOCAL_KB_DIR", str(BASE_DIR)))
+LOG_FILE     = _data_dir / "query_log.jsonl"
+STAGING_FILE = Path(os.getenv("STAGING_FILE", str(_data_dir / "staging_queue.json")))
+USER_KB_FILE = Path(os.getenv("USER_KB_FILE", str(_data_dir / "user_contributed.jsonl")))
 
 try:
     SEARCH_LIMIT = int(os.getenv("KB_SEARCH_LIMIT", "5"))
@@ -117,8 +120,13 @@ def log_user_entry(entry: dict) -> None:
 
 def get_module_map_text() -> str:
     """Read module_map.json and return formatted module list."""
-    module_map_path = Path(__file__).resolve().parent.parent / "indexer" / "module_map.json"
-    if not module_map_path.exists():
+    # Check default location (full install) and KB data dir (local workflow)
+    candidates = [
+        Path(__file__).resolve().parent.parent / "indexer" / "module_map.json",
+        _data_dir / "module_map.json",
+    ]
+    module_map_path = next((p for p in candidates if p.exists()), None)
+    if module_map_path is None:
         return "No module map found. Run study_agent first."
 
     try:

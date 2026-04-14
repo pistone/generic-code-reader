@@ -78,6 +78,7 @@ class LocalKB:
                 "source_type":  source_type,
                 "source_kind":  entry.get("source_kind", ""),
                 "search_value": entry.get("search_value", ""),
+                "doc_title":    entry.get("doc_title", ""),
             }
             # ChromaDB metadata values must be str, int, float, or bool
             meta = {k: v for k, v in meta.items() if v}
@@ -227,19 +228,16 @@ class LocalKB:
             try:
                 r = self._collection.get(
                     where={"source_type": {"$eq": st}},
-                    limit=1,
                     include=[],
                 )
-                # get() returns all matching IDs; count them
                 counts[st] = len(r["ids"]) if r["ids"] else 0
             except Exception:
                 counts[st] = 0
-        # The counts above are capped by limit; use total for accuracy
         counts["total"] = total
         return counts
 
 
 def _stable_id(text: str, meta: dict) -> str:
     """Generate a deterministic ID from content + metadata."""
-    key = json.dumps({"t": text[:500], "m": meta}, sort_keys=True)
+    key = json.dumps({"t": text[:2000], "m": meta}, sort_keys=True)
     return hashlib.sha256(key.encode()).hexdigest()[:24]
