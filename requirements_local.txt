@@ -1,0 +1,3 @@
+# Dependencies for local-only KB (no R2R/Docker needed)
+chromadb>=0.4.0
+mcp>=1.0.0,<2.0
