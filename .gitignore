@@ -12,34 +12,75 @@ __pycache__/
 .venv/
 venv/
 
-# Runtime state (not source)
+# =============================================================================
+# Work directory - ALL generated artifacts go here
+# =============================================================================
+# The work directory contains all target-codebase-specific data:
+# - Indexed summaries, hashes, module maps
+# - Ticket data, lessons learned
+# - Log files, cost tracking
+# Set WORK_DIR env var to customize location (default: ./work/)
+work/
+
+# =============================================================================
+# Legacy locations (for backwards compatibility)
+# These patterns catch artifacts if they end up in old locations
+# =============================================================================
+
+# MCP server runtime state
 mcp_server/staging_queue.json
 mcp_server/query_log.jsonl
-reviewer/rejected_queue.json
 
-# Generated artifacts
+# Reviewer artifacts
+reviewer/rejected_queue.json
+reviewer/cost_log.jsonl
+
+# Indexer artifacts (legacy location)
 indexer/module_map.json
 indexer/summaries.json
 indexer/context_cache.json
 indexer/file_hashes.json
 indexer/cost_log.jsonl
-reviewer/cost_log.jsonl
+indexer/call_graph.json
 
-# Doc agent artifacts
+# Doc agent artifacts (legacy location)
 doc_agent/doc_hashes.json
+doc_agent/doc_hashes.json.backup
+doc_agent/doc_summaries.json
+doc_agent/doc_summaries.json.*
 doc_agent/cost_log.jsonl
 
 # Auditor artifacts
 auditor/conflict_report.json
 auditor/cost_log.jsonl
 
-# Ticket agent artifacts
+# Ticket agent artifacts (legacy location)
 ticket_agent/ticket_hashes.json
 ticket_agent/ticket_summaries.json
 ticket_agent/cost_log.jsonl
 ticket_agent/last_fetch.json
-ticket_agent/tickets/          # raw Jira exports — can be large; opt-in to commit
-# lessons/ is intentionally NOT gitignored — commit them so the team benefits
+ticket_agent/tickets/
+ticket_agent/lessons/
+
+# =============================================================================
+# Log files
+# =============================================================================
+*.log
+logs/
+
+# =============================================================================
+# Temporary and debug files
+# =============================================================================
+debug/
+*.tmp
+*.bak
+
+# =============================================================================
+# Target codebase specific (should never be committed)
+# =============================================================================
+# These are examples - actual target codebase dirs should be outside this repo
+coverity-knowledge-base/
+presentation/
 
 # Proposal / internal docs
 proposal/

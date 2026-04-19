@@ -53,6 +53,7 @@ from codebase_shared.utils import (  # noqa: E402
     RateLimitedExecutor, AsyncRateLimiter,
     detect_rpm_from_proxy,
 )
+from codebase_shared.work_dir import get_indexer_dir, ensure_work_dirs  # noqa: E402
 try:
     from codebase_shared.colors import green, yellow, red, bold, dim, ok, warn, err  # noqa: E402
 except ImportError:
@@ -4398,7 +4399,7 @@ def main():
                              "Example: --model openai/gpt-4o --model-fast openai/gpt-4o-mini")
     parser.add_argument("--output-dir", default=None,
                         help="Where to write module_map.json and summaries.json "
-                             "(default: same dir as this script)")
+                             "(default: work/indexer/, configurable via WORK_DIR env var)")
     parser.add_argument("--language", default=None,
                         choices=["python", "javascript", "typescript", "cpp", "java", "go", "rust"],
                         help="Primary language (auto-detected if omitted)")
@@ -4476,7 +4477,11 @@ def main():
         SKIP_DIRS.update(args.exclude)
         print(f"[Config] Excluding additional dirs: {', '.join(args.exclude)}")
 
-    output_dir = Path(args.output_dir).resolve() if args.output_dir else Path(__file__).parent
+    # Ensure work directories exist
+    ensure_work_dirs()
+
+    # Output directory - defaults to work/indexer/, configurable via WORK_DIR env var
+    output_dir = Path(args.output_dir).resolve() if args.output_dir else get_indexer_dir()
     output_dir.mkdir(parents=True, exist_ok=True)
 
     module_map_path = output_dir / "module_map.json"

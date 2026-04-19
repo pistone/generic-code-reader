@@ -31,6 +31,7 @@ from codebase_shared.utils import (  # noqa: E402
     TokenTracker, llm_call, allm_call, load_manifest, save_manifest,
     _is_quota_error, AsyncRateLimiter,
 )
+from codebase_shared.work_dir import get_doc_agent_dir, ensure_work_dirs  # noqa: E402
 
 DEFAULT_MODEL = os.getenv("LLM_MODEL", "openai/gpt-4o-mini")
 MAX_SECTION_CHARS = 4000
@@ -303,7 +304,11 @@ def main():
                         help="Suppress per-chunk progress")
     args = parser.parse_args()
 
-    output_dir = Path(__file__).resolve().parent
+    # Ensure work directories exist
+    ensure_work_dirs()
+
+    # Output directory - defaults to work/doc_agent/, configurable via WORK_DIR env var
+    output_dir = get_doc_agent_dir()
     manifest_path = output_dir / "doc_hashes.json"
     cost_log_path = output_dir / "cost_log.jsonl"
     summaries_path = output_dir / "doc_summaries.json"
@@ -446,15 +451,32 @@ def main():
             for c in chunks:
                 c["last_modified"] = last_mod
 
-        # 5b. Save doc_summaries.json (always — this is the intermediate artifact)
+        # 5b. Save doc_summaries.json (merge with existing to preserve previous runs)
         all_output_chunks = []
         for raw, current_hash, chunks, last_mod in file_work:
             for c in chunks:
                 if c.get("summary"):
                     all_output_chunks.append(c)
         if all_output_chunks:
-            summaries_path.write_text(json.dumps(all_output_chunks, indent=2))
-            print(f"\n  Wrote {len(all_output_chunks)} chunks to {summaries_path}")
+            # Load existing summaries and merge
+            existing_chunks = []
+            if summaries_path.exists():
+                try:
+                    existing_chunks = json.loads(summaries_path.read_text())
+                except (json.JSONDecodeError, IOError):
+                    existing_chunks = []
+
+            # Build set of source_file+chunk_index for new chunks to replace
+            new_keys = {(c["source_file"], c.get("chunk_index", 0)) for c in all_output_chunks}
+
+            # Keep existing chunks that aren't being replaced
+            merged = [c for c in existing_chunks
+                      if (c["source_file"], c.get("chunk_index", 0)) not in new_keys]
+            merged.extend(all_output_chunks)
+
+            summaries_path.write_text(json.dumps(merged, indent=2))
+            print(f"\n  Wrote {len(all_output_chunks)} new chunks to {summaries_path} "
+                  f"(total: {len(merged)} chunks)")
 
         # 6. Index into R2R (unless --no-index)
         if args.no_index:

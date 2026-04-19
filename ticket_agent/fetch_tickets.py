@@ -328,9 +328,28 @@ DEFAULT_SINCE = "-365d"   # fetch tickets updated within the past year by defaul
 DEFAULT_STATUS_FILTER = 'status in (Done, Closed, Resolved, Fixed, Verified)'
 
 
-def _build_default_jql(projects: list[str], since: str) -> str:
-    """Build a sensible default JQL when the user hasn't supplied one."""
-    parts = [DEFAULT_STATUS_FILTER, f'updated >= {since}']
+def _build_default_jql(projects: list[str], since: str = None, status_filter: str = None) -> str:
+    """Build a sensible default JQL when the user hasn't supplied one.
+
+    Args:
+        projects: List of project keys
+        since: Relative date filter (e.g. "-365d"). None means no date filter.
+        status_filter: Custom status filter. None means use DEFAULT_STATUS_FILTER,
+                       empty string means no status filter
+    """
+    parts = []
+
+    # Add status filter if not explicitly disabled
+    if status_filter is None:
+        parts.append(DEFAULT_STATUS_FILTER)
+    elif status_filter:  # non-empty string
+        parts.append(status_filter)
+    # else: empty string means no status filter
+
+    # Add date filter only if provided
+    if since:
+        parts.append(f'updated >= {since}')
+
     if len(projects) == 1:
         parts.insert(0, f"project = {projects[0]}")
     elif len(projects) > 1:
@@ -352,13 +371,24 @@ def main():
     jql_group = parser.add_mutually_exclusive_group()
     jql_group.add_argument("--jql",
                            help="Full JQL query. If omitted, fetches resolved tickets "
-                                f"updated in the past year (use --since to adjust).")
+                                f"updated in the past year (use --since, --open, --all-status to adjust).")
     jql_group.add_argument("--project", nargs="+", metavar="KEY",
                            help="One or more Jira project keys (e.g. --project ABC DEF). "
                                 "Shorthand for a default JQL scoped to those projects.")
+
+    # Status filter options (only apply when using --project, not --jql)
+    status_group = parser.add_mutually_exclusive_group()
+    status_group.add_argument("--open", action="store_true",
+                              help="Fetch only open/in-progress tickets (excludes Done, Closed, etc.). "
+                                   "Only applies when using --project.")
+    status_group.add_argument("--all-status", action="store_true",
+                              help="Fetch tickets regardless of status (no status filter). "
+                                   "Only applies when using --project.")
+
     parser.add_argument("--since", default=DEFAULT_SINCE, metavar="PERIOD",
                         help=f"How far back to look when using the default JQL "
                              f"(Jira relative date, e.g. -365d, -90d, -1y). "
+                             f"Use 'all' to fetch all tickets regardless of date. "
                              f"Ignored if --jql is supplied. Default: {DEFAULT_SINCE}")
     parser.add_argument("--output", default=None,
                         help=f"Directory to write tickets (default: {TICKETS_DIR})")
@@ -431,8 +461,22 @@ def main():
     # Build JQL: explicit --jql wins; --project uses default template; bare default
     if args.jql:
         jql = args.jql
+        if args.open or args.all_status:
+            print("[Warning] --open and --all-status are ignored when using --jql")
     else:
-        jql = _build_default_jql(projects=args.project or [], since=args.since)
+        # Determine status filter based on flags
+        if args.open:
+            status_filter = 'status NOT IN (Done, Closed, Resolved, Fixed, Verified)'
+        elif args.all_status:
+            status_filter = ''  # empty string = no status filter
+        else:
+            status_filter = None  # None = use DEFAULT_STATUS_FILTER
+
+        # Handle --since: 'all' means no date filter
+        since_filter = None if args.since.lower() == 'all' else args.since
+
+        jql = _build_default_jql(projects=args.project or [], since=since_filter,
+                                  status_filter=status_filter)
         print(f"[Default JQL] {jql}")
 
     # Incremental: inject updated filter

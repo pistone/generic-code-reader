@@ -292,7 +292,6 @@ def download_confluence(
 
     result: dict = {
         "page_count": len(downloaded),
-        "filtered_count": len(filtered_out),
         "skipped_unchanged": skipped_unchanged,
         "errors": errors,
         "output_dir": str(out_dir),

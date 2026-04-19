@@ -32,7 +32,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-from r2r import R2RClient
+# Optional R2R import - gracefully handle if not installed
+try:
+    from r2r import R2RClient
+    HAS_R2R = True
+except ImportError:
+    R2RClient = None  # type: ignore
+    HAS_R2R = False
 
 # Shared utilities
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -40,6 +46,7 @@ from codebase_shared.utils import (  # noqa: E402
     TokenTracker, llm_call, load_manifest, save_manifest,
     _is_quota_error,
 )
+from codebase_shared.work_dir import get_ticket_agent_dir, ensure_work_dirs  # noqa: E402
 
 R2R_URL        = os.getenv("R2R_URL", "http://localhost:7272")
 DEFAULT_MODEL  = os.getenv("LLM_MODEL", "openai/gpt-4o")
@@ -49,7 +56,7 @@ GITLAB_URL     = os.getenv("GITLAB_URL", "https://gitlab.com")
 
 DEDUP_THRESHOLD   = 0.85
 MAX_DIFF_CHARS    = 4000   # cap on diff text fed to LLM
-MAX_LESSON_CHARS  = 3000   # soft cap on generated lesson text (how-to recipes can be long)
+MAX_LESSON_CHARS  = 5000   # soft cap on generated lesson text (how-to recipes can be long)
 
 RESOLVED_STATUSES  = {"done", "closed", "resolved", "fixed", "complete", "verified"}
 REJECT_RESOLUTIONS = {"won't fix", "wontfix", "duplicate", "cannot reproduce",
@@ -57,7 +64,8 @@ REJECT_RESOLUTIONS = {"won't fix", "wontfix", "duplicate", "cannot reproduce",
 
 _dedup_warned = False
 
-OUTPUT_DIR   = Path(__file__).resolve().parent
+# Output directory - defaults to work/ticket_agent/, configurable via WORK_DIR env var
+OUTPUT_DIR   = get_ticket_agent_dir()
 LESSONS_DIR  = OUTPUT_DIR / "lessons"
 
 
@@ -89,6 +97,9 @@ def structural_filter(tickets: list[dict],
                       key_pattern: Optional[re.Pattern] = None) -> list[dict]:
     """Filter to tickets likely to contain reusable knowledge.
 
+    All tickets are processed regardless of status (open or resolved).
+    Resolved tickets with poor resolutions (won't fix, duplicate, etc.) are filtered out.
+
     key_pattern: if set, only tickets whose key matches are kept.
     """
     passed: list[dict] = []
@@ -100,13 +111,17 @@ def structural_filter(tickets: list[dict],
 
         if key_pattern and not key_pattern.search(key):
             continue
-        if status and status not in RESOLVED_STATUSES:
-            continue
-        if resolution in REJECT_RESOLUTIONS:
-            continue
-        if len(comments) < 2:
-            continue
 
+        # Filter out resolved tickets with poor resolutions
+        is_resolved = status and status in RESOLVED_STATUSES
+        if is_resolved:
+            if resolution in REJECT_RESOLUTIONS:
+                continue
+            # Require at least 2 comments for resolved tickets to ensure quality
+            if len(comments) < 2:
+                continue
+
+        # Open tickets are included regardless of comment count
         passed.append(t)
     return passed
 
@@ -317,9 +332,11 @@ def build_ticket_context(ticket: dict, mr_context: str = "",
 # ---------------------------------------------------------------------------
 
 EXTRACT_SYSTEM = (
-    "You extract reusable technical knowledge from resolved engineering tickets. "
-    "If the ticket contains a root cause, workaround, design decision, "
-    "or recurring pattern worth remembering, extract it concisely. "
+    "You extract reusable technical knowledge from engineering tickets. "
+    "For open/in-progress tickets: extract the problem description and symptoms "
+    "to help others find similar issues. "
+    "For resolved tickets: if the ticket contains a root cause, workaround, "
+    "design decision, or recurring pattern worth remembering, extract it concisely. "
     "If MR/PR diffs are provided, summarize what the solution actually changed. "
     "If the ticket is just a routine bug fix with no reusable insight, "
     "mark it as not useful. "
@@ -327,7 +344,7 @@ EXTRACT_SYSTEM = (
     "NEVER use investigative or procedural language — do not write "
     "'check if', 'open file X', 'see whether', 'look for', 'verify that', "
     "'to reproduce', or any instruction that tells the reader to do something. "
-    "State facts: what the root cause WAS, what the fix DID, what the pattern IS. "
+    "State facts: what the root cause WAS (or IS for open tickets), what the fix DID, what the pattern IS. "
     "Output ONLY valid JSON — no markdown fences, no commentary."
 )
 
@@ -338,11 +355,12 @@ Extract the reusable technical knowledge from this ticket.
 Output this JSON:
 {{
   "useful": true or false,
-  "summary": "1-3 sentences stating the problem and its context as facts — what the root cause was, what condition triggers it, what component is involved. Write in past or present tense ('X fails when Y', 'The bug was caused by Z'). No instructions, no steps to reproduce.",
-  "solution": "1-2 sentences stating what the fix did — specific classes, functions, files, or patterns changed. ('The fix added X to Y', 'Class Z now calls W before V'). Only if useful and MR diff is available, otherwise omit.",
-  "category": "root_cause" or "workaround" or "design_decision" or "pattern" (only if useful)
+  "summary": "2-3 sentences stating the problem and its context as facts — what the symptoms are, what condition triggers it, what component is involved, and what the root cause was (if known). Write in present or past tense ('X fails when Y', 'The bug was caused by Z'). For open tickets, describe what's known about the problem. Include relevant technical details like checker names, error messages, language features, or API names. No instructions, no steps to reproduce.",
+  "solution": "2-3 sentences stating what the fix did — specific classes, functions, files, or patterns changed. ('The fix added X to Y', 'Class Z now calls W before V'). IMPORTANT: Only mention file paths that actually appear in the MR diff provided above — do not invent or guess file paths. Only include this field if the ticket is resolved AND MR diff is available, otherwise omit this field entirely.",
+  "category": "root_cause" or "workaround" or "design_decision" or "pattern" or "bug_report" (only if useful)
 }}
 
+For open tickets without a solution, still mark as useful if the problem description would help others find similar issues.
 If there's no reusable insight (routine fix, config change, typo), set useful to false."""
 
 
@@ -385,6 +403,8 @@ Problem summary: {summary}
 
 Solution: {solution}
 
+{mr_diff_section}
+
 Write a how-to lesson for a future developer who needs to make a similar change.
 
 Structure your lesson as follows:
@@ -403,12 +423,59 @@ Structure your lesson as follows:
    the solution revealed (e.g. "registration must happen before X", "the
    base class requires overriding Y or it silently no-ops").
 
-Use the actual names from the solution. Do NOT restate the bug or ticket summary.
+IMPORTANT: Only reference file paths that appear in the MR diff above. Do NOT
+invent or guess file paths. Use the actual names from the diff.
 Write for someone who already understands the codebase but has never made this
 specific type of change before."""
 
 
+SOURCE_CODE_EXTENSIONS = {
+    '.c', '.h', '.cpp', '.hpp', '.cc', '.cxx', '.hxx', '.c++', '.h++',
+    '.java', '.scala', '.kt', '.kts',
+    '.py', '.pyx', '.pxd',
+    '.js', '.ts', '.jsx', '.tsx', '.mjs', '.cjs',
+    '.go', '.rs', '.rb', '.php', '.swift', '.m', '.mm',
+    '.cs', '.vb', '.fs', '.fsx',
+    '.sh', '.bash', '.zsh', '.fish',
+    '.sql', '.pl', '.pm', '.r', '.R',
+    '.ml', '.mli', '.hs', '.lhs', '.elm', '.ex', '.exs',
+    '.mk', 'Makefile', '.cmake', 'CMakeLists.txt',
+}
+
+
+def _filter_diff_to_source_code(mr_diff: str, max_chars: int = 6000) -> str:
+    """Filter MR diff to only include source code files, excluding configs/docs."""
+    if not mr_diff:
+        return ""
+
+    lines = mr_diff.split('\n')
+    filtered_lines = []
+    current_file = ""
+    include_current = False
+
+    for line in lines:
+        # Detect file headers in diff output
+        if line.startswith('  ') and not line.startswith('   '):
+            # This is a filename line like "  path/to/file.cpp"
+            current_file = line.strip()
+            # Check if it's a source code file
+            include_current = any(
+                current_file.endswith(ext) or current_file == ext.lstrip('.')
+                for ext in SOURCE_CODE_EXTENSIONS
+            )
+            if include_current:
+                filtered_lines.append(line)
+        elif include_current:
+            filtered_lines.append(line)
+
+    result = '\n'.join(filtered_lines)
+    if len(result) > max_chars:
+        result = result[:max_chars] + "\n  ... (diff truncated)"
+    return result
+
+
 def generate_lesson(model: str, ticket: dict, extraction: dict,
+                    mr_diff: str = "",
                     tracker: Optional[TokenTracker] = None) -> Optional[str]:
     """Generate a generalizable lesson from an extracted ticket.
 
@@ -420,21 +487,26 @@ def generate_lesson(model: str, ticket: dict, extraction: dict,
     if not solution or not summary:
         return None
 
+    # Filter MR diff to source code only
+    filtered_diff = _filter_diff_to_source_code(mr_diff)
+    mr_diff_section = ""
+    if filtered_diff:
+        mr_diff_section = f"MR/PR diff (source code files only):\n{filtered_diff}"
+
     prompt = LESSON_PROMPT_TEMPLATE.format(
         key=ticket.get("key", ""),
         title=ticket.get("title", ""),
         summary=summary,
         solution=solution,
+        mr_diff_section=mr_diff_section,
     )
     try:
         lesson = llm_call(model, LESSON_SYSTEM, prompt,
-                          max_tokens=1200, tracker=tracker, phase="Lessons")
+                          max_tokens=2000, tracker=tracker, phase="Lessons")
         lesson = lesson.strip()
         if len(lesson) < 30:
             return None
-        if len(lesson) > MAX_LESSON_CHARS:
-            print(f"  [warn] Lesson truncated at {MAX_LESSON_CHARS} chars (was {len(lesson)})")
-            return lesson[:MAX_LESSON_CHARS]
+        # No truncation - let lessons be complete
         return lesson
     except Exception as e:
         print(f"  [warn] Lesson generation failed: {e}")
@@ -474,10 +546,10 @@ def save_lesson_file(ticket: dict, extraction: dict, lesson: str) -> Path:
 # Step 5: Dedup against KB
 # ---------------------------------------------------------------------------
 
-def dedup_against_kb(client: R2RClient, summary: str,
+def dedup_against_kb(client, summary: str,
                      threshold: float = DEDUP_THRESHOLD) -> bool:
     """Return True if a similar entry already exists in R2R."""
-    if not summary:
+    if not summary or not HAS_R2R or client is None:
         return False
     try:
         results = client.retrieval.search(
@@ -504,6 +576,7 @@ _CATEGORY_TO_KIND = {
     "workaround":       "operational",
     "design_decision":  "rationale",
     "pattern":          "reference",
+    "bug_report":       "reference",  # For open tickets without solutions
 }
 
 
@@ -516,12 +589,20 @@ def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
 
     Returns a dict mapping ticket key → doc_id of the summary document.
     """
+    if not HAS_R2R:
+        print("  [warn] R2R not installed — skipping indexing")
+        return {}
+
     client   = R2RClient(R2R_URL)
     indexed: dict[str, str] = {}
 
     for i, entry in enumerate(entries):
         key        = entry["key"]
         source_kind = _CATEGORY_TO_KIND.get(entry["category"], "reference")
+
+        # Skip entries with empty summary
+        if not entry.get("summary") or not entry["summary"].strip():
+            continue
 
         # Compose the indexed text: summary + solution if present
         text_parts = [entry["summary"]]
@@ -544,6 +625,9 @@ def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
             )
             indexed[key] = str(resp.results.document_id)
         except Exception as e:
+            if "already exists" in str(e):
+                # Skip existing documents silently
+                continue
             print(f"  [warn] {key}: index failed: {e}")
             continue
 
@@ -563,7 +647,8 @@ def index_ticket_summaries(entries: list[dict]) -> dict[str, str]:
                     },
                 )
             except Exception as e:
-                print(f"  [warn] {key}: lesson index failed: {e}")
+                if "already exists" not in str(e):
+                    print(f"  [warn] {key}: lesson index failed: {e}")
 
         if i > 0 and i % 20 == 0:
             time.sleep(0.5)
@@ -616,6 +701,9 @@ def main():
                         help="Suppress per-item progress, show only summaries")
     args = parser.parse_args()
 
+    # Ensure work directories exist
+    ensure_work_dirs()
+
     manifest_path  = OUTPUT_DIR / "ticket_hashes.json"
     cost_log_path  = OUTPUT_DIR / "cost_log.jsonl"
     summaries_path = OUTPUT_DIR / "ticket_summaries.json"
@@ -663,19 +751,24 @@ def main():
     # R2R health check — warn early before spending LLM budget.
     # Extraction results are always saved to ticket_summaries.json so
     # --reindex can recover if R2R comes up later, but it's better to know now.
-    try:
-        _r2r_probe = R2RClient(R2R_URL)
-        _r2r_probe.retrieval.search(query="ping", search_settings={"limit": 1})
-        print(f"R2R: connected at {R2R_URL}")
-    except Exception as _e:
-        print(f"Warning: R2R is not reachable at {R2R_URL} ({_e})")
-        print("  Extraction will proceed and results saved to ticket_summaries.json,")
-        print("  but nothing will be indexed. Start R2R then run --reindex afterwards.")
-        print("  To abort: Ctrl-C now. To continue anyway: press Enter.")
+    if HAS_R2R:
         try:
-            input()
-        except KeyboardInterrupt:
-            sys.exit(0)
+            _r2r_probe = R2RClient(R2R_URL)
+            _r2r_probe.retrieval.search(query="ping", search_settings={"limit": 1})
+            print(f"R2R: connected at {R2R_URL}")
+        except Exception as _e:
+            print(f"Warning: R2R is not reachable at {R2R_URL} ({_e})")
+            print("  Extraction will proceed and results saved to ticket_summaries.json,")
+            print("  but nothing will be indexed. Start R2R then run --reindex afterwards.")
+            print("  To abort: Ctrl-C now. To continue anyway: press Enter.")
+            try:
+                input()
+            except KeyboardInterrupt:
+                sys.exit(0)
+    else:
+        print("Warning: R2R package not installed")
+        print("  Extraction will proceed and results saved to ticket_summaries.json,")
+        print("  but nothing will be indexed. Install r2r then run --reindex afterwards.")
 
     tracker  = TokenTracker()
     manifest = load_manifest(manifest_path)
@@ -689,7 +782,7 @@ def main():
     # Step 2: structural filter (includes optional key-pattern check)
     candidates = structural_filter(all_tickets, key_pattern=key_pattern)
     filter_desc = f"key=/{args.key_pattern}/, " if key_pattern else ""
-    print(f"Structural filter ({filter_desc}resolved, ≥2 comments): "
+    print(f"Structural filter ({filter_desc}exclude duplicates/won't-fix): "
           f"{len(candidates)}/{len(all_tickets)} passed")
     if not candidates:
         print("No tickets passed the structural filter.")
@@ -709,7 +802,7 @@ def main():
         print(f"[Incremental] {len(changed)}/{len(candidates)} tickets changed")
         candidates = changed
 
-    client = R2RClient(R2R_URL)
+    client = R2RClient(R2R_URL) if HAS_R2R else None
 
     # Load existing summaries for merging
     existing_summaries: list[dict] = []
@@ -745,8 +838,12 @@ def main():
         key = t.get("key", "unknown")
 
         # Fetch MR context (best-effort)
+        # Skip MR fetching for open tickets (no solution to document yet)
+        status = (t.get("status") or "").lower().strip()
+        is_open = status and status not in RESOLVED_STATUSES
+
         mr_context = ""
-        if fetch_mrs:
+        if fetch_mrs and not is_open:
             mr_context = fetch_mr_context(t)
 
         context = build_ticket_context(t, mr_context=mr_context)
@@ -761,7 +858,13 @@ def main():
                 break
             raise
 
-        if not result["useful"]:
+        # For open tickets, always index for similarity search (override LLM usefulness check)
+        # For resolved tickets, respect the LLM's usefulness judgment
+        status = (t.get("status") or "").lower().strip()
+        is_open = status and status not in RESOLVED_STATUSES
+        is_useful = result["useful"] or is_open
+
+        if not is_useful:
             not_useful += 1
             if not args.quiet:
                 print(f"  [{i}/{len(remaining)}] {key}: not useful")
@@ -779,6 +882,7 @@ def main():
                 if result.get("solution"):
                     try:
                         lesson = generate_lesson(args.model, t, result,
+                                                 mr_diff=mr_context,
                                                  tracker=tracker)
                     except Exception as e:
                         if _is_quota_error(str(e).lower()):
