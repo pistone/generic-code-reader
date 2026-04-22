@@ -262,6 +262,68 @@ def purge_old_docs(source_file: str, manifest: dict) -> None:
     purge_docs(old_ids)
 
 
+def purge_orphaned_user_contributions() -> int:
+    """
+    Purge user-contributed documentation entries whose source files no longer exist.
+
+    This is called after normal doc indexing to clean up entries from failed PRs
+    or rejected contributions. User contributions are created by the MCP server's
+    add_to_kb() function and written to .claude/claude-docs/.
+
+    Returns the number of entries purged.
+    """
+    try:
+        from codebase_shared.r2r_indexer import get_client, purge_docs
+        from pathlib import Path
+
+        client = get_client()
+
+        # Search for all user contributions using metadata filter
+        # Note: This requires R2R to support metadata filtering
+        try:
+            results = client.documents.search(
+                query="",  # Empty query to get all
+                filters={"source_kind": {"$eq": "user_contribution"}},
+                limit=1000,  # Adjust if needed
+            )
+        except Exception:
+            # Fallback: metadata filtering might not be supported
+            # Skip purging in this case
+            return 0
+
+        orphaned_ids = []
+        checked = 0
+        for hit in results.get("results", []):
+            metadata = hit.get("metadata", {})
+            source_file = metadata.get("source_file", "")
+            doc_id = hit.get("id", "")
+            checked += 1
+
+            if source_file and doc_id:
+                # Check if source file exists
+                file_path = Path(source_file)
+                if not file_path.is_absolute():
+                    # Try relative to cwd
+                    file_path = Path.cwd() / source_file
+
+                if not file_path.exists():
+                    orphaned_ids.append(doc_id)
+
+        if checked > 0:
+            print(f"[Purge] Checked {checked} user contribution(s)")
+
+        if orphaned_ids:
+            print(f"[Purge] Found {len(orphaned_ids)} orphaned entries (source files deleted)")
+            purge_docs(orphaned_ids)
+            print(f"[Purge] Deleted {len(orphaned_ids)} orphaned entries from KB")
+            return len(orphaned_ids)
+
+        return 0
+    except Exception as e:
+        print(f"[Purge] Warning: Could not purge orphaned entries: {e}")
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Incremental mode
 # ---------------------------------------------------------------------------
@@ -500,6 +562,10 @@ def main():
 
     # Final manifest save
     save_manifest(manifest_path, manifest)
+
+    # Purge orphaned user contributions (from failed PRs or rejected docs)
+    if not args.no_index:
+        purge_orphaned_user_contributions()
 
     # Token tracking
     if tracker.phases:

@@ -1,8 +1,8 @@
 {
   "mcpServers": {
     "domain-kb": {
-      "command": ".venv/bin/python",
-      "args": ["mcp_server/server.py"],
+      "command": "/data00/songtao/prevent/.claude/mcp-server/.venv/bin/python",
+      "args": ["/data00/songtao/prevent/.claude/mcp-server/server.py"],
       "env": {
         "R2R_URL": "http://localhost:7272",
         "KB_SEARCH_LIMIT": "5"

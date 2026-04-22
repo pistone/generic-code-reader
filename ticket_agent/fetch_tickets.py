@@ -32,13 +32,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+# Add parent to path for imports
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from codebase_shared.work_dir import get_ticket_agent_dir, ensure_work_dirs  # noqa: E402
+
 JIRA_URL   = os.getenv("JIRA_URL", "").rstrip("/")
 JIRA_EMAIL = os.getenv("JIRA_EMAIL", "")
 JIRA_TOKEN = os.getenv("JIRA_TOKEN", "")
 
-OUTPUT_DIR    = Path(__file__).resolve().parent
-TICKETS_DIR   = OUTPUT_DIR / "tickets"
-WATERMARK_PATH = OUTPUT_DIR / "last_fetch.json"
+# Output directory - defaults to work/ticket_agent/tickets/, configurable via WORK_DIR env var or --output
+_ticket_dir = get_ticket_agent_dir()
+TICKETS_DIR   = _ticket_dir / "tickets"
+WATERMARK_PATH = _ticket_dir / "last_fetch.json"
 
 PAGE_SIZE = 100   # Jira max results per page
 
@@ -400,6 +405,9 @@ def main():
     parser.add_argument("--debug", action="store_true",
                         help="Print raw API response structure to diagnose empty results")
     args = parser.parse_args()
+
+    # Ensure work directories exist
+    ensure_work_dirs()
 
     # Validate env vars
     missing = [v for v, val in [("JIRA_URL", JIRA_URL),
